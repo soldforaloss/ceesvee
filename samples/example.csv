@@ -1,0 +1,11 @@
+id,first_name,last_name,email,department,salary,start_date,active
+1,Ada,Lovelace,ada@example.com,Engineering,142000,2021-03-15,true
+2,Grace,Hopper,grace@example.com,Engineering,151000,2019-07-01,true
+3,Alan,Turing,alan@example.com,Research,138000,2020-11-23,true
+4,Katherine,Johnson,katherine@example.com,"Research, Applied",129500,2018-02-10,true
+5,Margaret,Hamilton,margaret@example.com,Engineering,147250,2022-06-30,false
+6,Edsger,Dijkstra,edsger@example.com,Research,135000,2017-09-05,true
+7,Barbara,Liskov,barbara@example.com,Engineering,156000,2016-01-12,true
+8,Donald,Knuth,donald@example.com,Research,160000,2015-08-19,false
+9,Tim,Berners-Lee,tim@example.com,"Web, Standards",149900,2021-12-01,true
+10,Linus,Torvalds,linus@example.com,Engineering,158500,2014-04-25,true
