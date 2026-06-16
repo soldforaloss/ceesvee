@@ -63,6 +63,15 @@ export interface ReplaceResult {
   meta: DocumentMeta;
 }
 
+export interface SelectionStats {
+  count: number;
+  numericCount: number;
+  sum: number;
+  avg: number | null;
+  min: number | null;
+  max: number | null;
+}
+
 export interface ExportOptions {
   delimiter: string;
   encoding: string;

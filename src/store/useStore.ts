@@ -19,6 +19,9 @@ const RECENT_KEY = "ceesvee-recent";
 const THEME_KEY = "ceesvee-theme";
 const MAX_RECENT = 10;
 
+// Debounce timer for the (backend-computed) selection statistics.
+let statsTimer: ReturnType<typeof setTimeout> | null = null;
+
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
   { name: "All files", extensions: ["*"] },
@@ -77,12 +80,7 @@ interface Store {
   setTheme: (theme: ThemePref) => void;
   setError: (error: string | null) => void;
   setActive: (id: number) => void;
-  setSelection: (
-    info: SelectionInfo | null,
-    rect: CellRect | null,
-    rows: number[],
-    cols: number[],
-  ) => void;
+  setSelection: (rect: CellRect | null, rows: number[], cols: number[]) => void;
 
   // documents
   openDialog: () => Promise<void>;
@@ -221,8 +219,26 @@ export const useStore = create<Store>((set, get) => {
         selectedCols: [],
       }),
 
-    setSelection: (info, rect, rows, cols) =>
-      set({ selection: info, selectionRect: rect, selectedRows: rows, selectedCols: cols }),
+    setSelection: (rect, rows, cols) => {
+      set({ selectionRect: rect, selectedRows: rows, selectedCols: cols });
+      if (statsTimer !== null) clearTimeout(statsTimer);
+      const id = get().activeId;
+      if (id === null || !rect || rect.width * rect.height <= 1) {
+        set({ selection: null });
+        return;
+      }
+      // Compute aggregates in Rust over the full range (the front-end cache only
+      // holds the visible window, so client-side stats would be wrong for large
+      // selections). Debounced and guarded against stale results.
+      statsTimer = setTimeout(() => {
+        void api
+          .selectionStats(id, rect)
+          .then((stats) => {
+            if (get().selectionRect === rect) set({ selection: stats });
+          })
+          .catch(() => undefined);
+      }, 120);
+    },
 
     openDialog: async () => {
       const selected = await openFileDialog({ multiple: false, filters: FILE_FILTERS });
@@ -258,9 +274,15 @@ export const useStore = create<Store>((set, get) => {
       await api.closeDocument(id).catch(() => undefined);
       set((s) => {
         const tabs = s.tabs.filter((t) => t.id !== id);
-        const activeId =
-          s.activeId === id ? (tabs.length ? tabs[tabs.length - 1].id : null) : s.activeId;
-        return { tabs, activeId, dataVersion: s.dataVersion + 1 };
+        const closingActive = s.activeId === id;
+        const activeId = closingActive
+          ? tabs.length
+            ? tabs[tabs.length - 1].id
+            : null
+          : s.activeId;
+        // Only invalidate the grid cache when the active document actually
+        // changed; closing a background tab must not refetch the active grid.
+        return { tabs, activeId, dataVersion: closingActive ? s.dataVersion + 1 : s.dataVersion };
       });
     },
 
@@ -362,12 +384,12 @@ export const useStore = create<Store>((set, get) => {
 
     replaceCurrent: async () => {
       const id = get().activeId;
-      const { find } = get();
+      const { find, selectionRect } = get();
       const match = find.matches[find.index];
       if (id == null || !match) return;
       try {
-        const window = await api.getRows(id, match.row, 1);
-        const current = window.rows[0]?.[match.col] ?? "";
+        const win = await api.getRows(id, match.row, 1);
+        const current = win.rows[0]?.[match.col] ?? "";
         const options: FindOptions = {
           query: find.query,
           regex: find.regex,
@@ -379,7 +401,18 @@ export const useStore = create<Store>((set, get) => {
           const meta = await api.setCell(id, match.row, match.col, next);
           reloadDoc(meta);
         }
-        await get().runFind();
+        // Recompute matches and advance to the first one AFTER the replaced cell,
+        // so sequential Replace moves forward (and doesn't loop on a replacement
+        // that still matches the query).
+        const matches = await api.find(id, {
+          ...options,
+          selection: find.inSelection && selectionRect ? selectionRect : undefined,
+        });
+        let index = matches.findIndex(
+          (m) => m.row > match.row || (m.row === match.row && m.col > match.col),
+        );
+        if (index < 0) index = 0;
+        set((s) => ({ find: { ...s.find, matches, index: matches.length ? index : 0 } }));
       } catch (e) {
         set({ error: String(e) });
       }

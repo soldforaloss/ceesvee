@@ -12,7 +12,6 @@ import {
 } from "@glideapps/glide-data-grid";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { selectionStats } from "../lib/format";
 import { darkGridTheme, dirtyCellOverride, lightGridTheme } from "../lib/gridTheme";
 import * as api from "../lib/tauri";
 import { useStore } from "../store/useStore";
@@ -34,6 +33,9 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   const dirtyCache = useRef<Map<number, boolean[]>>(new Map());
   const inFlight = useRef<Set<number>>(new Set());
   const visibleRegion = useRef<Rectangle | null>(null);
+  // Bumped on every cache invalidation; an in-flight fetch from a previous
+  // generation must not write its (now-stale) rows into the cleared cache.
+  const generation = useRef(0);
 
   // Latest values for use inside stable callbacks.
   const docId = meta.id;
@@ -70,11 +72,14 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
 
   const loadPage = useCallback(async (page: number) => {
     const id = docIdRef.current;
+    const gen = generation.current;
     const startRow = page * PAGE;
     if (inFlight.current.has(page) || rowCache.current.has(startRow)) return;
     inFlight.current.add(page);
     try {
       const resp = await api.getRows(id, startRow, PAGE);
+      // The document was invalidated while this fetch was in flight — drop it.
+      if (gen !== generation.current) return;
       for (let i = 0; i < resp.rows.length; i++) {
         rowCache.current.set(resp.start + i, resp.rows[i]);
         dirtyCache.current.set(resp.start + i, resp.dirty[i]);
@@ -96,7 +101,8 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   const loadRange = useCallback(
     (startRow: number, rowCount: number) => {
       const firstPage = Math.max(0, Math.floor(startRow / PAGE));
-      const lastPage = Math.floor((startRow + rowCount) / PAGE);
+      // -1 so an exact-multiple range doesn't pull in the page just past it.
+      const lastPage = Math.floor((startRow + Math.max(1, rowCount) - 1) / PAGE);
       for (let p = firstPage; p <= lastPage; p++) void loadPage(p);
     },
     [loadPage],
@@ -105,6 +111,7 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   // Invalidate the cache when the document or its data changes structurally,
   // then refetch the visible window (loadPage's `updateCells` repaints them).
   useEffect(() => {
+    generation.current += 1;
     rowCache.current.clear();
     dirtyCache.current.clear();
     inFlight.current.clear();
@@ -121,6 +128,41 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     },
     [loadRange],
   );
+
+  // Column widths are keyed by position, so reset them when columns are
+  // inserted/removed to avoid a width sticking to the wrong column.
+  const prevColCount = useRef(colCount);
+  useEffect(() => {
+    if (prevColCount.current !== colCount) {
+      setColWidths({});
+      prevColCount.current = colCount;
+    }
+  }, [colCount]);
+
+  // Copy/fill must read the FULL selected range from the backend, not the
+  // windowed cache (off-screen rows aren't cached and would copy as blanks).
+  const getCellsForSelection = useCallback((sel: Rectangle) => {
+    const id = docIdRef.current;
+    return async (): Promise<readonly (readonly GridCell[])[]> => {
+      const resp = await api.getRows(id, sel.y, sel.height);
+      const out: GridCell[][] = [];
+      for (let r = 0; r < sel.height; r++) {
+        const rowData = resp.rows[r];
+        const cells: GridCell[] = [];
+        for (let c = sel.x; c < sel.x + sel.width; c++) {
+          const value = rowData?.[c] ?? "";
+          cells.push({
+            kind: GridCellKind.Text,
+            data: value,
+            displayData: value,
+            allowOverlay: true,
+          });
+        }
+        out.push(cells);
+      }
+      return out;
+    };
+  }, []);
 
   // ----- cell rendering & editing ----------------------------------------
 
@@ -180,18 +222,8 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     const rows = [...rowsSel].sort((a, b) => a - b);
     const cols = [...colsSel].sort((a, b) => a - b);
 
-    let stats = null;
-    if (range && range.width * range.height > 1) {
-      const values: string[] = [];
-      for (let row = range.y; row < range.y + range.height; row++) {
-        const rowData = rowCache.current.get(row);
-        for (let c = range.x; c < range.x + range.width; c++) {
-          values.push(rowData?.[c] ?? "");
-        }
-      }
-      stats = selectionStats(values);
-    }
-    useStore.getState().setSelection(stats, range ? rectOf(range) : null, rows, cols);
+    // Stats are computed in Rust over the full range (see the store).
+    useStore.getState().setSelection(range ? rectOf(range) : null, rows, cols);
   }, []);
 
   // ----- header menu (column operations) ---------------------------------
@@ -236,7 +268,7 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         onHeaderMenuClick={onHeaderMenuClick}
         gridSelection={selection}
         onGridSelectionChange={onGridSelectionChange}
-        getCellsForSelection={true}
+        getCellsForSelection={getCellsForSelection}
         rowMarkers="both"
         rangeSelect="multi-rect"
         columnSelect="multi"

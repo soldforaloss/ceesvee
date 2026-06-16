@@ -4,6 +4,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  CellRect,
   DocumentMeta,
   ExportOptions,
   FindMatch,
@@ -11,6 +12,7 @@ import type {
   OpenOptions,
   ReplaceResult,
   RowsResponse,
+  SelectionStats,
   SortKey,
 } from "../types";
 
@@ -31,6 +33,9 @@ export const listEncodings = () => invoke<string[]>("list_encodings");
 
 export const getRows = (docId: number, start: number, count: number) =>
   invoke<RowsResponse>("get_rows", { docId, start, count });
+
+export const selectionStats = (docId: number, rect: CellRect) =>
+  invoke<SelectionStats>("selection_stats", { docId, rect });
 
 export const setCell = (docId: number, row: number, col: number, value: string) =>
   invoke<DocumentMeta>("set_cell", { docId, row, col, value });

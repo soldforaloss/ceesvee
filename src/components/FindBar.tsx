@@ -11,13 +11,16 @@ export function FindBar() {
   const replaceCurrent = useStore((s) => s.replaceCurrent);
   const replaceAllMatches = useStore((s) => s.replaceAllMatches);
   const setFindOpen = useStore((s) => s.setFindOpen);
+  const selectionRect = useStore((s) => s.selectionRect);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (find.open) inputRef.current?.focus();
   }, [find.open]);
 
-  // Re-run the search shortly after the query or options change.
+  // Re-run the search shortly after the query or options change — and, when
+  // scoping to a selection, whenever that selection changes.
+  const selScope = find.inSelection ? selectionRect : null;
   useEffect(() => {
     if (!find.open) return;
     const handle = setTimeout(() => void runFind(), 200);
@@ -29,6 +32,7 @@ export function FindBar() {
     find.caseSensitive,
     find.wholeCell,
     find.inSelection,
+    selScope,
     runFind,
   ]);
 
