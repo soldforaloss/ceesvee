@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import { checkForUpdates } from "../lib/updater";
 import { useActiveMeta, useStore } from "../store/useStore";
 import {
   ChevronDown,
@@ -10,6 +11,7 @@ import {
   FolderOpen,
   Moon,
   Redo,
+  Refresh,
   RowPlus,
   Save,
   Search,
@@ -166,6 +168,9 @@ export function Toolbar({ onSort, onExport, onSummaries, onFilter }: ToolbarProp
 
       <div className="flex-1" />
 
+      <Tool title="Check for updates" onClick={() => void checkForUpdates({ silent: false })}>
+        <Refresh />
+      </Tool>
       <Tool title="Toggle theme" onClick={cycleTheme}>
         {theme === "dark" ? <Sun /> : <Moon />}
       </Tool>

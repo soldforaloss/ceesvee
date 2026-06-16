@@ -6,6 +6,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1]
+
+### Fixed
+
+- The auto-update prompt now actually appears. The `dialog:allow-ask` and
+  `dialog:allow-message` capability permissions were missing, so the "Update
+  available" confirmation (and the unsaved-tab close prompt) were silently
+  blocked. Installs from 0.2.1 onward can self-update; earlier versions must be
+  updated to 0.2.1 manually once.
+
+### Added
+
+- A **Check for updates** toolbar button that reports the outcome — up to date,
+  an available update, or the error — instead of only checking silently at
+  launch.
+
 ## [0.2.0]
 
 ### Added
@@ -48,6 +64,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In-app auto-updates (cryptographically signed) that check GitHub Releases on
   launch and prompt to download and install a newer version.
 
-[Unreleased]: https://github.com/soldforaloss/ceesvee/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/soldforaloss/ceesvee/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/soldforaloss/ceesvee/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/soldforaloss/ceesvee/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/soldforaloss/ceesvee/releases/tag/v0.1.0
