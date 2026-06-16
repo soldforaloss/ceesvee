@@ -28,6 +28,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Find & replace — plain text or regex, scoped to a selection or the whole file.
 - Live selection statistics (count, sum, average, min, max) in the status bar.
 - Light and dark themes that follow the OS preference.
+- File associations for `.csv` / `.tsv` / `.tab` / `.psv`, with single-instance
+  handling so "Open with CEESVEE" opens the file in a new tab of the running app.
 
 [Unreleased]: https://github.com/soldforaloss/ceesvee/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/soldforaloss/ceesvee/releases/tag/v0.1.0

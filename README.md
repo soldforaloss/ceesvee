@@ -64,6 +64,9 @@ and faithful on large, real-world delimited files.**
 
 - Light and dark themes that follow your OS preference.
 - A restrained, dense-but-readable interface.
+- **File associations** — set CEESVEE as the default app for `.csv` / `.tsv` /
+  `.tab` / `.psv` files, or right-click → **Open with CEESVEE**. Opening another
+  file while CEESVEE is running adds a tab instead of a second window.
 
 ## Install
 
