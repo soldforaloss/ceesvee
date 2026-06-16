@@ -24,7 +24,12 @@ pub fn compare_rows(a: &[String], b: &[String], keys: &[SortKey]) -> Ordering {
 
 fn compare_values(a: &str, b: &str) -> Ordering {
     match (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
-        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+        // Only treat genuinely finite numbers as numeric. Literal text like
+        // "nan"/"inf" parses as f64 but would break the strict-weak-ordering
+        // contract (NaN compares Equal to everything), so fall back to text.
+        (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => {
+            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+        }
         _ => a.cmp(b),
     }
 }
@@ -71,6 +76,25 @@ mod tests {
         assert_eq!(
             compare_rows(&row(&["1"]), &row(&["2"]), &keys),
             Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn nan_and_inf_text_sorts_lexicographically() {
+        let keys = [SortKey {
+            column: 0,
+            descending: false,
+        }];
+        // "nan"/"inf" parse as f64 but must NOT take the numeric path (NaN would
+        // break ordering). They compare as text instead.
+        assert_eq!(
+            compare_rows(&row(&["inf"]), &row(&["apple"]), &keys),
+            Ordering::Greater // 'i' > 'a' lexicographically
+        );
+        // A literal "nan" must compare consistently (text), not pin as Equal.
+        assert_ne!(
+            compare_rows(&row(&["nan"]), &row(&["1"]), &keys),
+            Ordering::Equal
         );
     }
 

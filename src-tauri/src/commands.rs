@@ -8,8 +8,8 @@ use tauri::State;
 
 use crate::document::Document;
 use crate::dto::{
-    DocumentMeta, ExportOptions, FindMatch, FindOptions, OpenOptions, ReplaceResult, RowsResponse,
-    SortKey,
+    CellRect, DocumentMeta, ExportOptions, FindMatch, FindOptions, OpenOptions, ReplaceResult,
+    RowsResponse, SelectionStats, SortKey,
 };
 use crate::error::{AppError, AppResult};
 use crate::parse::{parse, ParseSettings, ParsedFile};
@@ -143,6 +143,11 @@ pub fn list_encodings() -> Vec<String> {
 #[tauri::command]
 pub fn get_rows(doc_id: u64, start: usize, count: usize, state: Db<'_>) -> AppResult<RowsResponse> {
     Ok(lock(&state)?.get(doc_id)?.get_rows(start, count))
+}
+
+#[tauri::command]
+pub fn selection_stats(doc_id: u64, rect: CellRect, state: Db<'_>) -> AppResult<SelectionStats> {
+    Ok(lock(&state)?.get(doc_id)?.selection_stats(rect))
 }
 
 // ----- cell editing ------------------------------------------------------

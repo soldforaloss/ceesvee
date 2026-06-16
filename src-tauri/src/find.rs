@@ -53,9 +53,9 @@ pub fn find(doc: &Document, opts: &FindOptions) -> AppResult<Vec<FindMatch>> {
     let rows = doc.rows();
 
     let mut matches = Vec::new();
-    for r in row_start..row_end {
-        for c in col_start..col_end {
-            if re.is_match(&rows[r][c]) {
+    for (r, row) in rows.iter().enumerate().take(row_end).skip(row_start) {
+        for (c, cell) in row.iter().enumerate().take(col_end).skip(col_start) {
+            if re.is_match(cell) {
                 matches.push(FindMatch { row: r, col: c });
             }
         }
@@ -76,9 +76,8 @@ pub fn replace_all(
     let rows = doc.rows();
 
     let mut changes = Vec::new();
-    for r in row_start..row_end {
-        for c in col_start..col_end {
-            let cell = &rows[r][c];
+    for (r, row) in rows.iter().enumerate().take(row_end).skip(row_start) {
+        for (c, cell) in row.iter().enumerate().take(col_end).skip(col_start) {
             if !re.is_match(cell) {
                 continue;
             }

@@ -34,6 +34,7 @@ pub fn run() {
             commands::get_meta,
             commands::list_encodings,
             commands::get_rows,
+            commands::selection_stats,
             commands::set_cell,
             commands::set_cells,
             commands::paste,

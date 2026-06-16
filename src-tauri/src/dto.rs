@@ -98,6 +98,18 @@ pub struct ReplaceResult {
     pub meta: DocumentMeta,
 }
 
+/// Aggregate statistics over a selected cell range, for the status bar.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionStats {
+    pub count: usize,
+    pub numeric_count: usize,
+    pub sum: f64,
+    pub avg: Option<f64>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
 /// Options controlling how a document is serialized on save.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

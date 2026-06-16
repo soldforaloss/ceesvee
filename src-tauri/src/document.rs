@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::dto::{DocumentMeta, RowsResponse, SortKey};
+use crate::dto::{CellRect, DocumentMeta, RowsResponse, SelectionStats, SortKey};
 use crate::error::{AppError, AppResult};
 use crate::parse::ParsedFile;
 
@@ -247,6 +247,47 @@ impl Document {
         RowsResponse { start, rows, dirty }
     }
 
+    /// Aggregate numeric statistics over a rectangular selection (data-row
+    /// coordinates). Computed in Rust so it scales to any selection size.
+    pub fn selection_stats(&self, rect: CellRect) -> SelectionStats {
+        let row_end = rect.y.saturating_add(rect.height).min(self.rows.len());
+        let col_end = rect.x.saturating_add(rect.width).min(self.headers.len());
+
+        let mut count = 0usize;
+        let mut numeric_count = 0usize;
+        let mut sum = 0.0f64;
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+
+        for r in rect.y..row_end {
+            for c in rect.x..col_end {
+                count += 1;
+                if let Ok(n) = self.rows[r][c].trim().parse::<f64>() {
+                    if n.is_finite() {
+                        numeric_count += 1;
+                        sum += n;
+                        if n < min {
+                            min = n;
+                        }
+                        if n > max {
+                            max = n;
+                        }
+                    }
+                }
+            }
+        }
+
+        let has_numeric = numeric_count > 0;
+        SelectionStats {
+            count,
+            numeric_count,
+            sum,
+            avg: has_numeric.then(|| sum / numeric_count as f64),
+            min: has_numeric.then_some(min),
+            max: has_numeric.then_some(max),
+        }
+    }
+
     pub fn meta(&self) -> DocumentMeta {
         let file_name = self
             .path
@@ -414,14 +455,22 @@ impl Document {
         if anchor_col >= self.headers.len() {
             return Err(AppError::invalid("column index out of range"));
         }
+        // `== len` is allowed so a paste can append at the end.
+        if anchor_row > self.rows.len() {
+            return Err(AppError::invalid("row index out of range"));
+        }
         let block_rows = block.len();
         let block_cols = block.iter().map(|r| r.len()).max().unwrap_or(0);
         if block_cols == 0 {
             return Ok(());
         }
 
-        let needed_rows = (anchor_row + block_rows).saturating_sub(self.rows.len());
-        let needed_cols = (anchor_col + block_cols).saturating_sub(self.headers.len());
+        let needed_rows = anchor_row
+            .saturating_add(block_rows)
+            .saturating_sub(self.rows.len());
+        let needed_cols = anchor_col
+            .saturating_add(block_cols)
+            .saturating_sub(self.headers.len());
 
         let mut sub: Vec<EditOp> = Vec::new();
         if needed_rows > 0 {
@@ -522,6 +571,14 @@ impl Document {
     // ----- helpers: build + apply a fresh op, returning it (no stack push) --
 
     fn register(&mut self, op: EditOp) {
+        // If the saved state lived in the redo branch we're about to discard,
+        // it becomes permanently unreachable — so the document is dirty until the
+        // next save. Without this, `undo` (which shortens the stack) followed by a
+        // new edit can make `undo_stack.len()` coincide with `saved_marker` again
+        // and falsely report a clean document.
+        if self.saved_marker > self.undo_stack.len() {
+            self.saved_marker = usize::MAX;
+        }
         self.undo_stack.push(op);
         self.redo_stack.clear();
     }
@@ -993,5 +1050,55 @@ mod tests {
         let win = d.get_rows(0, 3);
         assert!(!win.dirty[0][0]);
         assert!(win.dirty[2][0]);
+    }
+
+    #[test]
+    fn dirty_survives_save_undo_then_new_edit() {
+        // Regression: save -> undo -> a *new* edit must remain dirty, because the
+        // saved state lived in the redo branch that the new edit discards.
+        let mut d = doc_from("a\n1", true);
+        d.set_cell(0, 0, "2".into()).unwrap();
+        d.set_cell(0, 0, "3".into()).unwrap();
+        d.mark_saved(None); // saved at "3"
+        assert!(!d.is_dirty());
+        d.undo().unwrap(); // back to "2"
+        assert!(d.is_dirty());
+        d.set_cell(0, 0, "9".into()).unwrap(); // diverge; saved "3" now unreachable
+        assert_eq!(d.cell(0, 0), "9");
+        assert!(
+            d.is_dirty(),
+            "document differs from the saved file but reported clean"
+        );
+    }
+
+    #[test]
+    fn selection_stats_numeric_and_text() {
+        let d = doc_from("a,b\n10,x\n20,y\n30,z", true);
+        // The whole 3x2 selection: 6 cells, 3 numeric (10/20/30).
+        let stats = d.selection_stats(CellRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 3,
+        });
+        assert_eq!(stats.count, 6);
+        assert_eq!(stats.numeric_count, 3);
+        assert_eq!(stats.sum, 60.0);
+        assert_eq!(stats.avg, Some(20.0));
+        assert_eq!(stats.min, Some(10.0));
+        assert_eq!(stats.max, Some(30.0));
+    }
+
+    #[test]
+    fn selection_stats_clamps_out_of_range() {
+        let d = doc_from("a\n1\n2", true);
+        let stats = d.selection_stats(CellRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 100,
+        });
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.sum, 3.0);
     }
 }
