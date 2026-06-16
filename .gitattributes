@@ -1,0 +1,11 @@
+# Normalize line endings to LF in the repository and on checkout so Prettier and
+# rustfmt behave identically across platforms.
+* text=auto eol=lf
+
+# Binary assets — never normalize.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CEESVEE</title>
+    <script>
+      // Apply the saved (or OS-preferred) theme before paint to avoid a flash.
+      (function () {
+        try {
+          const stored = localStorage.getItem("ceesvee-theme");
+          const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+          const dark =
+            stored === "dark" || ((stored === null || stored === "system") && prefersDark);
+          document.documentElement.classList.toggle("dark", dark);
+        } catch (_) {
+          /* localStorage unavailable — fall back to light */
+        }
+      })();
+    </script>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <!-- Glide Data Grid renders its overlay editors into this portal. -->
+    <div id="portal" style="position: fixed; left: 0; top: 0; z-index: 9999"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
