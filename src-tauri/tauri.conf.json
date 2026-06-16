@@ -34,21 +34,21 @@
       {
         "ext": ["csv"],
         "name": "CEESVEE.csv",
-        "description": "Comma-separated values",
+        "description": "CSV (CEESVEE)",
         "mimeType": "text/csv",
         "role": "Editor"
       },
       {
         "ext": ["tsv", "tab"],
         "name": "CEESVEE.tsv",
-        "description": "Tab-separated values",
+        "description": "TSV (CEESVEE)",
         "mimeType": "text/tab-separated-values",
         "role": "Editor"
       },
       {
         "ext": ["psv"],
         "name": "CEESVEE.psv",
-        "description": "Pipe-separated values",
+        "description": "PSV (CEESVEE)",
         "role": "Editor"
       }
     ],
