@@ -1,5 +1,6 @@
 import { useStore } from "../store/useStore";
 import { FilePlus, FolderOpen } from "./Icons";
+import { Logo } from "./Logo";
 
 export function EmptyState() {
   const openDialog = useStore((s) => s.openDialog);
@@ -9,7 +10,8 @@ export function EmptyState() {
 
   return (
     <div className="flex h-full flex-col items-center justify-center gap-6 px-6 text-center">
-      <div>
+      <div className="flex flex-col items-center">
+        <Logo className="mb-3 h-16 w-16 drop-shadow-sm" />
         <h1 className="bg-gradient-to-br from-violet-500 to-indigo-500 bg-clip-text text-4xl font-bold tracking-tight text-transparent">
           CEESVEE
         </h1>

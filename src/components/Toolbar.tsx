@@ -17,6 +17,7 @@ import {
   Trash,
   Undo,
 } from "./Icons";
+import { Logo } from "./Logo";
 
 interface ToolbarProps {
   onSort: () => void;
@@ -67,7 +68,8 @@ export function Toolbar({ onSort, onExport }: ToolbarProps) {
 
   return (
     <div className="flex h-11 shrink-0 items-center gap-1 border-b border-zinc-200 bg-zinc-50/80 px-2 backdrop-blur dark:border-zinc-800 dark:bg-zinc-900/80">
-      <span className="mr-1 select-none px-1 font-semibold tracking-tight text-violet-600 dark:text-violet-400">
+      <span className="mr-1 flex select-none items-center gap-1.5 px-1 font-semibold tracking-tight text-violet-600 dark:text-violet-400">
+        <Logo className="h-5 w-5" />
         CEESVEE
       </span>
 

@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="CEESVEE">
+  <defs>
+    <linearGradient id="tile" x1="96" y1="96" x2="928" y2="928" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7c3aed" />
+      <stop offset="1" stop-color="#4f46e5" />
+    </linearGradient>
+    <radialGradient id="sheen" cx="330" cy="260" r="660" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22" />
+      <stop offset="0.62" stop-color="#ffffff" stop-opacity="0" />
+    </radialGradient>
+    <clipPath id="grid">
+      <rect x="242" y="242" width="540" height="540" rx="40" />
+    </clipPath>
+  </defs>
+
+  <!-- Rounded-square tile -->
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="url(#tile)" />
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="url(#sheen)" />
+
+  <!-- Table interior (clipped to rounded corners) -->
+  <g clip-path="url(#grid)">
+    <!-- header row -->
+    <rect x="242" y="242" width="540" height="180" fill="#ffffff" />
+    <!-- active (selected) cell -->
+    <rect x="422" y="422" width="180" height="180" fill="#ddd6fe" />
+    <!-- grid lines -->
+    <g stroke="#ffffff" stroke-width="16">
+      <line x1="422" y1="242" x2="422" y2="782" />
+      <line x1="602" y1="242" x2="602" y2="782" />
+      <line x1="242" y1="422" x2="782" y2="422" />
+      <line x1="242" y1="602" x2="782" y2="602" />
+    </g>
+  </g>
+
+  <!-- Table border -->
+  <rect x="242" y="242" width="540" height="540" rx="40" fill="none" stroke="#ffffff" stroke-width="18" />
+
+  <!-- Fill handle on the active cell -->
+  <rect x="584" y="584" width="36" height="36" rx="7" fill="#ffffff" stroke="#4f46e5" stroke-width="8" />
+</svg>

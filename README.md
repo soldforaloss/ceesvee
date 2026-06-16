@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="branding/ceesvee-icon.svg" alt="CEESVEE" width="104" height="104" />
+
 # CEESVEE
 
 **A fast, open-source CSV / delimited-file viewer and editor.**
