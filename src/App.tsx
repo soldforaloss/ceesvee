@@ -12,6 +12,7 @@ import { StatusBar } from "./components/StatusBar";
 import { Tabs } from "./components/Tabs";
 import { Toolbar } from "./components/Toolbar";
 import * as api from "./lib/tauri";
+import { checkForUpdates } from "./lib/updater";
 import { useActiveMeta, useStore } from "./store/useStore";
 
 export default function App() {
@@ -28,6 +29,11 @@ export default function App() {
   // Initialise persisted state (recent files, theme) once.
   useEffect(() => {
     useStore.getState().init();
+  }, []);
+
+  // Check for a newer release once at launch (no-op in dev).
+  useEffect(() => {
+    void checkForUpdates();
   }, []);
 
   // Open files passed via "Open with CEESVEE": at launch (cold start, drained
