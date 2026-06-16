@@ -110,6 +110,8 @@ export type Conjunction = "and" | "or";
 
 export interface FilterCondition {
   type: "condition";
+  /** Stable client-side id for React keys (ignored by the backend). */
+  id: string;
   column: number;
   op: FilterOp;
   value: string;
@@ -118,6 +120,8 @@ export interface FilterCondition {
 
 export interface FilterGroup {
   type: "group";
+  /** Stable client-side id for React keys (ignored by the backend). */
+  id: string;
   conjunction: Conjunction;
   nodes: FilterNode[];
 }

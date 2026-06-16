@@ -367,7 +367,13 @@ pub fn set_filter(doc_id: u64, spec: FilterGroup, state: Db<'_>) -> AppResult<Do
     let mut guard = lock(&state)?;
     let doc = guard.get_mut(doc_id)?;
     let view = filter_mod::matching_rows(doc, &spec)?;
-    doc.set_filter(view);
+    // A filter that excludes nothing isn't an active filter — avoids reporting
+    // "N of N rows · filtered" for a match-all or empty spec.
+    if view.len() == doc.n_rows() {
+        doc.clear_filter();
+    } else {
+        doc.set_filter(view);
+    }
     Ok(doc.meta())
 }
 

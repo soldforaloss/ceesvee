@@ -6,7 +6,7 @@
 //! exactly: only a genuinely *finite* f64 counts (literal "nan"/"inf" parse as
 //! f64 but are treated as text), which preserves a strict-weak ordering.
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime};
 
 /// Parse a (possibly untrimmed) cell as a finite number. The single source of
 /// truth for "is numeric" across the app.
@@ -46,13 +46,25 @@ pub fn is_date(cell: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    DATE_FORMATS
-        .iter()
-        .any(|fmt| NaiveDate::parse_from_str(s, fmt).is_ok())
-        || DATETIME_FORMATS
-            .iter()
-            .any(|fmt| NaiveDateTime::parse_from_str(s, fmt).is_ok())
-        || DateTime::parse_from_rfc3339(s).is_ok()
+    // Require a 4-digit year (>= 1000): chrono's `%Y` otherwise accepts a 1-3
+    // digit year, which would mis-classify short hierarchical codes such as
+    // "1.2.3" or "1/2/3" (parsed as year 3) as dates.
+    let year_ok = |y: i32| (1000..=9999).contains(&y);
+    for fmt in DATE_FORMATS {
+        if let Ok(d) = NaiveDate::parse_from_str(s, fmt) {
+            if year_ok(d.year()) {
+                return true;
+            }
+        }
+    }
+    for fmt in DATETIME_FORMATS {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
+            if year_ok(dt.year()) {
+                return true;
+            }
+        }
+    }
+    DateTime::parse_from_rfc3339(s).is_ok()
 }
 
 #[cfg(test)]
@@ -85,5 +97,9 @@ mod tests {
         assert!(is_date("2024-01-02T03:04:05Z"));
         assert!(!is_date("2024-13-40"));
         assert!(!is_date("hello"));
+        // Short version-like codes must NOT be treated as dates.
+        assert!(!is_date("1.2.3"));
+        assert!(!is_date("1/2/3"));
+        assert!(!is_date("1-2-3"));
     }
 }

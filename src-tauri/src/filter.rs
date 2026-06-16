@@ -118,10 +118,17 @@ fn parse_num(value: &str) -> AppResult<f64> {
 
 fn eval(node: &Compiled, row: &[String]) -> bool {
     match node {
-        Compiled::Group { conj, nodes } => match conj {
-            Conjunction::And => nodes.iter().all(|n| eval(n, row)),
-            Conjunction::Or => !nodes.is_empty() && nodes.iter().any(|n| eval(n, row)),
-        },
+        Compiled::Group { conj, nodes } => {
+            // An empty group is neutral — it matches every row regardless of the
+            // conjunction (matching the builder's "matches every row" hint).
+            if nodes.is_empty() {
+                return true;
+            }
+            match conj {
+                Conjunction::And => nodes.iter().all(|n| eval(n, row)),
+                Conjunction::Or => nodes.iter().any(|n| eval(n, row)),
+            }
+        }
         Compiled::Condition { column, test } => {
             let cell = row.get(*column).map(String::as_str).unwrap_or("");
             eval_test(test, cell)
@@ -215,9 +222,72 @@ mod tests {
     }
 
     #[test]
+    fn empty_or_group_matches_all() {
+        let d = doc("name\na\nb");
+        let g = group(Conjunction::Or, vec![]);
+        assert_eq!(matching_rows(&d, &g).unwrap(), vec![0, 1]);
+    }
+
+    #[test]
     fn bad_regex_errors() {
         let d = doc("name\na");
         let g = group(Conjunction::And, vec![cond(0, FilterOp::Regex, "(")]);
         assert!(matching_rows(&d, &g).is_err());
+    }
+
+    // ----- read/translate paths under an active filter ---------------------
+
+    #[test]
+    fn filtered_reads_map_display_to_absolute() {
+        let mut d = doc("name,qty\na,1\nb,2\nc,3\nd,4");
+        d.set_filter(vec![1, 3]); // keep absolute data rows b,2 and d,4
+        assert_eq!(d.visible_len(), 2);
+        assert_eq!(d.display_to_abs(0), Some(1));
+        assert_eq!(d.display_to_abs(1), Some(3));
+        assert_eq!(d.display_to_abs(2), None);
+        assert_eq!(d.display_to_abs_insert(2), Some(4)); // append at end
+        let resp = d.get_rows(0, 10);
+        assert_eq!(resp.rows.len(), 2);
+        assert_eq!(resp.rows[0][0], "b");
+        assert_eq!(resp.rows[1][0], "d");
+    }
+
+    #[test]
+    fn filtered_selection_stats_use_visible_rows() {
+        let mut d = doc("name,qty\na,1\nb,2\nc,3\nd,4");
+        d.set_filter(vec![1, 3]);
+        let rect = crate::dto::CellRect {
+            x: 1,
+            y: 0,
+            width: 1,
+            height: 2,
+        };
+        let stats = d.selection_stats(rect);
+        assert_eq!(stats.numeric_count, 2);
+        assert_eq!(stats.sum, 6.0); // 2 + 4, not the hidden 1 or 3
+    }
+
+    #[test]
+    fn find_under_filter_is_display_coords_and_panic_free() {
+        let mut d = doc("name,qty\nx,1\ny,2\nx,3");
+        d.set_filter(vec![2]); // only the third data row (x,3) visible -> display row 0
+        let opts = crate::dto::FindOptions {
+            query: "x".into(),
+            ..Default::default()
+        };
+        let m = crate::find::find(&d, &opts).unwrap();
+        assert_eq!(m, vec![crate::dto::FindMatch { row: 0, col: 0 }]);
+        // A selection rect that exceeds the visible range must not panic.
+        let oversized = crate::dto::FindOptions {
+            query: "x".into(),
+            selection: Some(crate::dto::CellRect {
+                x: 0,
+                y: 0,
+                width: 9,
+                height: 99,
+            }),
+            ..Default::default()
+        };
+        assert!(crate::find::find(&d, &oversized).is_ok());
     }
 }

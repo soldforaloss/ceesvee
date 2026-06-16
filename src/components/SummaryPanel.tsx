@@ -28,6 +28,12 @@ export function SummaryPanel({ onClose }: { onClose: () => void }) {
 
   return (
     <Modal title="Column summaries" onClose={onClose} size="xl">
+      {meta.filtered && (
+        <p className="mb-3 rounded bg-violet-50 px-2 py-1.5 text-xs text-violet-700 dark:bg-violet-500/10 dark:text-violet-300">
+          A filter is active. Summaries are computed over all {meta.totalRowCount.toLocaleString()}{" "}
+          rows, not just the visible ones.
+        </p>
+      )}
       {!rows ? (
         <p className="py-8 text-center text-sm text-zinc-400">Analysing columns…</p>
       ) : (

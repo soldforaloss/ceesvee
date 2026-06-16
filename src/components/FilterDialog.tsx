@@ -24,8 +24,14 @@ const OP_OPTIONS: { value: FilterOp; label: string }[] = [
 const NO_VALUE: ReadonlySet<FilterOp> = new Set(["isEmpty", "notEmpty"]);
 const MAX_DEPTH = 3;
 
+// Monotonic id source for stable React keys on builder nodes (client-only;
+// the backend ignores the `id` field).
+let nodeIdSeq = 0;
+const nextId = () => `n${nodeIdSeq++}`;
+
 const newCondition = (): FilterCondition => ({
   type: "condition",
+  id: nextId(),
   column: 0,
   op: "contains",
   value: "",
@@ -34,6 +40,7 @@ const newCondition = (): FilterCondition => ({
 
 const newGroup = (): FilterGroup => ({
   type: "group",
+  id: nextId(),
   conjunction: "and",
   nodes: [newCondition()],
 });
@@ -156,7 +163,7 @@ function GroupEditor({
         {group.nodes.map((node, i) =>
           node.type === "group" ? (
             <GroupEditor
-              key={i}
+              key={node.id}
               group={node}
               headers={headers}
               depth={depth + 1}
@@ -165,7 +172,7 @@ function GroupEditor({
             />
           ) : (
             <ConditionRow
-              key={i}
+              key={node.id}
               condition={node}
               headers={headers}
               onChange={(c) => setNode(i, c)}

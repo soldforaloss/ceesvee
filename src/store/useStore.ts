@@ -74,8 +74,11 @@ const initialFilter: FilterState = {
   open: false,
   spec: {
     type: "group",
+    id: "root",
     conjunction: "and",
-    nodes: [{ type: "condition", column: 0, op: "contains", value: "", caseSensitive: false }],
+    nodes: [
+      { type: "condition", id: "c0", column: 0, op: "contains", value: "", caseSensitive: false },
+    ],
   },
 };
 
@@ -362,7 +365,7 @@ export const useStore = create<Store>((set, get) => {
     reparse: async (options) => {
       const id = get().activeId;
       if (id == null) return;
-      set({ busy: true });
+      set({ busy: true, summaries: null, summariesDocId: null });
       try {
         const meta = await api.reparse(id, options);
         reloadDoc(meta);
@@ -372,15 +375,49 @@ export const useStore = create<Store>((set, get) => {
       }
     },
 
-    setHeaderMode: (hasHeader) => mutate((id) => api.setHeaderMode(id, hasHeader)),
+    setHeaderMode: (hasHeader) => {
+      // Promoting/demoting the header row re-interprets every column.
+      set({ summaries: null, summariesDocId: null });
+      return mutate((id) => api.setHeaderMode(id, hasHeader));
+    },
 
     setCell: (row, col, value) => mutate((id) => api.setCell(id, row, col, value), false),
     pasteBlock: (row, col, block) => mutate((id) => api.paste(id, row, col, block)),
     insertRows: (at, count) => mutate((id) => api.insertRows(id, at, count)),
     deleteRows: (indices) => mutate((id) => api.deleteRows(id, indices)),
     moveRow: (from, to) => mutate((id) => api.moveRow(id, from, to)),
-    insertColumn: (at, name) => mutate((id) => api.insertColumn(id, at, name)),
-    deleteColumns: (indices) => mutate((id) => api.deleteColumns(id, indices)),
+    insertColumn: (at, name) => {
+      const id = get().activeId;
+      if (id != null) {
+        // Column identity shifts: invalidate summaries and keep the frozen
+        // boundary on the same logical columns (shift it right if we inserted
+        // within the frozen region).
+        set((s) => {
+          const frozen = s.frozenCols[id] ?? 0;
+          return {
+            summaries: null,
+            summariesDocId: null,
+            frozenCols: { ...s.frozenCols, [id]: at < frozen ? frozen + 1 : frozen },
+          };
+        });
+      }
+      return mutate((docId) => api.insertColumn(docId, at, name));
+    },
+    deleteColumns: (indices) => {
+      const id = get().activeId;
+      if (id != null) {
+        set((s) => {
+          const frozen = s.frozenCols[id] ?? 0;
+          const removedBelow = indices.filter((c) => c < frozen).length;
+          return {
+            summaries: null,
+            summariesDocId: null,
+            frozenCols: { ...s.frozenCols, [id]: Math.max(0, frozen - removedBelow) },
+          };
+        });
+      }
+      return mutate((docId) => api.deleteColumns(docId, indices));
+    },
     renameColumn: (col, name) => mutate((id) => api.renameColumn(id, col, name)),
     sortBy: (keys) => mutate((id) => api.sort(id, keys)),
     undo: () => mutate((id) => api.undo(id)),

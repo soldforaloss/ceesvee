@@ -307,7 +307,7 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         columns={columns}
         headerIcons={HEADER_ICONS}
         rows={meta.rowCount}
-        freezeColumns={Math.min(frozenCols, colCount)}
+        freezeColumns={Math.min(frozenCols, Math.max(0, colCount - 1))}
         getCellContent={getCellContent}
         onCellEdited={onCellEdited}
         onPaste={onPaste}

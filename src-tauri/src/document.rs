@@ -234,10 +234,6 @@ impl Document {
             .unwrap_or(self.rows.len())
     }
 
-    pub fn is_filtered(&self) -> bool {
-        self.filter_view.is_some()
-    }
-
     /// The active filter's matching absolute row indices, in order, if any.
     pub fn filter_view(&self) -> Option<&[usize]> {
         self.filter_view.as_deref()
