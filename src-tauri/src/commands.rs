@@ -8,13 +8,13 @@ use tauri::State;
 
 use crate::document::Document;
 use crate::dto::{
-    CellRect, DocumentMeta, ExportOptions, FindMatch, FindOptions, OpenOptions, ReplaceResult,
-    RowsResponse, SelectionStats, SortKey,
+    CellRect, ColumnSummary, DocumentMeta, ExportOptions, FilterGroup, FindMatch, FindOptions,
+    OpenOptions, ReplaceResult, RowsResponse, SelectionStats, SortKey,
 };
 use crate::error::{AppError, AppResult};
 use crate::parse::{parse, ParseSettings, ParsedFile};
 use crate::state::{AppState, PendingFiles};
-use crate::{encoding, export, find as find_mod, util};
+use crate::{encoding, export, filter as filter_mod, find as find_mod, util};
 
 type Db<'a> = State<'a, Mutex<AppState>>;
 
@@ -22,6 +22,19 @@ fn lock<'g>(state: &'g Db<'_>) -> AppResult<MutexGuard<'g, AppState>> {
     state
         .lock()
         .map_err(|_| AppError::Other("internal state lock error".into()))
+}
+
+/// Translate a visible (display) row index to its absolute index, erroring if
+/// out of range. Identity when no filter is active.
+fn abs_row(doc: &Document, display: usize) -> AppResult<usize> {
+    doc.display_to_abs(display)
+        .ok_or_else(|| AppError::invalid("row index out of range"))
+}
+
+/// Like [`abs_row`] but allows a display index at the end (for append/insert).
+fn abs_insert_row(doc: &Document, display: usize) -> AppResult<usize> {
+    doc.display_to_abs_insert(display)
+        .ok_or_else(|| AppError::invalid("row index out of range"))
 }
 
 /// Heuristic: treat the first row as a header when none of its cells is numeric.
@@ -160,6 +173,11 @@ pub fn selection_stats(doc_id: u64, rect: CellRect, state: Db<'_>) -> AppResult<
     Ok(lock(&state)?.get(doc_id)?.selection_stats(rect))
 }
 
+#[tauri::command]
+pub fn column_summaries(doc_id: u64, state: Db<'_>) -> AppResult<Vec<ColumnSummary>> {
+    Ok(lock(&state)?.get(doc_id)?.column_summaries())
+}
+
 // ----- cell editing ------------------------------------------------------
 
 #[tauri::command]
@@ -172,7 +190,8 @@ pub fn set_cell(
 ) -> AppResult<DocumentMeta> {
     let mut guard = lock(&state)?;
     let doc = guard.get_mut(doc_id)?;
-    doc.set_cell(row, col, value)?;
+    let abs = abs_row(doc, row)?;
+    doc.set_cell(abs, col, value)?;
     Ok(doc.meta())
 }
 
@@ -184,7 +203,11 @@ pub fn set_cells(
 ) -> AppResult<DocumentMeta> {
     let mut guard = lock(&state)?;
     let doc = guard.get_mut(doc_id)?;
-    doc.set_cells(changes)?;
+    let mut translated = Vec::with_capacity(changes.len());
+    for (row, col, value) in changes {
+        translated.push((abs_row(doc, row)?, col, value));
+    }
+    doc.set_cells(translated)?;
     Ok(doc.meta())
 }
 
@@ -198,7 +221,11 @@ pub fn paste(
 ) -> AppResult<DocumentMeta> {
     let mut guard = lock(&state)?;
     let doc = guard.get_mut(doc_id)?;
-    doc.paste(anchor_row, anchor_col, block)?;
+    // Pasting can grow/reshape the grid, so it drops any active filter and
+    // operates on the absolute anchor position.
+    let abs = abs_insert_row(doc, anchor_row)?;
+    doc.clear_filter();
+    doc.paste(abs, anchor_col, block)?;
     Ok(doc.meta())
 }
 
@@ -208,7 +235,9 @@ pub fn paste(
 pub fn insert_rows(doc_id: u64, at: usize, count: usize, state: Db<'_>) -> AppResult<DocumentMeta> {
     let mut guard = lock(&state)?;
     let doc = guard.get_mut(doc_id)?;
-    doc.insert_rows(at, count)?;
+    let abs = abs_insert_row(doc, at)?;
+    doc.clear_filter();
+    doc.insert_rows(abs, count)?;
     Ok(doc.meta())
 }
 
@@ -216,7 +245,12 @@ pub fn insert_rows(doc_id: u64, at: usize, count: usize, state: Db<'_>) -> AppRe
 pub fn delete_rows(doc_id: u64, indices: Vec<usize>, state: Db<'_>) -> AppResult<DocumentMeta> {
     let mut guard = lock(&state)?;
     let doc = guard.get_mut(doc_id)?;
-    doc.delete_rows(indices)?;
+    let mut abs = Vec::with_capacity(indices.len());
+    for d in indices {
+        abs.push(abs_row(doc, d)?);
+    }
+    doc.clear_filter();
+    doc.delete_rows(abs)?;
     Ok(doc.meta())
 }
 
@@ -224,7 +258,10 @@ pub fn delete_rows(doc_id: u64, indices: Vec<usize>, state: Db<'_>) -> AppResult
 pub fn move_row(doc_id: u64, from: usize, to: usize, state: Db<'_>) -> AppResult<DocumentMeta> {
     let mut guard = lock(&state)?;
     let doc = guard.get_mut(doc_id)?;
-    doc.move_row(from, to)?;
+    let from_abs = abs_row(doc, from)?;
+    let to_abs = abs_row(doc, to)?;
+    doc.clear_filter();
+    doc.move_row(from_abs, to_abs)?;
     Ok(doc.meta())
 }
 
@@ -239,6 +276,8 @@ pub fn insert_column(
 ) -> AppResult<DocumentMeta> {
     let mut guard = lock(&state)?;
     let doc = guard.get_mut(doc_id)?;
+    // Column structure shifts the indices a filter references, so drop it.
+    doc.clear_filter();
     doc.insert_column(at, name)?;
     Ok(doc.meta())
 }
@@ -247,6 +286,7 @@ pub fn insert_column(
 pub fn delete_columns(doc_id: u64, indices: Vec<usize>, state: Db<'_>) -> AppResult<DocumentMeta> {
     let mut guard = lock(&state)?;
     let doc = guard.get_mut(doc_id)?;
+    doc.clear_filter();
     doc.delete_columns(indices)?;
     Ok(doc.meta())
 }
@@ -268,6 +308,7 @@ pub fn rename_column(
 pub fn move_column(doc_id: u64, from: usize, to: usize, state: Db<'_>) -> AppResult<DocumentMeta> {
     let mut guard = lock(&state)?;
     let doc = guard.get_mut(doc_id)?;
+    doc.clear_filter();
     doc.move_column(from, to)?;
     Ok(doc.meta())
 }
@@ -278,6 +319,8 @@ pub fn move_column(doc_id: u64, from: usize, to: usize, state: Db<'_>) -> AppRes
 pub fn sort(doc_id: u64, keys: Vec<SortKey>, state: Db<'_>) -> AppResult<DocumentMeta> {
     let mut guard = lock(&state)?;
     let doc = guard.get_mut(doc_id)?;
+    // Sorting reorders all rows, invalidating a filter view; drop it.
+    doc.clear_filter();
     doc.sort(&keys)?;
     Ok(doc.meta())
 }
@@ -286,6 +329,8 @@ pub fn sort(doc_id: u64, keys: Vec<SortKey>, state: Db<'_>) -> AppResult<Documen
 pub fn set_header_mode(doc_id: u64, has_header: bool, state: Db<'_>) -> AppResult<DocumentMeta> {
     let mut guard = lock(&state)?;
     let doc = guard.get_mut(doc_id)?;
+    // Re-interpreting the header row shifts all row indices; drop any filter.
+    doc.clear_filter();
     doc.set_header_mode(has_header);
     Ok(doc.meta())
 }
@@ -315,12 +360,40 @@ pub fn replace_all(
     })
 }
 
+// ----- filtering ---------------------------------------------------------
+
+#[tauri::command]
+pub fn set_filter(doc_id: u64, spec: FilterGroup, state: Db<'_>) -> AppResult<DocumentMeta> {
+    let mut guard = lock(&state)?;
+    let doc = guard.get_mut(doc_id)?;
+    let view = filter_mod::matching_rows(doc, &spec)?;
+    // A filter that excludes nothing isn't an active filter — avoids reporting
+    // "N of N rows · filtered" for a match-all or empty spec.
+    if view.len() == doc.n_rows() {
+        doc.clear_filter();
+    } else {
+        doc.set_filter(view);
+    }
+    Ok(doc.meta())
+}
+
+#[tauri::command]
+pub fn clear_filter(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
+    let mut guard = lock(&state)?;
+    let doc = guard.get_mut(doc_id)?;
+    doc.clear_filter();
+    Ok(doc.meta())
+}
+
 // ----- history -----------------------------------------------------------
 
 #[tauri::command]
 pub fn undo(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
     let mut guard = lock(&state)?;
     let doc = guard.get_mut(doc_id)?;
+    // Undo/redo may reinstate rows the filter view doesn't account for, so the
+    // view is dropped to keep coordinates consistent.
+    doc.clear_filter();
     doc.undo()?;
     Ok(doc.meta())
 }
@@ -329,6 +402,7 @@ pub fn undo(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
 pub fn redo(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
     let mut guard = lock(&state)?;
     let doc = guard.get_mut(doc_id)?;
+    doc.clear_filter();
     doc.redo()?;
     Ok(doc.meta())
 }

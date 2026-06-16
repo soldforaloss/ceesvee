@@ -24,6 +24,8 @@ export function ColumnMenu({ state, headers, onClose }: ColumnMenuProps) {
   const renameColumn = useStore((s) => s.renameColumn);
   const insertColumn = useStore((s) => s.insertColumn);
   const deleteColumns = useStore((s) => s.deleteColumns);
+  const setFrozenCols = useStore((s) => s.setFrozenCols);
+  const frozenCols = useStore((s) => (s.activeId != null ? (s.frozenCols[s.activeId] ?? 0) : 0));
 
   useEffect(() => {
     const onDown = (e: MouseEvent) => {
@@ -92,6 +94,11 @@ export function ColumnMenu({ state, headers, onClose }: ColumnMenuProps) {
           <MenuItem onClick={() => run(() => void sortBy([{ column: col, descending: true }]))}>
             Sort descending
           </MenuItem>
+          <Divider />
+          <MenuItem onClick={() => run(() => setFrozenCols(col + 1))}>Freeze up to here</MenuItem>
+          {frozenCols > 0 && (
+            <MenuItem onClick={() => run(() => setFrozenCols(0))}>Unfreeze columns</MenuItem>
+          )}
           <Divider />
           <MenuItem onClick={() => setRenaming(true)}>Rename…</MenuItem>
           <MenuItem

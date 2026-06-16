@@ -50,6 +50,12 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
       }
     >
       <div className="space-y-3 text-sm">
+        {meta.filtered && (
+          <p className="rounded bg-violet-50 px-2 py-1.5 text-xs text-violet-700 dark:bg-violet-500/10 dark:text-violet-300">
+            A filter is active — all {meta.totalRowCount.toLocaleString()} rows will be written. The
+            filter only changes the on-screen view, not what is saved.
+          </p>
+        )}
         <Row label="Delimiter">
           <select
             value={

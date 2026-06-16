@@ -3,7 +3,7 @@
 
 use encoding_rs::Encoding;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::{delimiter, encoding};
 
 /// The result of parsing a file: a ragged-normalised grid plus the settings
@@ -39,6 +39,15 @@ pub fn parse(bytes: &[u8], settings: &ParseSettings) -> AppResult<ParsedFile> {
     };
 
     let (text, _had_errors) = encoding::decode(bytes, encoding);
+
+    // A NUL byte in the decoded text is a strong signal this is a binary file,
+    // not delimited text (real text encodings, incl. UTF-16, decode without
+    // NULs). Reject early with a clear message instead of producing garbage.
+    if text.as_bytes().iter().take(8192).any(|&b| b == 0) {
+        return Err(AppError::invalid(
+            "this does not look like a delimited text file",
+        ));
+    }
 
     // 2. Delimiter: honour the override, else sniff.
     let delimiter = settings
@@ -114,6 +123,17 @@ mod tests {
     fn detects_crlf() {
         let parsed = parse(b"a,b\r\n1,2\r\n", &ParseSettings::default()).unwrap();
         assert!(parsed.uses_crlf);
+    }
+
+    #[test]
+    fn rejects_binary_with_nul() {
+        // A buffer containing NUL bytes (e.g. the start of a zip/binary) is
+        // rejected rather than parsed into garbage rows.
+        assert!(parse(
+            b"PK\x03\x04\x00\x00\x08\x00garbage",
+            &ParseSettings::default()
+        )
+        .is_err());
     }
 
     #[test]

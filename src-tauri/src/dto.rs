@@ -14,7 +14,12 @@ pub struct DocumentMeta {
     pub id: u64,
     pub path: Option<String>,
     pub file_name: String,
+    /// Visible row count (the filtered count when a filter is active).
     pub row_count: usize,
+    /// Total data rows, ignoring any active filter.
+    pub total_row_count: usize,
+    /// Whether a row filter is currently applied.
+    pub filtered: bool,
     pub col_count: usize,
     pub headers: Vec<String>,
     pub has_header_row: bool,
@@ -108,6 +113,97 @@ pub struct SelectionStats {
     pub avg: Option<f64>,
     pub min: Option<f64>,
     pub max: Option<f64>,
+}
+
+/// The detected data type of a column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColumnKind {
+    Number,
+    Date,
+    Bool,
+    Text,
+}
+
+/// Numeric aggregates for a column; present only when it has numeric cells.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumericSummary {
+    pub min: f64,
+    pub max: f64,
+    pub mean: f64,
+}
+
+/// Per-column type detection and summary, computed over all data rows.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnSummary {
+    pub column: usize,
+    pub kind: ColumnKind,
+    /// Total data rows (equals the document's row count).
+    pub count: usize,
+    /// Empty/blank cells in this column.
+    pub nulls: usize,
+    /// Number of distinct non-empty values.
+    pub unique: usize,
+    /// Numeric aggregates over the numeric cells, if any.
+    pub numeric: Option<NumericSummary>,
+}
+
+/// Comparison operator for a single filter condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FilterOp {
+    Equals,
+    NotEquals,
+    Contains,
+    NotContains,
+    StartsWith,
+    EndsWith,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    IsEmpty,
+    NotEmpty,
+    Regex,
+}
+
+/// How sibling filter nodes are combined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Conjunction {
+    And,
+    Or,
+}
+
+/// A single leaf condition: `column <op> value`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterCondition {
+    pub column: usize,
+    pub op: FilterOp,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub case_sensitive: bool,
+}
+
+/// A group of filter nodes combined with a conjunction (supports nesting).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterGroup {
+    pub conjunction: Conjunction,
+    pub nodes: Vec<FilterNode>,
+}
+
+/// A node in the filter tree: a leaf condition or a nested group. Tagged by a
+/// `type` field on the wire ("condition" / "group").
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum FilterNode {
+    Condition(FilterCondition),
+    Group(FilterGroup),
 }
 
 /// Options controlling how a document is serialized on save.

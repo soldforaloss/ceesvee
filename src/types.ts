@@ -9,6 +9,8 @@ export interface DocumentMeta {
   path: string | null;
   fileName: string;
   rowCount: number;
+  totalRowCount: number;
+  filtered: boolean;
   colCount: number;
   headers: string[];
   hasHeaderRow: boolean;
@@ -71,6 +73,60 @@ export interface SelectionStats {
   min: number | null;
   max: number | null;
 }
+
+export type ColumnKind = "number" | "date" | "bool" | "text";
+
+export interface NumericSummary {
+  min: number;
+  max: number;
+  mean: number;
+}
+
+export interface ColumnSummary {
+  column: number;
+  kind: ColumnKind;
+  count: number;
+  nulls: number;
+  unique: number;
+  numeric: NumericSummary | null;
+}
+
+export type FilterOp =
+  | "equals"
+  | "notEquals"
+  | "contains"
+  | "notContains"
+  | "startsWith"
+  | "endsWith"
+  | "gt"
+  | "gte"
+  | "lt"
+  | "lte"
+  | "isEmpty"
+  | "notEmpty"
+  | "regex";
+
+export type Conjunction = "and" | "or";
+
+export interface FilterCondition {
+  type: "condition";
+  /** Stable client-side id for React keys (ignored by the backend). */
+  id: string;
+  column: number;
+  op: FilterOp;
+  value: string;
+  caseSensitive: boolean;
+}
+
+export interface FilterGroup {
+  type: "group";
+  /** Stable client-side id for React keys (ignored by the backend). */
+  id: string;
+  conjunction: Conjunction;
+  nodes: FilterNode[];
+}
+
+export type FilterNode = FilterCondition | FilterGroup;
 
 export interface ExportOptions {
   delimiter: string;

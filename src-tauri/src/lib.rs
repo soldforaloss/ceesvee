@@ -1,6 +1,7 @@
 //! CEESVEE core library: a Rust-owned, in-memory CSV/delimited-file model
 //! exposed to the web front end through a small Tauri command surface.
 
+mod analyze;
 mod commands;
 mod delimiter;
 mod document;
@@ -8,6 +9,7 @@ mod dto;
 mod encoding;
 mod error;
 mod export;
+mod filter;
 mod find;
 mod parse;
 mod sort;
@@ -73,6 +75,7 @@ pub fn run() {
             commands::take_pending_files,
             commands::get_rows,
             commands::selection_stats,
+            commands::column_summaries,
             commands::set_cell,
             commands::set_cells,
             commands::paste,
@@ -85,6 +88,8 @@ pub fn run() {
             commands::move_column,
             commands::sort,
             commands::set_header_mode,
+            commands::set_filter,
+            commands::clear_filter,
             commands::find,
             commands::replace_all,
             commands::undo,

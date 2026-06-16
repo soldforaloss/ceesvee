@@ -15,11 +15,35 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { darkGridTheme, dirtyCellOverride, lightGridTheme } from "../lib/gridTheme";
 import * as api from "../lib/tauri";
 import { useStore } from "../store/useStore";
-import type { DocumentMeta } from "../types";
+import type { ColumnKind, DocumentMeta } from "../types";
 import { ColumnMenu, type ColumnMenuState } from "./ColumnMenu";
 
 const PAGE = 200;
 const DEFAULT_COL_WIDTH = 160;
+
+// Header type-badge sprites (Feather-style), rendered by glide-data-grid next
+// to a column's title once its type has been detected. Text columns get none.
+const HEADER_ICONS: Record<string, (p: { fgColor: string }) => string> = {
+  ceesveeNumber: (p) =>
+    `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="${p.fgColor}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></svg>`,
+  ceesveeDate: (p) =>
+    `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="${p.fgColor}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`,
+  ceesveeBool: (p) =>
+    `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="${p.fgColor}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`,
+};
+
+function iconForKind(kind: ColumnKind): string | undefined {
+  switch (kind) {
+    case "number":
+      return "ceesveeNumber";
+    case "date":
+      return "ceesveeDate";
+    case "bool":
+      return "ceesveeBool";
+    default:
+      return undefined;
+  }
+}
 
 interface GridProps {
   meta: DocumentMeta;
@@ -54,6 +78,17 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
 
   const findMatches = useStore((s) => s.find.matches);
   const findIndex = useStore((s) => s.find.index);
+  const frozenCols = useStore((s) => s.frozenCols[docId] ?? 0);
+  const summaries = useStore((s) => (s.summariesDocId === docId ? s.summaries : null));
+
+  // Detected type per column (defaults to text until summaries load).
+  const columnKinds = useMemo<ColumnKind[]>(() => {
+    const kinds: ColumnKind[] = new Array(colCount).fill("text");
+    if (summaries) {
+      for (const cs of summaries) if (cs.column < colCount) kinds[cs.column] = cs.kind;
+    }
+    return kinds;
+  }, [summaries, colCount]);
 
   // ----- columns ----------------------------------------------------------
 
@@ -64,8 +99,9 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         id: String(i),
         width: colWidths[i] ?? DEFAULT_COL_WIDTH,
         hasMenu: true,
+        icon: iconForKind(columnKinds[i] ?? "text"),
       })),
-    [meta.headers, colWidths],
+    [meta.headers, colWidths, columnKinds],
   );
 
   // ----- windowed data fetching ------------------------------------------
@@ -120,6 +156,13 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     const count = region ? region.height + 2 * PAGE : PAGE;
     loadRange(start, count);
   }, [docId, dataVersion, loadRange]);
+
+  // (Re)detect column types + summaries whenever the document changes
+  // structurally. Debounced in the store; results drive header badges,
+  // numeric alignment, and the summaries panel.
+  useEffect(() => {
+    useStore.getState().loadSummaries();
+  }, [docId, dataVersion]);
 
   const onVisibleRegionChanged = useCallback(
     (range: Rectangle) => {
@@ -179,11 +222,14 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         data: value,
         displayData: value,
         allowOverlay: true,
+        contentAlign: columnKinds[col] === "number" ? "right" : undefined,
         themeOverride: isDirty ? dirtyCellOverride : undefined,
       };
     },
-    // Reads only refs; structural refreshes go through `updateCells`.
-    [],
+    // Cell data is read from refs; recreated only when column types change so
+    // numeric columns re-render right-aligned. Structural refreshes still go
+    // through `updateCells`.
+    [columnKinds],
   );
 
   const onCellEdited = useCallback(([col, row]: Item, newValue: EditableGridCell) => {
@@ -259,7 +305,9 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         ref={gridRef}
         theme={dark ? darkGridTheme : lightGridTheme}
         columns={columns}
+        headerIcons={HEADER_ICONS}
         rows={meta.rowCount}
+        freezeColumns={Math.min(frozenCols, Math.max(0, colCount - 1))}
         getCellContent={getCellContent}
         onCellEdited={onCellEdited}
         onPaste={onPaste}

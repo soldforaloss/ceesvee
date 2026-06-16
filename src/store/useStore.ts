@@ -5,8 +5,10 @@ import * as api from "../lib/tauri";
 import { applyReplace } from "../lib/replace";
 import type {
   CellRect,
+  ColumnSummary,
   DocumentMeta,
   ExportOptions,
+  FilterGroup,
   FindMatch,
   FindOptions,
   OpenOptions,
@@ -21,6 +23,8 @@ const MAX_RECENT = 10;
 
 // Debounce timer for the (backend-computed) selection statistics.
 let statsTimer: ReturnType<typeof setTimeout> | null = null;
+// Debounce timer for the (backend-computed) per-column summaries.
+let summariesTimer: ReturnType<typeof setTimeout> | null = null;
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
@@ -60,6 +64,24 @@ const initialFind: FindState = {
   index: 0,
 };
 
+export interface FilterState {
+  open: boolean;
+  /** The query-builder tree (kept even while not applied, for editing). */
+  spec: FilterGroup;
+}
+
+const initialFilter: FilterState = {
+  open: false,
+  spec: {
+    type: "group",
+    id: "root",
+    conjunction: "and",
+    nodes: [
+      { type: "condition", id: "c0", column: 0, op: "contains", value: "", caseSensitive: false },
+    ],
+  },
+};
+
 interface Store {
   tabs: DocumentMeta[];
   activeId: number | null;
@@ -74,6 +96,13 @@ interface Store {
   selectedRows: number[];
   selectedCols: number[];
   find: FindState;
+  filter: FilterState;
+  /** Per-document count of pinned leading columns, keyed by doc id. */
+  frozenCols: Record<number, number>;
+  /** Detected per-column type + summary for the active doc (null until loaded). */
+  summaries: ColumnSummary[] | null;
+  /** Which document `summaries` belong to (guards against cross-tab staleness). */
+  summariesDocId: number | null;
 
   // lifecycle / chrome
   init: () => void;
@@ -81,6 +110,8 @@ interface Store {
   setError: (error: string | null) => void;
   setActive: (id: number) => void;
   setSelection: (rect: CellRect | null, rows: number[], cols: number[]) => void;
+  setFrozenCols: (count: number) => void;
+  loadSummaries: () => void;
 
   // documents
   openDialog: () => Promise<void>;
@@ -111,6 +142,12 @@ interface Store {
   gotoMatch: (delta: number) => void;
   replaceCurrent: () => Promise<void>;
   replaceAllMatches: () => Promise<void>;
+
+  // filter
+  setFilterOpen: (open: boolean) => void;
+  updateFilterSpec: (spec: FilterGroup) => void;
+  applyFilter: (spec: FilterGroup) => Promise<void>;
+  clearFilter: () => Promise<void>;
 }
 
 function loadRecent(): string[] {
@@ -188,6 +225,10 @@ export const useStore = create<Store>((set, get) => {
     selectedRows: [],
     selectedCols: [],
     find: initialFind,
+    filter: initialFilter,
+    frozenCols: {},
+    summaries: null,
+    summariesDocId: null,
 
     init: () => {
       const theme = loadTheme();
@@ -217,6 +258,8 @@ export const useStore = create<Store>((set, get) => {
         selectionRect: null,
         selectedRows: [],
         selectedCols: [],
+        summaries: null,
+        summariesDocId: null,
       }),
 
     setSelection: (rect, rows, cols) => {
@@ -238,6 +281,32 @@ export const useStore = create<Store>((set, get) => {
           })
           .catch(() => undefined);
       }, 120);
+    },
+
+    setFrozenCols: (count) =>
+      set((s) => {
+        const id = s.activeId;
+        if (id == null) return {};
+        return { frozenCols: { ...s.frozenCols, [id]: Math.max(0, count) } };
+      }),
+
+    loadSummaries: () => {
+      const id = get().activeId;
+      if (id == null) {
+        set({ summaries: null, summariesDocId: null });
+        return;
+      }
+      // Computed in Rust over the full document (the front-end cache only holds
+      // the visible window). Debounced and guarded against a tab switch.
+      if (summariesTimer !== null) clearTimeout(summariesTimer);
+      summariesTimer = setTimeout(() => {
+        void api
+          .columnSummaries(id)
+          .then((summaries) => {
+            if (get().activeId === id) set({ summaries, summariesDocId: id });
+          })
+          .catch(() => undefined);
+      }, 150);
     },
 
     openDialog: async () => {
@@ -280,16 +349,23 @@ export const useStore = create<Store>((set, get) => {
             ? tabs[tabs.length - 1].id
             : null
           : s.activeId;
+        const frozenCols = { ...s.frozenCols };
+        delete frozenCols[id];
         // Only invalidate the grid cache when the active document actually
         // changed; closing a background tab must not refetch the active grid.
-        return { tabs, activeId, dataVersion: closingActive ? s.dataVersion + 1 : s.dataVersion };
+        return {
+          tabs,
+          activeId,
+          frozenCols,
+          dataVersion: closingActive ? s.dataVersion + 1 : s.dataVersion,
+        };
       });
     },
 
     reparse: async (options) => {
       const id = get().activeId;
       if (id == null) return;
-      set({ busy: true });
+      set({ busy: true, summaries: null, summariesDocId: null });
       try {
         const meta = await api.reparse(id, options);
         reloadDoc(meta);
@@ -299,15 +375,49 @@ export const useStore = create<Store>((set, get) => {
       }
     },
 
-    setHeaderMode: (hasHeader) => mutate((id) => api.setHeaderMode(id, hasHeader)),
+    setHeaderMode: (hasHeader) => {
+      // Promoting/demoting the header row re-interprets every column.
+      set({ summaries: null, summariesDocId: null });
+      return mutate((id) => api.setHeaderMode(id, hasHeader));
+    },
 
     setCell: (row, col, value) => mutate((id) => api.setCell(id, row, col, value), false),
     pasteBlock: (row, col, block) => mutate((id) => api.paste(id, row, col, block)),
     insertRows: (at, count) => mutate((id) => api.insertRows(id, at, count)),
     deleteRows: (indices) => mutate((id) => api.deleteRows(id, indices)),
     moveRow: (from, to) => mutate((id) => api.moveRow(id, from, to)),
-    insertColumn: (at, name) => mutate((id) => api.insertColumn(id, at, name)),
-    deleteColumns: (indices) => mutate((id) => api.deleteColumns(id, indices)),
+    insertColumn: (at, name) => {
+      const id = get().activeId;
+      if (id != null) {
+        // Column identity shifts: invalidate summaries and keep the frozen
+        // boundary on the same logical columns (shift it right if we inserted
+        // within the frozen region).
+        set((s) => {
+          const frozen = s.frozenCols[id] ?? 0;
+          return {
+            summaries: null,
+            summariesDocId: null,
+            frozenCols: { ...s.frozenCols, [id]: at < frozen ? frozen + 1 : frozen },
+          };
+        });
+      }
+      return mutate((docId) => api.insertColumn(docId, at, name));
+    },
+    deleteColumns: (indices) => {
+      const id = get().activeId;
+      if (id != null) {
+        set((s) => {
+          const frozen = s.frozenCols[id] ?? 0;
+          const removedBelow = indices.filter((c) => c < frozen).length;
+          return {
+            summaries: null,
+            summariesDocId: null,
+            frozenCols: { ...s.frozenCols, [id]: Math.max(0, frozen - removedBelow) },
+          };
+        });
+      }
+      return mutate((docId) => api.deleteColumns(docId, indices));
+    },
     renameColumn: (col, name) => mutate((id) => api.renameColumn(id, col, name)),
     sortBy: (keys) => mutate((id) => api.sort(id, keys)),
     undo: () => mutate((id) => api.undo(id)),
@@ -437,6 +547,21 @@ export const useStore = create<Store>((set, get) => {
         set({ error: String(e) });
       }
     },
+
+    // ----- filter ---------------------------------------------------------
+
+    setFilterOpen: (open) => set((s) => ({ filter: { ...s.filter, open } })),
+
+    updateFilterSpec: (spec) => set((s) => ({ filter: { ...s.filter, spec } })),
+
+    // Applying/clearing a filter changes the visible row set, so both go through
+    // reloadDoc (bumping dataVersion) to refetch the grid against the new view.
+    applyFilter: async (spec) => {
+      set((s) => ({ filter: { ...s.filter, spec } }));
+      await mutate((id) => api.setFilter(id, spec));
+    },
+
+    clearFilter: () => mutate((id) => api.clearFilter(id)),
   };
 });
 

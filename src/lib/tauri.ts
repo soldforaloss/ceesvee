@@ -5,8 +5,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   CellRect,
+  ColumnSummary,
   DocumentMeta,
   ExportOptions,
+  FilterGroup,
   FindMatch,
   FindOptions,
   OpenOptions,
@@ -38,6 +40,9 @@ export const getRows = (docId: number, start: number, count: number) =>
 
 export const selectionStats = (docId: number, rect: CellRect) =>
   invoke<SelectionStats>("selection_stats", { docId, rect });
+
+export const columnSummaries = (docId: number) =>
+  invoke<ColumnSummary[]>("column_summaries", { docId });
 
 export const setCell = (docId: number, row: number, col: number, value: string) =>
   invoke<DocumentMeta>("set_cell", { docId, row, col, value });
@@ -74,6 +79,11 @@ export const sort = (docId: number, keys: SortKey[]) =>
 
 export const setHeaderMode = (docId: number, hasHeader: boolean) =>
   invoke<DocumentMeta>("set_header_mode", { docId, hasHeader });
+
+export const setFilter = (docId: number, spec: FilterGroup) =>
+  invoke<DocumentMeta>("set_filter", { docId, spec });
+
+export const clearFilter = (docId: number) => invoke<DocumentMeta>("clear_filter", { docId });
 
 export const find = (docId: number, options: FindOptions) =>
   invoke<FindMatch[]>("find", { docId, options });
