@@ -33,21 +33,21 @@
     "fileAssociations": [
       {
         "ext": ["csv"],
-        "name": "CSV File",
+        "name": "CEESVEE.csv",
         "description": "Comma-separated values",
         "mimeType": "text/csv",
         "role": "Editor"
       },
       {
         "ext": ["tsv", "tab"],
-        "name": "TSV File",
+        "name": "CEESVEE.tsv",
         "description": "Tab-separated values",
         "mimeType": "text/tab-separated-values",
         "role": "Editor"
       },
       {
         "ext": ["psv"],
-        "name": "PSV File",
+        "name": "CEESVEE.psv",
         "description": "Pipe-separated values",
         "role": "Editor"
       }
