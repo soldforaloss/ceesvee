@@ -1,0 +1,47 @@
+[package]
+name = "ceesvee"
+version = "0.1.0"
+description = "CEESVEE — a fast, open-source CSV / delimited-file viewer and editor"
+authors = ["CEESVEE contributors"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/soldforaloss/ceesvee"
+rust-version = "1.77"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "ceesvee_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-clipboard-manager = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+csv = "1"
+encoding_rs = "0.8"
+chardetng = "0.1"
+regex = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Release profile tuned for throughput on large files while keeping the
+# binary reasonably small.
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
