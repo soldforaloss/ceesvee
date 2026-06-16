@@ -16,16 +16,51 @@ mod util;
 
 use std::sync::Mutex;
 
-use crate::state::AppState;
+use crate::state::{AppState, PendingFiles};
+
+/// Extract file paths from a process argument list, skipping the executable and
+/// any flags, and keeping only arguments that point at an existing file. This is
+/// how "Open with CEESVEE" hands us the file on Windows and Linux.
+fn files_from_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    args.into_iter()
+        .skip(1)
+        .filter(|arg| !arg.starts_with('-'))
+        .filter(|arg| std::path::Path::new(arg).is_file())
+        .collect()
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let initial_files = files_from_args(std::env::args());
+
+    #[allow(unused_mut)]
+    let mut builder = tauri::Builder::default();
+
+    // Single-instance must be registered first so it can intercept a second
+    // launch (e.g. opening another CSV) before a new window is created, and
+    // forward the file to the window that's already open.
+    #[cfg(desktop)]
+    {
+        use tauri::{Emitter, Manager};
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            let files = files_from_args(argv);
+            if !files.is_empty() {
+                let _ = app.emit("open-files", files);
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }));
+    }
+
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(Mutex::new(AppState::default()))
+        .manage(PendingFiles(Mutex::new(initial_files)))
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
             commands::reparse,
@@ -33,6 +68,7 @@ pub fn run() {
             commands::close_document,
             commands::get_meta,
             commands::list_encodings,
+            commands::take_pending_files,
             commands::get_rows,
             commands::selection_stats,
             commands::set_cell,
@@ -53,6 +89,28 @@ pub fn run() {
             commands::redo,
             commands::save,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app, _event| {
+            // macOS delivers "Open with" via an application event, not argv.
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::{Emitter, Manager};
+                if let tauri::RunEvent::Opened { urls } = _event {
+                    let files: Vec<String> = urls
+                        .iter()
+                        .filter_map(|u| u.to_file_path().ok())
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect();
+                    if !files.is_empty() {
+                        if let Some(state) = _app.try_state::<PendingFiles>() {
+                            if let Ok(mut pending) = state.0.lock() {
+                                pending.extend(files.clone());
+                            }
+                        }
+                        let _ = _app.emit("open-files", files);
+                    }
+                }
+            }
+        });
 }

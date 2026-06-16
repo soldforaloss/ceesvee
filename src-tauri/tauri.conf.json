@@ -30,6 +30,28 @@
     "category": "Productivity",
     "shortDescription": "Fast CSV / delimited-file viewer and editor",
     "longDescription": "CEESVEE is a fast, open-source spreadsheet-style editor for CSV, TSV and other delimited files, built with Tauri and React.",
+    "fileAssociations": [
+      {
+        "ext": ["csv"],
+        "name": "CSV File",
+        "description": "Comma-separated values",
+        "mimeType": "text/csv",
+        "role": "Editor"
+      },
+      {
+        "ext": ["tsv", "tab"],
+        "name": "TSV File",
+        "description": "Tab-separated values",
+        "mimeType": "text/tab-separated-values",
+        "role": "Editor"
+      },
+      {
+        "ext": ["psv"],
+        "name": "PSV File",
+        "description": "Pipe-separated values",
+        "role": "Editor"
+      }
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

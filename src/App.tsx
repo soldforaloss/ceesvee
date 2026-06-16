@@ -1,3 +1,4 @@
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect, useState } from "react";
 
 import { EmptyState } from "./components/EmptyState";
@@ -10,6 +11,7 @@ import { SourceBar } from "./components/SourceBar";
 import { StatusBar } from "./components/StatusBar";
 import { Tabs } from "./components/Tabs";
 import { Toolbar } from "./components/Toolbar";
+import * as api from "./lib/tauri";
 import { useActiveMeta, useStore } from "./store/useStore";
 
 export default function App() {
@@ -26,6 +28,28 @@ export default function App() {
   // Initialise persisted state (recent files, theme) once.
   useEffect(() => {
     useStore.getState().init();
+  }, []);
+
+  // Open files passed via "Open with CEESVEE": at launch (cold start, drained
+  // from the backend) and while running (warm start, forwarded by the
+  // single-instance plugin / macOS).
+  useEffect(() => {
+    const open = async (paths: string[]) => {
+      for (const path of paths) await useStore.getState().openPath(path);
+    };
+    void api
+      .takePendingFiles()
+      .then(open)
+      .catch(() => undefined);
+
+    let unlisten: UnlistenFn | undefined;
+    void listen<string[]>("open-files", (event) => void open(event.payload))
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => undefined);
+
+    return () => unlisten?.();
   }, []);
 
   // Track effective dark mode for the grid theme.

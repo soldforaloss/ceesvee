@@ -2,9 +2,15 @@
 //! Wrapped in a `Mutex` and handed to Tauri via `Builder::manage`.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::document::Document;
 use crate::error::{AppError, AppResult};
+
+/// Files passed on the command line at launch (e.g. "Open with CEESVEE"),
+/// waiting to be drained by the front end once it mounts.
+#[derive(Default)]
+pub struct PendingFiles(pub Mutex<Vec<String>>);
 
 #[derive(Default)]
 pub struct AppState {

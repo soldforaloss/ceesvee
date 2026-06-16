@@ -31,6 +31,8 @@ export const getMeta = (docId: number) => invoke<DocumentMeta>("get_meta", { doc
 
 export const listEncodings = () => invoke<string[]>("list_encodings");
 
+export const takePendingFiles = () => invoke<string[]>("take_pending_files");
+
 export const getRows = (docId: number, start: number, count: number) =>
   invoke<RowsResponse>("get_rows", { docId, start, count });
 

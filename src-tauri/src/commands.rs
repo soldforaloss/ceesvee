@@ -13,7 +13,7 @@ use crate::dto::{
 };
 use crate::error::{AppError, AppResult};
 use crate::parse::{parse, ParseSettings, ParsedFile};
-use crate::state::AppState;
+use crate::state::{AppState, PendingFiles};
 use crate::{encoding, export, find as find_mod, util};
 
 type Db<'a> = State<'a, Mutex<AppState>>;
@@ -136,6 +136,16 @@ pub fn get_meta(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
 #[tauri::command]
 pub fn list_encodings() -> Vec<String> {
     encoding::SUPPORTED.iter().map(|s| s.to_string()).collect()
+}
+
+/// Drain and return any files passed at launch (e.g. via "Open with CEESVEE").
+#[tauri::command]
+pub fn take_pending_files(pending: State<'_, PendingFiles>) -> Vec<String> {
+    pending
+        .0
+        .lock()
+        .map(|mut files| std::mem::take(&mut *files))
+        .unwrap_or_default()
 }
 
 // ----- windowed reads ----------------------------------------------------
