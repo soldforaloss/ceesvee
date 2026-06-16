@@ -6,6 +6,21 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0]
+
+### Added
+
+- Per-column data-type detection (number / date / boolean / text) shown as
+  header badges, with numeric columns right-aligned and a **Column Summaries**
+  panel reporting count, blanks, unique values, and numeric min / max / mean.
+- **Row filtering** with an advanced query builder: nest AND/OR groups of
+  conditions (contains, equals, numeric comparisons, is-empty, regex, and more).
+  The status bar shows "N of M rows" with one-click clear. Filtering is a
+  non-destructive view — Save always writes every row, never just the visible
+  ones.
+- **Frozen (pinned) leading columns** via the column header menu.
+- **Drag-and-drop** a file onto the window to open it.
+
 ## [0.1.0] — Initial release
 
 ### Added
@@ -30,6 +45,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Light and dark themes that follow the OS preference.
 - File associations for `.csv` / `.tsv` / `.tab` / `.psv`, with single-instance
   handling so "Open with CEESVEE" opens the file in a new tab of the running app.
+- In-app auto-updates (cryptographically signed) that check GitHub Releases on
+  launch and prompt to download and install a newer version.
 
-[Unreleased]: https://github.com/soldforaloss/ceesvee/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/soldforaloss/ceesvee/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/soldforaloss/ceesvee/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/soldforaloss/ceesvee/releases/tag/v0.1.0
