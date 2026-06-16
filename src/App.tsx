@@ -10,6 +10,7 @@ import { Close } from "./components/Icons";
 import { SortDialog } from "./components/SortDialog";
 import { SourceBar } from "./components/SourceBar";
 import { StatusBar } from "./components/StatusBar";
+import { SummaryPanel } from "./components/SummaryPanel";
 import { Tabs } from "./components/Tabs";
 import { Toolbar } from "./components/Toolbar";
 import * as api from "./lib/tauri";
@@ -25,6 +26,7 @@ export default function App() {
 
   const [sortOpen, setSortOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [summariesOpen, setSummariesOpen] = useState(false);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const [dragOver, setDragOver] = useState(false);
 
@@ -151,7 +153,11 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col bg-white text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
-      <Toolbar onSort={() => setSortOpen(true)} onExport={() => setExportOpen(true)} />
+      <Toolbar
+        onSort={() => setSortOpen(true)}
+        onExport={() => setExportOpen(true)}
+        onSummaries={() => setSummariesOpen(true)}
+      />
       <Tabs />
       <SourceBar />
       <FindBar />
@@ -171,6 +177,7 @@ export default function App() {
 
       {sortOpen && <SortDialog onClose={() => setSortOpen(false)} />}
       {exportOpen && <ExportDialog onClose={() => setExportOpen(false)} />}
+      {summariesOpen && <SummaryPanel onClose={() => setSummariesOpen(false)} />}
 
       {error && (
         <div className="fixed bottom-10 right-4 z-50 flex max-w-md items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 shadow-lg dark:border-red-900/60 dark:bg-red-950/80 dark:text-red-300">

@@ -5,6 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   CellRect,
+  ColumnSummary,
   DocumentMeta,
   ExportOptions,
   FindMatch,
@@ -38,6 +39,9 @@ export const getRows = (docId: number, start: number, count: number) =>
 
 export const selectionStats = (docId: number, rect: CellRect) =>
   invoke<SelectionStats>("selection_stats", { docId, rect });
+
+export const columnSummaries = (docId: number) =>
+  invoke<ColumnSummary[]>("column_summaries", { docId });
 
 export const setCell = (docId: number, row: number, col: number, value: string) =>
   invoke<DocumentMeta>("set_cell", { docId, row, col, value });

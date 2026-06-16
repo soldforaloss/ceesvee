@@ -461,6 +461,7 @@ name = "ceesvee"
 version = "0.1.0"
 dependencies = [
  "chardetng",
+ "chrono",
  "csv",
  "encoding_rs",
  "regex",

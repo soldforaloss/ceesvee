@@ -8,8 +8,8 @@ use tauri::State;
 
 use crate::document::Document;
 use crate::dto::{
-    CellRect, DocumentMeta, ExportOptions, FindMatch, FindOptions, OpenOptions, ReplaceResult,
-    RowsResponse, SelectionStats, SortKey,
+    CellRect, ColumnSummary, DocumentMeta, ExportOptions, FindMatch, FindOptions, OpenOptions,
+    ReplaceResult, RowsResponse, SelectionStats, SortKey,
 };
 use crate::error::{AppError, AppResult};
 use crate::parse::{parse, ParseSettings, ParsedFile};
@@ -158,6 +158,11 @@ pub fn get_rows(doc_id: u64, start: usize, count: usize, state: Db<'_>) -> AppRe
 #[tauri::command]
 pub fn selection_stats(doc_id: u64, rect: CellRect, state: Db<'_>) -> AppResult<SelectionStats> {
     Ok(lock(&state)?.get(doc_id)?.selection_stats(rect))
+}
+
+#[tauri::command]
+pub fn column_summaries(doc_id: u64, state: Db<'_>) -> AppResult<Vec<ColumnSummary>> {
+    Ok(lock(&state)?.get(doc_id)?.column_summaries())
 }
 
 // ----- cell editing ------------------------------------------------------

@@ -72,6 +72,23 @@ export interface SelectionStats {
   max: number | null;
 }
 
+export type ColumnKind = "number" | "date" | "bool" | "text";
+
+export interface NumericSummary {
+  min: number;
+  max: number;
+  mean: number;
+}
+
+export interface ColumnSummary {
+  column: number;
+  kind: ColumnKind;
+  count: number;
+  nulls: number;
+  unique: number;
+  numeric: NumericSummary | null;
+}
+
 export interface ExportOptions {
   delimiter: string;
   encoding: string;

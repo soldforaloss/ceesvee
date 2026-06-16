@@ -110,6 +110,41 @@ pub struct SelectionStats {
     pub max: Option<f64>,
 }
 
+/// The detected data type of a column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColumnKind {
+    Number,
+    Date,
+    Bool,
+    Text,
+}
+
+/// Numeric aggregates for a column; present only when it has numeric cells.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumericSummary {
+    pub min: f64,
+    pub max: f64,
+    pub mean: f64,
+}
+
+/// Per-column type detection and summary, computed over all data rows.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnSummary {
+    pub column: usize,
+    pub kind: ColumnKind,
+    /// Total data rows (equals the document's row count).
+    pub count: usize,
+    /// Empty/blank cells in this column.
+    pub nulls: usize,
+    /// Number of distinct non-empty values.
+    pub unique: usize,
+    /// Numeric aggregates over the numeric cells, if any.
+    pub numeric: Option<NumericSummary>,
+}
+
 /// Options controlling how a document is serialized on save.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

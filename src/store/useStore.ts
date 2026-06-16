@@ -5,6 +5,7 @@ import * as api from "../lib/tauri";
 import { applyReplace } from "../lib/replace";
 import type {
   CellRect,
+  ColumnSummary,
   DocumentMeta,
   ExportOptions,
   FindMatch,
@@ -21,6 +22,8 @@ const MAX_RECENT = 10;
 
 // Debounce timer for the (backend-computed) selection statistics.
 let statsTimer: ReturnType<typeof setTimeout> | null = null;
+// Debounce timer for the (backend-computed) per-column summaries.
+let summariesTimer: ReturnType<typeof setTimeout> | null = null;
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
@@ -76,6 +79,10 @@ interface Store {
   find: FindState;
   /** Per-document count of pinned leading columns, keyed by doc id. */
   frozenCols: Record<number, number>;
+  /** Detected per-column type + summary for the active doc (null until loaded). */
+  summaries: ColumnSummary[] | null;
+  /** Which document `summaries` belong to (guards against cross-tab staleness). */
+  summariesDocId: number | null;
 
   // lifecycle / chrome
   init: () => void;
@@ -84,6 +91,7 @@ interface Store {
   setActive: (id: number) => void;
   setSelection: (rect: CellRect | null, rows: number[], cols: number[]) => void;
   setFrozenCols: (count: number) => void;
+  loadSummaries: () => void;
 
   // documents
   openDialog: () => Promise<void>;
@@ -192,6 +200,8 @@ export const useStore = create<Store>((set, get) => {
     selectedCols: [],
     find: initialFind,
     frozenCols: {},
+    summaries: null,
+    summariesDocId: null,
 
     init: () => {
       const theme = loadTheme();
@@ -221,6 +231,8 @@ export const useStore = create<Store>((set, get) => {
         selectionRect: null,
         selectedRows: [],
         selectedCols: [],
+        summaries: null,
+        summariesDocId: null,
       }),
 
     setSelection: (rect, rows, cols) => {
@@ -250,6 +262,25 @@ export const useStore = create<Store>((set, get) => {
         if (id == null) return {};
         return { frozenCols: { ...s.frozenCols, [id]: Math.max(0, count) } };
       }),
+
+    loadSummaries: () => {
+      const id = get().activeId;
+      if (id == null) {
+        set({ summaries: null, summariesDocId: null });
+        return;
+      }
+      // Computed in Rust over the full document (the front-end cache only holds
+      // the visible window). Debounced and guarded against a tab switch.
+      if (summariesTimer !== null) clearTimeout(summariesTimer);
+      summariesTimer = setTimeout(() => {
+        void api
+          .columnSummaries(id)
+          .then((summaries) => {
+            if (get().activeId === id) set({ summaries, summariesDocId: id });
+          })
+          .catch(() => undefined);
+      }, 150);
+    },
 
     openDialog: async () => {
       const selected = await openFileDialog({ multiple: false, filters: FILE_FILTERS });

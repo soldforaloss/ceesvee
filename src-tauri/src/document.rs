@@ -9,7 +9,11 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::dto::{CellRect, DocumentMeta, RowsResponse, SelectionStats, SortKey};
+use crate::analyze;
+use crate::dto::{
+    CellRect, ColumnKind, ColumnSummary, DocumentMeta, NumericSummary, RowsResponse,
+    SelectionStats, SortKey,
+};
 use crate::error::{AppError, AppResult};
 use crate::parse::ParsedFile;
 
@@ -262,16 +266,14 @@ impl Document {
         for r in rect.y..row_end {
             for c in rect.x..col_end {
                 count += 1;
-                if let Ok(n) = self.rows[r][c].trim().parse::<f64>() {
-                    if n.is_finite() {
-                        numeric_count += 1;
-                        sum += n;
-                        if n < min {
-                            min = n;
-                        }
-                        if n > max {
-                            max = n;
-                        }
+                if let Some(n) = analyze::as_number(&self.rows[r][c]) {
+                    numeric_count += 1;
+                    sum += n;
+                    if n < min {
+                        min = n;
+                    }
+                    if n > max {
+                        max = n;
                     }
                 }
             }
@@ -285,6 +287,81 @@ impl Document {
             avg: has_numeric.then(|| sum / numeric_count as f64),
             min: has_numeric.then_some(min),
             max: has_numeric.then_some(max),
+        }
+    }
+
+    /// Detect the type of, and summarise, every column over all data rows.
+    /// Computed in Rust because the front end only caches the visible window;
+    /// recomputed on demand (no cache, so it can never go stale after an edit).
+    pub fn column_summaries(&self) -> Vec<ColumnSummary> {
+        (0..self.headers.len())
+            .map(|c| self.column_summary(c))
+            .collect()
+    }
+
+    /// Type detection + summary for a single column.
+    pub fn column_summary(&self, col: usize) -> ColumnSummary {
+        let count = self.rows.len();
+        let mut nulls = 0usize;
+        let mut numeric = 0usize;
+        let mut booly = 0usize;
+        let mut datey = 0usize;
+        let mut unique: HashSet<&str> = HashSet::new();
+        let mut sum = 0.0f64;
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+
+        for row in &self.rows {
+            let trimmed = row.get(col).map(|s| s.trim()).unwrap_or("");
+            if trimmed.is_empty() {
+                nulls += 1;
+                continue;
+            }
+            unique.insert(trimmed);
+            if let Some(n) = analyze::as_number(trimmed) {
+                numeric += 1;
+                sum += n;
+                if n < min {
+                    min = n;
+                }
+                if n > max {
+                    max = n;
+                }
+            } else if analyze::is_bool(trimmed) {
+                booly += 1;
+            } else if analyze::is_date(trimmed) {
+                datey += 1;
+            }
+        }
+
+        // A column takes a non-text kind only when *every* non-empty cell
+        // matches it; otherwise it is text (blanks never decide the kind).
+        let non_empty = count - nulls;
+        let kind = if non_empty == 0 {
+            ColumnKind::Text
+        } else if numeric == non_empty {
+            ColumnKind::Number
+        } else if booly == non_empty {
+            ColumnKind::Bool
+        } else if datey == non_empty {
+            ColumnKind::Date
+        } else {
+            ColumnKind::Text
+        };
+
+        let numeric_summary = (numeric > 0).then_some(NumericSummary {
+            min,
+            max,
+            mean: sum / numeric as f64,
+        });
+
+        ColumnSummary {
+            column: col,
+            kind,
+            count,
+            nulls,
+            unique: unique.len(),
+            numeric: numeric_summary,
         }
     }
 

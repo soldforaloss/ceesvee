@@ -13,6 +13,7 @@ import {
   Save,
   Search,
   SortIcon,
+  Stats,
   Sun,
   Trash,
   Undo,
@@ -22,9 +23,10 @@ import { Logo } from "./Logo";
 interface ToolbarProps {
   onSort: () => void;
   onExport: () => void;
+  onSummaries: () => void;
 }
 
-export function Toolbar({ onSort, onExport }: ToolbarProps) {
+export function Toolbar({ onSort, onExport, onSummaries }: ToolbarProps) {
   const meta = useActiveMeta();
   const theme = useStore((s) => s.theme);
   const recent = useStore((s) => s.recent);
@@ -149,6 +151,9 @@ export function Toolbar({ onSort, onExport }: ToolbarProps) {
       </Tool>
       <Tool title="Sort…" onClick={onSort} disabled={!hasDoc}>
         <SortIcon />
+      </Tool>
+      <Tool title="Column summaries" onClick={onSummaries} disabled={!hasDoc}>
+        <Stats />
       </Tool>
       <Tool title="Export / Save As…" onClick={onExport} disabled={!hasDoc}>
         <Download />

@@ -103,6 +103,14 @@ export const Download = ({ className }: IconProps) => (
   </svg>
 );
 
+export const Stats = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <line x1="18" y1="20" x2="18" y2="10" />
+    <line x1="12" y1="20" x2="12" y2="4" />
+    <line x1="6" y1="20" x2="6" y2="14" />
+  </svg>
+);
+
 export const Close = ({ className }: IconProps) => (
   <svg {...base} className={className}>
     <path d="M18 6 6 18M6 6l12 12" />
