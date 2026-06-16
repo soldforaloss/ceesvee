@@ -59,7 +59,7 @@ export function EmptyState() {
       )}
 
       <p className="text-xs text-zinc-400 dark:text-zinc-600">
-        Tip: drag isn’t needed — use Open, or your recent files above.
+        Tip: drag a file onto the window to open it, or use the buttons above.
       </p>
     </div>
   );
