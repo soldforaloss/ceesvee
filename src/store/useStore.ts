@@ -74,6 +74,8 @@ interface Store {
   selectedRows: number[];
   selectedCols: number[];
   find: FindState;
+  /** Per-document count of pinned leading columns, keyed by doc id. */
+  frozenCols: Record<number, number>;
 
   // lifecycle / chrome
   init: () => void;
@@ -81,6 +83,7 @@ interface Store {
   setError: (error: string | null) => void;
   setActive: (id: number) => void;
   setSelection: (rect: CellRect | null, rows: number[], cols: number[]) => void;
+  setFrozenCols: (count: number) => void;
 
   // documents
   openDialog: () => Promise<void>;
@@ -188,6 +191,7 @@ export const useStore = create<Store>((set, get) => {
     selectedRows: [],
     selectedCols: [],
     find: initialFind,
+    frozenCols: {},
 
     init: () => {
       const theme = loadTheme();
@@ -240,6 +244,13 @@ export const useStore = create<Store>((set, get) => {
       }, 120);
     },
 
+    setFrozenCols: (count) =>
+      set((s) => {
+        const id = s.activeId;
+        if (id == null) return {};
+        return { frozenCols: { ...s.frozenCols, [id]: Math.max(0, count) } };
+      }),
+
     openDialog: async () => {
       const selected = await openFileDialog({ multiple: false, filters: FILE_FILTERS });
       if (typeof selected === "string") await get().openPath(selected);
@@ -280,9 +291,16 @@ export const useStore = create<Store>((set, get) => {
             ? tabs[tabs.length - 1].id
             : null
           : s.activeId;
+        const frozenCols = { ...s.frozenCols };
+        delete frozenCols[id];
         // Only invalidate the grid cache when the active document actually
         // changed; closing a background tab must not refetch the active grid.
-        return { tabs, activeId, dataVersion: closingActive ? s.dataVersion + 1 : s.dataVersion };
+        return {
+          tabs,
+          activeId,
+          frozenCols,
+          dataVersion: closingActive ? s.dataVersion + 1 : s.dataVersion,
+        };
       });
     },
 

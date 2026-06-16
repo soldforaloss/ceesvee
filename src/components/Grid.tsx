@@ -54,6 +54,7 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
 
   const findMatches = useStore((s) => s.find.matches);
   const findIndex = useStore((s) => s.find.index);
+  const frozenCols = useStore((s) => s.frozenCols[docId] ?? 0);
 
   // ----- columns ----------------------------------------------------------
 
@@ -260,6 +261,7 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         theme={dark ? darkGridTheme : lightGridTheme}
         columns={columns}
         rows={meta.rowCount}
+        freezeColumns={Math.min(frozenCols, colCount)}
         getCellContent={getCellContent}
         onCellEdited={onCellEdited}
         onPaste={onPaste}
