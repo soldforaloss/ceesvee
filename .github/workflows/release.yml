@@ -6,9 +6,41 @@ on:
       - "v*"
 
 jobs:
-  publish-tauri:
+  # 1. Pre-create the draft release once, so the parallel build jobs upload to a
+  #    release that already exists instead of racing to create it (which caused
+  #    "already_exists" failures and an incomplete latest.json).
+  create-release:
     permissions:
-      contents: write # required for tauri-action to create the Release
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.result }}
+    steps:
+      - name: Create draft release
+        id: create
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = context.ref.replace('refs/tags/', '');
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `CEESVEE ${tag}`,
+              body: 'See the assets below to download and install this version.',
+              draft: true,
+              prerelease: false,
+            });
+            return data.id;
+
+  # 2. Build each platform and upload its signed bundles to the pre-created
+  #    release. includeUpdaterJson is off: no job writes latest.json, so there
+  #    is no manifest upload race. The build runs with a one-shot retry to absorb
+  #    the intermittent macOS bundle_dmg.sh failure.
+  build-tauri:
+    needs: create-release
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -57,16 +89,63 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build & publish release
+      # Attempt 1: continue-on-error so a flaky failure (notably the macOS DMG
+      # bundling) doesn't fail the job outright — we retry once below.
+      - name: Build & upload bundles (attempt 1)
+        id: build1
+        continue-on-error: true
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "CEESVEE ${{ github.ref_name }}"
-          releaseBody: "See the assets below to download and install this version."
-          releaseDraft: true
-          prerelease: false
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          includeUpdaterJson: false
           args: ${{ matrix.args }}
+
+      # Attempt 2: only if the first failed. The DMG flake fails during the build
+      # (before any upload), so the retry rebuilds and uploads cleanly.
+      - name: Build & upload bundles (retry)
+        if: steps.build1.outcome == 'failure'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          includeUpdaterJson: false
+          args: ${{ matrix.args }}
+
+  # 3. After every platform has uploaded its bundles, assemble latest.json once
+  #    from the published .sig files and upload it. Single writer = always a
+  #    complete, race-free updater manifest. The release stays a draft for
+  #    manual review/publish.
+  publish-manifest:
+    needs: build-tauri
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Download bundle signatures
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p sigs
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern "*.sig" --dir sigs
+
+      - name: Assemble latest.json
+        run: node scripts/build-latest-json.mjs "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" sigs latest.json
+
+      - name: Upload latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" latest.json --repo "$GITHUB_REPOSITORY" --clobber
