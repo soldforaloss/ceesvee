@@ -8,6 +8,7 @@ import type {
   ColumnSummary,
   DocumentMeta,
   ExportOptions,
+  FilterGroup,
   FindMatch,
   FindOptions,
   OpenOptions,
@@ -78,6 +79,11 @@ export const sort = (docId: number, keys: SortKey[]) =>
 
 export const setHeaderMode = (docId: number, hasHeader: boolean) =>
   invoke<DocumentMeta>("set_header_mode", { docId, hasHeader });
+
+export const setFilter = (docId: number, spec: FilterGroup) =>
+  invoke<DocumentMeta>("set_filter", { docId, spec });
+
+export const clearFilter = (docId: number) => invoke<DocumentMeta>("clear_filter", { docId });
 
 export const find = (docId: number, options: FindOptions) =>
   invoke<FindMatch[]>("find", { docId, options });

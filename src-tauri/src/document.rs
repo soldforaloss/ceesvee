@@ -117,6 +117,10 @@ pub struct Document {
     redo_stack: Vec<EditOp>,
     /// `undo_stack.len()` at the last save; the document is dirty when it differs.
     saved_marker: usize,
+    /// Absolute indices of the rows matching the active filter, in order; `None`
+    /// when unfiltered. A non-undoable view: recomputed on `set_filter` and
+    /// cleared by structural mutations (handled in the command layer).
+    filter_view: Option<Vec<usize>>,
 }
 
 impl Document {
@@ -166,6 +170,7 @@ impl Document {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             saved_marker: 0,
+            filter_view: None,
         }
     }
 
@@ -192,6 +197,7 @@ impl Document {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             saved_marker: 0,
+            filter_view: None,
         }
     }
 
@@ -217,6 +223,54 @@ impl Document {
         self.has_header_row
     }
 
+    // ----- row filter view -------------------------------------------------
+
+    /// Visible row count: the filtered count when a filter is active, else the
+    /// full row count.
+    pub fn visible_len(&self) -> usize {
+        self.filter_view
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or(self.rows.len())
+    }
+
+    pub fn is_filtered(&self) -> bool {
+        self.filter_view.is_some()
+    }
+
+    /// The active filter's matching absolute row indices, in order, if any.
+    pub fn filter_view(&self) -> Option<&[usize]> {
+        self.filter_view.as_deref()
+    }
+
+    /// Replace the active filter with a precomputed view (absolute row indices).
+    pub fn set_filter(&mut self, view: Vec<usize>) {
+        self.filter_view = Some(view);
+    }
+
+    pub fn clear_filter(&mut self) {
+        self.filter_view = None;
+    }
+
+    /// Translate a visible (display) row index to its absolute index. Identity
+    /// when unfiltered; `None` if the display index is past the visible range.
+    pub fn display_to_abs(&self, display: usize) -> Option<usize> {
+        match &self.filter_view {
+            Some(view) => view.get(display).copied(),
+            None => (display < self.rows.len()).then_some(display),
+        }
+    }
+
+    /// Like [`Document::display_to_abs`], but a display index equal to the
+    /// visible length maps to the end of the document so a paste/insert at the
+    /// bottom can append.
+    pub fn display_to_abs_insert(&self, display: usize) -> Option<usize> {
+        if display == self.visible_len() {
+            return Some(self.rows.len());
+        }
+        self.display_to_abs(display)
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.undo_stack.len() != self.saved_marker
     }
@@ -238,11 +292,20 @@ impl Document {
 
     /// A window of rows plus a parallel dirty-flag matrix.
     pub fn get_rows(&self, start: usize, count: usize) -> RowsResponse {
-        let start = start.min(self.rows.len());
-        let end = start.saturating_add(count).min(self.rows.len());
-        let rows: Vec<Vec<String>> = self.rows[start..end].to_vec();
+        let visible = self.visible_len();
+        let start = start.min(visible);
+        let end = start.saturating_add(count).min(visible);
+        // Map a display-row index to its absolute index (identity when unfiltered).
+        let abs_at = |display: usize| -> usize {
+            match &self.filter_view {
+                Some(view) => view[display],
+                None => display,
+            }
+        };
+        let rows: Vec<Vec<String>> = (start..end).map(|d| self.rows[abs_at(d)].clone()).collect();
         let dirty: Vec<Vec<bool>> = (start..end)
-            .map(|r| {
+            .map(|d| {
+                let r = abs_at(d);
                 (0..self.headers.len())
                     .map(|c| self.dirty_cells.contains(&(r, c)))
                     .collect()
@@ -254,7 +317,7 @@ impl Document {
     /// Aggregate numeric statistics over a rectangular selection (data-row
     /// coordinates). Computed in Rust so it scales to any selection size.
     pub fn selection_stats(&self, rect: CellRect) -> SelectionStats {
-        let row_end = rect.y.saturating_add(rect.height).min(self.rows.len());
+        let row_end = rect.y.saturating_add(rect.height).min(self.visible_len());
         let col_end = rect.x.saturating_add(rect.width).min(self.headers.len());
 
         let mut count = 0usize;
@@ -263,7 +326,12 @@ impl Document {
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
 
-        for r in rect.y..row_end {
+        for d in rect.y..row_end {
+            // Resolve display row to absolute (identity when unfiltered).
+            let r = match &self.filter_view {
+                Some(view) => view[d],
+                None => d,
+            };
             for c in rect.x..col_end {
                 count += 1;
                 if let Some(n) = analyze::as_number(&self.rows[r][c]) {
@@ -377,7 +445,9 @@ impl Document {
             id: self.id,
             path: self.path.as_ref().map(|p| p.to_string_lossy().to_string()),
             file_name,
-            row_count: self.rows.len(),
+            row_count: self.visible_len(),
+            total_row_count: self.rows.len(),
+            filtered: self.filter_view.is_some(),
             col_count: self.headers.len(),
             headers: self.headers.clone(),
             has_header_row: self.has_header_row,

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { EmptyState } from "./components/EmptyState";
 import { ExportDialog } from "./components/ExportDialog";
+import { FilterDialog } from "./components/FilterDialog";
 import { FindBar } from "./components/FindBar";
 import { Grid } from "./components/Grid";
 import { Close } from "./components/Icons";
@@ -27,6 +28,7 @@ export default function App() {
   const [sortOpen, setSortOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [summariesOpen, setSummariesOpen] = useState(false);
+  const [filterOpen, setFilterOpen] = useState(false);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const [dragOver, setDragOver] = useState(false);
 
@@ -157,6 +159,7 @@ export default function App() {
         onSort={() => setSortOpen(true)}
         onExport={() => setExportOpen(true)}
         onSummaries={() => setSummariesOpen(true)}
+        onFilter={() => setFilterOpen(true)}
       />
       <Tabs />
       <SourceBar />
@@ -178,6 +181,7 @@ export default function App() {
       {sortOpen && <SortDialog onClose={() => setSortOpen(false)} />}
       {exportOpen && <ExportDialog onClose={() => setExportOpen(false)} />}
       {summariesOpen && <SummaryPanel onClose={() => setSummariesOpen(false)} />}
+      {filterOpen && <FilterDialog onClose={() => setFilterOpen(false)} />}
 
       {error && (
         <div className="fixed bottom-10 right-4 z-50 flex max-w-md items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 shadow-lg dark:border-red-900/60 dark:bg-red-950/80 dark:text-red-300">

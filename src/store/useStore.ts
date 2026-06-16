@@ -8,6 +8,7 @@ import type {
   ColumnSummary,
   DocumentMeta,
   ExportOptions,
+  FilterGroup,
   FindMatch,
   FindOptions,
   OpenOptions,
@@ -63,6 +64,21 @@ const initialFind: FindState = {
   index: 0,
 };
 
+export interface FilterState {
+  open: boolean;
+  /** The query-builder tree (kept even while not applied, for editing). */
+  spec: FilterGroup;
+}
+
+const initialFilter: FilterState = {
+  open: false,
+  spec: {
+    type: "group",
+    conjunction: "and",
+    nodes: [{ type: "condition", column: 0, op: "contains", value: "", caseSensitive: false }],
+  },
+};
+
 interface Store {
   tabs: DocumentMeta[];
   activeId: number | null;
@@ -77,6 +93,7 @@ interface Store {
   selectedRows: number[];
   selectedCols: number[];
   find: FindState;
+  filter: FilterState;
   /** Per-document count of pinned leading columns, keyed by doc id. */
   frozenCols: Record<number, number>;
   /** Detected per-column type + summary for the active doc (null until loaded). */
@@ -122,6 +139,12 @@ interface Store {
   gotoMatch: (delta: number) => void;
   replaceCurrent: () => Promise<void>;
   replaceAllMatches: () => Promise<void>;
+
+  // filter
+  setFilterOpen: (open: boolean) => void;
+  updateFilterSpec: (spec: FilterGroup) => void;
+  applyFilter: (spec: FilterGroup) => Promise<void>;
+  clearFilter: () => Promise<void>;
 }
 
 function loadRecent(): string[] {
@@ -199,6 +222,7 @@ export const useStore = create<Store>((set, get) => {
     selectedRows: [],
     selectedCols: [],
     find: initialFind,
+    filter: initialFilter,
     frozenCols: {},
     summaries: null,
     summariesDocId: null,
@@ -486,6 +510,21 @@ export const useStore = create<Store>((set, get) => {
         set({ error: String(e) });
       }
     },
+
+    // ----- filter ---------------------------------------------------------
+
+    setFilterOpen: (open) => set((s) => ({ filter: { ...s.filter, open } })),
+
+    updateFilterSpec: (spec) => set((s) => ({ filter: { ...s.filter, spec } })),
+
+    // Applying/clearing a filter changes the visible row set, so both go through
+    // reloadDoc (bumping dataVersion) to refetch the grid against the new view.
+    applyFilter: async (spec) => {
+      set((s) => ({ filter: { ...s.filter, spec } }));
+      await mutate((id) => api.setFilter(id, spec));
+    },
+
+    clearFilter: () => mutate((id) => api.clearFilter(id)),
   };
 });
 

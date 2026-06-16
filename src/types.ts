@@ -9,6 +9,8 @@ export interface DocumentMeta {
   path: string | null;
   fileName: string;
   rowCount: number;
+  totalRowCount: number;
+  filtered: boolean;
   colCount: number;
   headers: string[];
   hasHeaderRow: boolean;
@@ -88,6 +90,39 @@ export interface ColumnSummary {
   unique: number;
   numeric: NumericSummary | null;
 }
+
+export type FilterOp =
+  | "equals"
+  | "notEquals"
+  | "contains"
+  | "notContains"
+  | "startsWith"
+  | "endsWith"
+  | "gt"
+  | "gte"
+  | "lt"
+  | "lte"
+  | "isEmpty"
+  | "notEmpty"
+  | "regex";
+
+export type Conjunction = "and" | "or";
+
+export interface FilterCondition {
+  type: "condition";
+  column: number;
+  op: FilterOp;
+  value: string;
+  caseSensitive: boolean;
+}
+
+export interface FilterGroup {
+  type: "group";
+  conjunction: Conjunction;
+  nodes: FilterNode[];
+}
+
+export type FilterNode = FilterCondition | FilterGroup;
 
 export interface ExportOptions {
   delimiter: string;

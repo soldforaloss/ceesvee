@@ -32,31 +32,44 @@ fn build_regex(opts: &FindOptions) -> AppResult<Regex> {
         .map_err(|e| AppError::invalid(format!("invalid regular expression: {e}")))
 }
 
-/// Bounds (row/col ranges) to scan, derived from an optional selection.
+/// Bounds (row/col ranges) to scan, derived from an optional selection. Row
+/// bounds are in DISPLAY (visible) coordinates so they respect an active filter.
 fn scan_bounds(doc: &Document, opts: &FindOptions) -> (usize, usize, usize, usize) {
+    let visible = doc.visible_len();
     match opts.selection {
         Some(rect) => {
-            let row_start = rect.y.min(doc.n_rows());
-            let row_end = rect.y.saturating_add(rect.height).min(doc.n_rows());
+            let row_start = rect.y.min(visible);
+            let row_end = rect.y.saturating_add(rect.height).min(visible);
             let col_start = rect.x.min(doc.n_cols());
             let col_end = rect.x.saturating_add(rect.width).min(doc.n_cols());
             (row_start, row_end, col_start, col_end)
         }
-        None => (0, doc.n_rows(), 0, doc.n_cols()),
+        None => (0, visible, 0, doc.n_cols()),
     }
 }
 
-/// Return every cell (in data-row coordinates) that matches.
+/// Map a visible (display) row index to its absolute index (identity unfiltered).
+fn abs(view: Option<&[usize]>, display: usize) -> usize {
+    match view {
+        Some(v) => v[display],
+        None => display,
+    }
+}
+
+/// Return every matching cell. Rows are reported in DISPLAY coordinates (what
+/// the grid sees), so a find under an active filter scrolls to the right cell.
 pub fn find(doc: &Document, opts: &FindOptions) -> AppResult<Vec<FindMatch>> {
     let re = build_regex(opts)?;
     let (row_start, row_end, col_start, col_end) = scan_bounds(doc, opts);
     let rows = doc.rows();
+    let view = doc.filter_view();
 
     let mut matches = Vec::new();
-    for (r, row) in rows.iter().enumerate().take(row_end).skip(row_start) {
+    for disp in row_start..row_end {
+        let row = &rows[abs(view, disp)];
         for (c, cell) in row.iter().enumerate().take(col_end).skip(col_start) {
             if re.is_match(cell) {
-                matches.push(FindMatch { row: r, col: c });
+                matches.push(FindMatch { row: disp, col: c });
             }
         }
     }
@@ -74,9 +87,14 @@ pub fn replace_all(
     let re = build_regex(opts)?;
     let (row_start, row_end, col_start, col_end) = scan_bounds(doc, opts);
     let rows = doc.rows();
+    let view = doc.filter_view();
 
+    // Changes are returned in ABSOLUTE coordinates because the caller applies
+    // them via `Document::set_cells`, which works in absolute space.
     let mut changes = Vec::new();
-    for (r, row) in rows.iter().enumerate().take(row_end).skip(row_start) {
+    for disp in row_start..row_end {
+        let r = abs(view, disp);
+        let row = &rows[r];
         for (c, cell) in row.iter().enumerate().take(col_end).skip(col_start) {
             if !re.is_match(cell) {
                 continue;

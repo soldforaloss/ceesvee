@@ -9,6 +9,7 @@ mod dto;
 mod encoding;
 mod error;
 mod export;
+mod filter;
 mod find;
 mod parse;
 mod sort;
@@ -87,6 +88,8 @@ pub fn run() {
             commands::move_column,
             commands::sort,
             commands::set_header_mode,
+            commands::set_filter,
+            commands::clear_filter,
             commands::find,
             commands::replace_all,
             commands::undo,
