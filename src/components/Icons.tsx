@@ -142,6 +142,14 @@ export const ChevronDown = ({ className }: IconProps) => (
   </svg>
 );
 
+export const Dots = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <circle cx="5" cy="12" r="1" />
+    <circle cx="12" cy="12" r="1" />
+    <circle cx="19" cy="12" r="1" />
+  </svg>
+);
+
 export const Dot = ({ className }: IconProps) => (
   <svg width="8" height="8" viewBox="0 0 8 8" className={className}>
     <circle cx="4" cy="4" r="4" fill="currentColor" />

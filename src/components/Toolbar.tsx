@@ -5,6 +5,7 @@ import { useActiveMeta, useStore } from "../store/useStore";
 import {
   ChevronDown,
   ColumnPlus,
+  Dots,
   Download,
   FilePlus,
   Filter,
@@ -30,11 +31,21 @@ interface ToolbarProps {
   onFilter: () => void;
 }
 
+interface ToolItem {
+  label: string;
+  title?: string;
+  icon: React.ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+  active?: boolean;
+}
+
 export function Toolbar({ onSort, onExport, onSummaries, onFilter }: ToolbarProps) {
   const meta = useActiveMeta();
   const theme = useStore((s) => s.theme);
   const recent = useStore((s) => s.recent);
   const [recentOpen, setRecentOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
 
   const newDoc = useStore((s) => s.newDoc);
   const openDialog = useStore((s) => s.openDialog);
@@ -72,8 +83,37 @@ export function Toolbar({ onSort, onExport, onSummaries, onFilter }: ToolbarProp
     setTheme(next);
   };
 
+  // These two groups render inline on wide windows and collapse into the
+  // "More tools" menu on narrow ones, so nothing gets clipped.
+  const rowColumnTools: ToolItem[] = [
+    { label: "Insert row", icon: <RowPlus />, onClick: addRow, disabled: !hasDoc },
+    { label: "Delete selected rows", icon: <Trash />, onClick: removeRows, disabled: !hasDoc },
+    { label: "Add column", icon: <ColumnPlus />, onClick: addColumn, disabled: !hasDoc },
+  ];
+
+  const dataTools: ToolItem[] = [
+    {
+      label: "Find & replace",
+      title: "Find & replace (Ctrl+F)",
+      icon: <Search />,
+      onClick: () => setFindOpen(!findIsOpen),
+      active: findIsOpen,
+      disabled: !hasDoc,
+    },
+    {
+      label: "Filter rows…",
+      icon: <Filter />,
+      onClick: onFilter,
+      active: !!meta?.filtered,
+      disabled: !hasDoc,
+    },
+    { label: "Sort…", icon: <SortIcon />, onClick: onSort, disabled: !hasDoc },
+    { label: "Column summaries", icon: <Stats />, onClick: onSummaries, disabled: !hasDoc },
+    { label: "Export / Save As…", icon: <Download />, onClick: onExport, disabled: !hasDoc },
+  ];
+
   return (
-    <div className="flex h-11 shrink-0 items-center gap-1 border-b border-zinc-200 bg-zinc-50/80 px-2 backdrop-blur dark:border-zinc-800 dark:bg-zinc-900/80">
+    <div className="z-30 flex h-11 shrink-0 items-center gap-1 border-b border-zinc-200 bg-zinc-50/80 px-2 backdrop-blur dark:border-zinc-800 dark:bg-zinc-900/80">
       <span className="mr-1 flex select-none items-center gap-1.5 px-1 font-semibold tracking-tight text-violet-600 dark:text-violet-400">
         <Logo className="h-5 w-5" />
         CEESVEE
@@ -131,40 +171,54 @@ export function Toolbar({ onSort, onExport, onSummaries, onFilter }: ToolbarProp
         <Redo />
       </Tool>
 
-      <Divider />
+      <div className="hidden items-center gap-1 md:flex">
+        <Divider />
+        {rowColumnTools.map((t) => (
+          <Tool
+            key={t.label}
+            title={t.title ?? t.label}
+            onClick={t.onClick}
+            disabled={t.disabled}
+            active={t.active}
+          >
+            {t.icon}
+          </Tool>
+        ))}
+        <Divider />
+        {dataTools.map((t) => (
+          <Tool
+            key={t.label}
+            title={t.title ?? t.label}
+            onClick={t.onClick}
+            disabled={t.disabled}
+            active={t.active}
+          >
+            {t.icon}
+          </Tool>
+        ))}
+      </div>
 
-      <Tool title="Insert row" onClick={addRow} disabled={!hasDoc}>
-        <RowPlus />
-      </Tool>
-      <Tool title="Delete selected rows" onClick={removeRows} disabled={!hasDoc}>
-        <Trash />
-      </Tool>
-      <Tool title="Add column" onClick={addColumn} disabled={!hasDoc}>
-        <ColumnPlus />
-      </Tool>
-
-      <Divider />
-
-      <Tool
-        title="Find & replace (Ctrl+F)"
-        onClick={() => setFindOpen(!findIsOpen)}
-        active={findIsOpen}
-        disabled={!hasDoc}
-      >
-        <Search />
-      </Tool>
-      <Tool title="Filter rows…" onClick={onFilter} active={!!meta?.filtered} disabled={!hasDoc}>
-        <Filter />
-      </Tool>
-      <Tool title="Sort…" onClick={onSort} disabled={!hasDoc}>
-        <SortIcon />
-      </Tool>
-      <Tool title="Column summaries" onClick={onSummaries} disabled={!hasDoc}>
-        <Stats />
-      </Tool>
-      <Tool title="Export / Save As…" onClick={onExport} disabled={!hasDoc}>
-        <Download />
-      </Tool>
+      <div className="flex items-center gap-1 md:hidden">
+        <Divider />
+        <div className="relative flex">
+          <Tool title="More tools" onClick={() => setMoreOpen((o) => !o)} active={moreOpen}>
+            <Dots />
+          </Tool>
+          {moreOpen && (
+            <div
+              className="absolute left-0 top-10 z-40 w-60 overflow-hidden rounded-lg border border-zinc-200 bg-white py-1 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-800"
+              onMouseLeave={() => setMoreOpen(false)}
+            >
+              <MenuGroup
+                label="Rows & columns"
+                items={rowColumnTools}
+                onPick={() => setMoreOpen(false)}
+              />
+              <MenuGroup label="Data" items={dataTools} onPick={() => setMoreOpen(false)} />
+            </div>
+          )}
+        </div>
+      </div>
 
       <div className="flex-1" />
 
@@ -202,6 +256,41 @@ function Tool({
     >
       {children}
     </button>
+  );
+}
+
+function MenuGroup({
+  label,
+  items,
+  onPick,
+}: {
+  label: string;
+  items: ToolItem[];
+  onPick: () => void;
+}) {
+  return (
+    <>
+      <div className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
+        {label}
+      </div>
+      {items.map((t) => (
+        <button
+          key={t.label}
+          title={t.title ?? t.label}
+          disabled={t.disabled}
+          onClick={() => {
+            onPick();
+            t.onClick();
+          }}
+          className={`flex w-full items-center gap-2.5 px-3 py-1.5 text-left transition-colors hover:bg-zinc-100 disabled:cursor-default disabled:opacity-30 dark:hover:bg-zinc-700 ${
+            t.active ? "text-violet-700 dark:text-violet-300" : "text-zinc-700 dark:text-zinc-200"
+          }`}
+        >
+          {t.icon}
+          {t.label}
+        </button>
+      ))}
+    </>
   );
 }
 
