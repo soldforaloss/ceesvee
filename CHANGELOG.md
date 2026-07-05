@@ -6,6 +6,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.2]
+
+### Fixed
+
+- Toolbar tools are no longer cut off on narrow windows. Below ~770px the
+  row/column and data tools collapse into a **More tools** menu that stacks
+  them with labels under "Rows & columns" and "Data" headers; wider windows
+  keep the full inline toolbar.
+- Toolbar dropdown menus (Recent files, and the new More tools) no longer
+  render underneath the main content.
+
 ## [0.2.1]
 
 ### Fixed
@@ -64,7 +75,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In-app auto-updates (cryptographically signed) that check GitHub Releases on
   launch and prompt to download and install a newer version.
 
-[Unreleased]: https://github.com/soldforaloss/ceesvee/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/soldforaloss/ceesvee/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/soldforaloss/ceesvee/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/soldforaloss/ceesvee/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/soldforaloss/ceesvee/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/soldforaloss/ceesvee/releases/tag/v0.1.0
