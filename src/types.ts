@@ -246,6 +246,9 @@ export interface FilterGroup {
 
 export type FilterNode = FilterCondition | FilterGroup;
 
+/** What to do with the previous destination file when saving over it. */
+export type BackupPolicy = "none" | "single";
+
 export interface ExportOptions {
   delimiter: string;
   encoding: string;
@@ -253,4 +256,23 @@ export interface ExportOptions {
   lineEnding: LineEnding;
   bom: boolean;
   includeHeaders: boolean;
+  /** Backup policy for the previous destination file (default "none"). */
+  backup?: BackupPolicy;
+}
+
+/** One cell (or header) that a target encoding cannot represent. */
+export interface EncodingIncompatibility {
+  /** Data-row index; null for a header cell. */
+  row: number | null;
+  col: number;
+  value: string;
+}
+
+/** Result of scanning for characters a target encoding cannot represent. */
+export interface EncodingCompatibility {
+  encoding: string;
+  compatible: boolean;
+  affectedCells: number;
+  /** First affected locations (capped at 100). */
+  samples: EncodingIncompatibility[];
 }

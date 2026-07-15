@@ -8,6 +8,7 @@ import type {
   ColumnSummary,
   DiagnosticsReport,
   DocumentMeta,
+  EncodingCompatibility,
   ExportOptions,
   ExternalChange,
   FileFingerprint,
@@ -137,5 +138,25 @@ export const undo = (docId: number) => invoke<DocumentMeta>("undo", { docId });
 
 export const redo = (docId: number) => invoke<DocumentMeta>("redo", { docId });
 
-export const save = (docId: number, path: string, options: ExportOptions) =>
-  invoke<DocumentMeta>("save", { docId, path, options });
+/** Scan for characters the target encoding cannot represent. */
+export const checkEncodingCompatibility = (docId: number, encoding: string) =>
+  invoke<EncodingCompatibility>("check_encoding_compatibility", { docId, encoding });
+
+/**
+ * Start an atomic streaming save; resolves with the job id. Completion (and
+ * the refreshed metadata) arrives via the job events + getMeta.
+ */
+export const startSave = (
+  docId: number,
+  path: string,
+  options: ExportOptions,
+  expectedRevision: number,
+) => invoke<number>("start_save", { docId, path, options, expectedRevision });
+
+/** Start an atomic streaming export (no save point / fingerprint update). */
+export const startExport = (
+  docId: number,
+  path: string,
+  options: ExportOptions,
+  expectedRevision: number,
+) => invoke<number>("start_export", { docId, path, options, expectedRevision });

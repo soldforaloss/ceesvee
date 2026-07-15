@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { EmptyState } from "./components/EmptyState";
+import { EncodingIssuesDialog } from "./components/EncodingIssuesDialog";
 import { ExportDialog } from "./components/ExportDialog";
 import { ExternalChangeDialog } from "./components/ExternalChangeDialog";
 import { FilterDialog } from "./components/FilterDialog";
@@ -241,6 +242,7 @@ export default function App() {
       <ReopenDialog />
       <ExternalChangeDialog />
       <QuitDialog />
+      <EncodingIssuesDialog />
 
       {error && (
         <div className="fixed bottom-10 right-4 z-50 flex max-w-md items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 shadow-lg dark:border-red-900/60 dark:bg-red-950/80 dark:text-red-300">

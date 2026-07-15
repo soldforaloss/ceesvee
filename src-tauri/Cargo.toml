@@ -36,15 +36,14 @@ chardetng = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 regex = "1"
 thiserror = "2"
+# Crash-safe saves: staging file in the destination directory + atomic rename.
+tempfile = "3"
 
 # Single-instance is desktop-only: it forwards a second "Open with" launch
 # (and its file argument) to the already-running window instead of spawning a
 # new one.
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2"
-
-[dev-dependencies]
-tempfile = "3"
 
 # Release profile tuned for throughput on large files while keeping the
 # binary reasonably small.
