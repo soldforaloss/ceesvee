@@ -4,6 +4,7 @@
 mod analyze;
 mod commands;
 mod delimiter;
+mod diagnostics;
 mod document;
 mod dto;
 mod encoding;
@@ -21,6 +22,7 @@ mod util;
 
 use std::sync::Mutex;
 
+use crate::diagnostics::DiagnosticsCache;
 use crate::job::JobRegistry;
 use crate::state::{AppState, PendingFiles};
 
@@ -70,6 +72,7 @@ pub fn run() {
         .manage(Mutex::new(AppState::default()))
         .manage(PendingFiles(Mutex::new(initial_files)))
         .manage(JobRegistry::default())
+        .manage(DiagnosticsCache::default())
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
             commands::reparse,
@@ -79,6 +82,9 @@ pub fn run() {
             commands::list_encodings,
             commands::take_pending_files,
             commands::cancel_job,
+            commands::get_diagnostics,
+            commands::start_diagnostics_scan,
+            commands::apply_diagnostic_filter,
             commands::get_rows,
             commands::selection_stats,
             commands::column_summaries,

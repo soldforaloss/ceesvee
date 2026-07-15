@@ -2,6 +2,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useCallback, useEffect, useState } from "react";
 
+import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { EmptyState } from "./components/EmptyState";
 import { ExportDialog } from "./components/ExportDialog";
 import { FilterDialog } from "./components/FilterDialog";
@@ -14,6 +15,7 @@ import { StatusBar } from "./components/StatusBar";
 import { SummaryPanel } from "./components/SummaryPanel";
 import { Tabs } from "./components/Tabs";
 import { Toolbar } from "./components/Toolbar";
+import { onJobFinished, onJobProgress } from "./lib/jobs";
 import * as api from "./lib/tauri";
 import { checkForUpdates } from "./lib/updater";
 import { useActiveMeta, useStore } from "./store/useStore";
@@ -29,6 +31,7 @@ export default function App() {
   const [exportOpen, setExportOpen] = useState(false);
   const [summariesOpen, setSummariesOpen] = useState(false);
   const [filterOpen, setFilterOpen] = useState(false);
+  const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const [dragOver, setDragOver] = useState(false);
 
@@ -45,6 +48,26 @@ export default function App() {
   // Check for a newer release once at launch (no-op in dev).
   useEffect(() => {
     void checkForUpdates();
+  }, []);
+
+  // Route background-job progress/completion events into the store.
+  useEffect(() => {
+    let unProgress: UnlistenFn | undefined;
+    let unFinished: UnlistenFn | undefined;
+    void onJobProgress((p) => useStore.getState().handleJobProgress(p))
+      .then((fn) => {
+        unProgress = fn;
+      })
+      .catch(() => undefined);
+    void onJobFinished((f) => void useStore.getState().handleJobFinished(f))
+      .then((fn) => {
+        unFinished = fn;
+      })
+      .catch(() => undefined);
+    return () => {
+      unProgress?.();
+      unFinished?.();
+    };
   }, []);
 
   // Open files passed via "Open with CEESVEE": at launch (cold start, drained
@@ -165,15 +188,18 @@ export default function App() {
       <SourceBar />
       <FindBar />
 
-      <main className="relative min-h-0 flex-1">
-        {meta ? <Grid meta={meta} dataVersion={dataVersion} dark={dark} /> : <EmptyState />}
-        {dragOver && (
-          <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-violet-500/10 backdrop-blur-[1px]">
-            <div className="rounded-xl border-2 border-dashed border-violet-400 bg-white/85 px-6 py-4 text-sm font-medium text-violet-700 shadow-lg dark:bg-zinc-900/85 dark:text-violet-300">
-              Drop to open
+      <main className="relative flex min-h-0 flex-1">
+        <div className="relative min-w-0 flex-1">
+          {meta ? <Grid meta={meta} dataVersion={dataVersion} dark={dark} /> : <EmptyState />}
+          {dragOver && (
+            <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-violet-500/10 backdrop-blur-[1px]">
+              <div className="rounded-xl border-2 border-dashed border-violet-400 bg-white/85 px-6 py-4 text-sm font-medium text-violet-700 shadow-lg dark:bg-zinc-900/85 dark:text-violet-300">
+                Drop to open
+              </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
+        {diagnosticsOpen && meta && <DiagnosticsPanel />}
       </main>
 
       <StatusBar />

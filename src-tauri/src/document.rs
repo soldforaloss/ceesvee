@@ -15,7 +15,7 @@ use crate::dto::{
     SelectionStats, SortKey,
 };
 use crate::error::{AppError, AppResult};
-use crate::parse::ParsedFile;
+use crate::parse::{ImportInfo, ParsedFile};
 
 /// Line-ending style, tracked per document and configurable on export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +127,9 @@ pub struct Document {
     /// long-running results carry the revision they were computed against and
     /// are rejected when it no longer matches (see [`Document::check_revision`]).
     revision: u64,
+    /// Fidelity information captured when the source file was parsed
+    /// (decode damage, ragged records). Refreshed only by a reparse.
+    import_info: ImportInfo,
 }
 
 impl Document {
@@ -144,6 +147,7 @@ impl Document {
             encoding,
             had_bom,
             uses_crlf,
+            import,
         } = parsed;
 
         let (headers, rows) = if has_header_row && !records.is_empty() {
@@ -178,6 +182,7 @@ impl Document {
             saved_marker: 0,
             filter_view: None,
             revision: 1,
+            import_info: import,
         }
     }
 
@@ -206,6 +211,7 @@ impl Document {
             saved_marker: 0,
             filter_view: None,
             revision: 1,
+            import_info: ImportInfo::default(),
         }
     }
 
@@ -231,6 +237,16 @@ impl Document {
         self.has_header_row
     }
 
+    /// Canonical name of the encoding the source file was decoded from.
+    pub fn encoding_name(&self) -> &str {
+        &self.encoding_name
+    }
+
+    /// Import-time fidelity information (decode damage, ragged records).
+    pub fn import_info(&self) -> &ImportInfo {
+        &self.import_info
+    }
+
     /// Current document revision (see the field docs for what bumps it).
     pub fn revision(&self) -> u64 {
         self.revision
@@ -245,7 +261,6 @@ impl Document {
 
     /// Guard a deferred operation: fail with [`AppError::StaleRevision`] when
     /// the document has changed since `expected` was captured.
-    #[allow(dead_code)] // first consumed by the preview/apply commands of the feature PRs
     pub fn check_revision(&self, expected: u64) -> AppResult<()> {
         if self.revision == expected {
             Ok(())

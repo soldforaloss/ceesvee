@@ -6,11 +6,14 @@ import { applyReplace } from "../lib/replace";
 import type {
   CellRect,
   ColumnSummary,
+  DiagnosticsReport,
   DocumentMeta,
   ExportOptions,
   FilterGroup,
   FindMatch,
   FindOptions,
+  JobFinished,
+  JobProgress,
   OpenOptions,
   SortKey,
 } from "../types";
@@ -70,6 +73,36 @@ export interface FilterState {
   spec: FilterGroup;
 }
 
+/** Diagnostics scan/report state for one document. */
+export interface DiagnosticsDocState {
+  /** Last completed report (kept visible, marked stale, while rescanning). */
+  report: DiagnosticsReport | null;
+  /** Running scan job, if any. */
+  jobId: number | null;
+  processed: number;
+  total: number | null;
+  /** Terminal error of the last scan, if it failed. */
+  scanError: string | null;
+}
+
+const initialDiagnosticsDocState: DiagnosticsDocState = {
+  report: null,
+  jobId: null,
+  processed: 0,
+  total: null,
+  scanError: null,
+};
+
+/** One-shot request for the grid to scroll to and select a cell. */
+export interface JumpTarget {
+  row: number;
+  col: number;
+  /** Distinguishes repeated jumps to the same cell. */
+  nonce: number;
+}
+
+let jumpNonce = 0;
+
 const initialFilter: FilterState = {
   open: false,
   spec: {
@@ -103,6 +136,12 @@ interface Store {
   summaries: ColumnSummary[] | null;
   /** Which document `summaries` belong to (guards against cross-tab staleness). */
   summariesDocId: number | null;
+  /** Whether the diagnostics side panel is shown. */
+  diagnosticsOpen: boolean;
+  /** Diagnostics reports and scan state, keyed by document id. */
+  diagnostics: Record<number, DiagnosticsDocState>;
+  /** One-shot cell-jump request consumed by the grid. */
+  jumpTarget: JumpTarget | null;
 
   // lifecycle / chrome
   init: () => void;
@@ -148,6 +187,17 @@ interface Store {
   updateFilterSpec: (spec: FilterGroup) => void;
   applyFilter: (spec: FilterGroup) => Promise<void>;
   clearFilter: () => Promise<void>;
+
+  // diagnostics
+  setDiagnosticsOpen: (open: boolean) => void;
+  runDiagnosticsScan: () => Promise<void>;
+  cancelDiagnosticsScan: () => Promise<void>;
+  applyIssueFilter: (issueId: string) => Promise<void>;
+  jumpToCell: (row: number, col: number) => Promise<void>;
+
+  // background-job events (wired to the Tauri event listeners in App)
+  handleJobProgress: (progress: JobProgress) => void;
+  handleJobFinished: (finished: JobFinished) => Promise<void>;
 }
 
 function loadRecent(): string[] {
@@ -212,6 +262,16 @@ export const useStore = create<Store>((set, get) => {
     }
   };
 
+  /** Merge a partial update into one document's diagnostics state. */
+  const patchDiagnostics = (docId: number, patch: Partial<DiagnosticsDocState>) => {
+    set((s) => ({
+      diagnostics: {
+        ...s.diagnostics,
+        [docId]: { ...(s.diagnostics[docId] ?? initialDiagnosticsDocState), ...patch },
+      },
+    }));
+  };
+
   return {
     tabs: [],
     activeId: null,
@@ -229,6 +289,9 @@ export const useStore = create<Store>((set, get) => {
     frozenCols: {},
     summaries: null,
     summariesDocId: null,
+    diagnosticsOpen: false,
+    diagnostics: {},
+    jumpTarget: null,
 
     init: () => {
       const theme = loadTheme();
@@ -260,6 +323,7 @@ export const useStore = create<Store>((set, get) => {
         selectedCols: [],
         summaries: null,
         summariesDocId: null,
+        jumpTarget: null,
       }),
 
     setSelection: (rect, rows, cols) => {
@@ -351,12 +415,15 @@ export const useStore = create<Store>((set, get) => {
           : s.activeId;
         const frozenCols = { ...s.frozenCols };
         delete frozenCols[id];
+        const diagnostics = { ...s.diagnostics };
+        delete diagnostics[id];
         // Only invalidate the grid cache when the active document actually
         // changed; closing a background tab must not refetch the active grid.
         return {
           tabs,
           activeId,
           frozenCols,
+          diagnostics,
           dataVersion: closingActive ? s.dataVersion + 1 : s.dataVersion,
         };
       });
@@ -562,6 +629,86 @@ export const useStore = create<Store>((set, get) => {
     },
 
     clearFilter: () => mutate((id) => api.clearFilter(id)),
+
+    // ----- diagnostics ------------------------------------------------------
+
+    setDiagnosticsOpen: (open) => set({ diagnosticsOpen: open }),
+
+    runDiagnosticsScan: async () => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const existing = get().diagnostics[meta.id];
+      if (existing?.jobId != null) return; // a scan is already running
+      try {
+        const jobId = await api.startDiagnosticsScan(meta.id, meta.revision);
+        patchDiagnostics(meta.id, { jobId, processed: 0, total: null, scanError: null });
+      } catch (e) {
+        patchDiagnostics(meta.id, { scanError: String(e) });
+      }
+    },
+
+    cancelDiagnosticsScan: async () => {
+      const id = get().activeId;
+      if (id == null) return;
+      const jobId = get().diagnostics[id]?.jobId;
+      if (jobId != null) await api.cancelJob(jobId).catch(() => undefined);
+    },
+
+    applyIssueFilter: async (issueId) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      try {
+        const updated = await api.applyDiagnosticFilter(meta.id, issueId, meta.revision);
+        reloadDoc(updated);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    jumpToCell: async (row, col) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      // Diagnostic samples use absolute row indices; a jump while filtered
+      // would land on the wrong (display) row and the target may be hidden
+      // anyway, so drop the filter first.
+      if (meta.filtered) {
+        try {
+          const updated = await api.clearFilter(meta.id);
+          reloadDoc(updated);
+        } catch (e) {
+          set({ error: String(e) });
+          return;
+        }
+      }
+      jumpNonce += 1;
+      set({ jumpTarget: { row, col, nonce: jumpNonce } });
+    },
+
+    // ----- background-job events -------------------------------------------
+
+    handleJobProgress: (progress) => {
+      if (progress.kind !== "diagnostics" || progress.docId == null) return;
+      const docId = progress.docId;
+      // Only track the scan we started (guards against reused ids after e.g.
+      // an app-side restart of the job system).
+      if (get().diagnostics[docId]?.jobId !== progress.jobId) return;
+      patchDiagnostics(docId, { processed: progress.processed, total: progress.total });
+    },
+
+    handleJobFinished: async (finished) => {
+      if (finished.kind !== "diagnostics" || finished.docId == null) return;
+      const docId = finished.docId;
+      if (get().diagnostics[docId]?.jobId !== finished.jobId) return;
+      if (finished.status === "done") {
+        const report = await api.getDiagnostics(docId).catch(() => null);
+        patchDiagnostics(docId, { jobId: null, report, scanError: null });
+      } else {
+        patchDiagnostics(docId, {
+          jobId: null,
+          scanError: finished.status === "failed" ? (finished.error ?? "scan failed") : null,
+        });
+      }
+    },
   };
 });
 

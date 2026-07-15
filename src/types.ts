@@ -52,6 +52,44 @@ export interface JobFinished {
   error: string | null;
 }
 
+export type DiagnosticSeverity = "error" | "warning" | "info";
+
+/** A pointer at (or description of) one place affected by a diagnostic. */
+export interface DiagnosticSample {
+  /** Data-row index in the current document, when the issue maps to one. */
+  row: number | null;
+  /** Column index, when the issue maps to one. */
+  col: number | null;
+  /** Truncated cell/header value for display. */
+  value: string | null;
+  /** Extra context (e.g. "line 1042 had 3 fields (expected 5)"). */
+  note: string | null;
+}
+
+export interface DiagnosticIssue {
+  /** Stable identifier: the kind, plus ":column" when column-scoped. */
+  id: string;
+  kind: string;
+  severity: DiagnosticSeverity;
+  title: string;
+  description: string;
+  affectedCount: number;
+  samples: DiagnosticSample[];
+  suggestedAction: string | null;
+  /** Whether "filter to affected rows" is meaningful for this issue. */
+  rowFilterable: boolean;
+}
+
+export interface DiagnosticsReport {
+  docId: number;
+  /** Document revision this report was computed against. */
+  revision: number;
+  /** Issues describing the imported source file. */
+  source: DiagnosticIssue[];
+  /** Issues describing the current in-memory document. */
+  current: DiagnosticIssue[];
+}
+
 export interface RowsResponse {
   start: number;
   rows: string[][];

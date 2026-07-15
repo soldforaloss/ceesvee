@@ -12,6 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use tauri::State;
 
+use crate::diagnostics::{self, DiagnosticsCache, DiagnosticsReport};
 use crate::document::Document;
 use crate::dto::{
     CellRect, ColumnSummary, DocumentMeta, ExportOptions, FilterGroup, FindMatch, FindOptions,
@@ -177,8 +178,13 @@ pub fn new_document(
 }
 
 #[tauri::command]
-pub fn close_document(doc_id: u64, state: Db<'_>) -> AppResult<()> {
+pub fn close_document(
+    doc_id: u64,
+    state: Db<'_>,
+    diagnostics_cache: State<'_, DiagnosticsCache>,
+) -> AppResult<()> {
     lock(&state)?.remove(doc_id);
+    diagnostics_cache.remove(doc_id);
     Ok(())
 }
 
@@ -209,6 +215,79 @@ pub fn take_pending_files(pending: State<'_, PendingFiles>) -> Vec<String> {
 #[tauri::command]
 pub fn cancel_job(job_id: u64, jobs: State<'_, JobRegistry>) -> bool {
     jobs.cancel(job_id)
+}
+
+// ----- diagnostics ---------------------------------------------------------
+
+/// The last completed diagnostics report for a document, if any. The report
+/// carries the revision it was computed against; the UI offers a rescan when
+/// the document has moved on.
+#[tauri::command]
+pub fn get_diagnostics(
+    doc_id: u64,
+    diagnostics_cache: State<'_, DiagnosticsCache>,
+) -> Option<DiagnosticsReport> {
+    diagnostics_cache.get(doc_id)
+}
+
+/// Start a background diagnostics scan, returning its job id immediately.
+/// Progress streams over `job-progress`; on `job-finished` (done) the report
+/// is available via `get_diagnostics`. Rejected up front when
+/// `expected_revision` no longer matches the document.
+#[tauri::command]
+pub async fn start_diagnostics_scan(
+    doc_id: u64,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    diagnostics_cache: State<'_, DiagnosticsCache>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    // Fail fast (before spawning a job) when the caller's snapshot is stale.
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+    }
+
+    let ctx = jobs.begin_for_app(&app, "diagnostics", Some(doc_id));
+    let job_id = ctx.id;
+    let sink = diagnostics_cache.share();
+    tauri::async_runtime::spawn(async move {
+        // Terminal status (done / cancelled / failed) is emitted by
+        // run_blocking; the report only becomes visible on success.
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            // The document may have changed between the fast check above and
+            // the read lock being granted; a stale scan would waste work and
+            // its result would have to be discarded anyway.
+            doc.check_revision(expected_revision)?;
+            let report = diagnostics::scan(&doc, ctx)?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, report);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// Replace the document's filter view with the rows affected by a
+/// row-filterable diagnostic issue.
+#[tauri::command]
+pub fn apply_diagnostic_filter(
+    doc_id: u64,
+    issue_id: String,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    write_doc(&state, doc_id, |doc| {
+        doc.check_revision(expected_revision)?;
+        let rows = diagnostics::issue_rows(doc, &issue_id)?;
+        doc.set_filter(rows);
+        Ok(doc.meta())
+    })
 }
 
 // ----- windowed reads ----------------------------------------------------
