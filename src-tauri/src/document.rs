@@ -245,6 +245,7 @@ impl Document {
 
     /// Guard a deferred operation: fail with [`AppError::StaleRevision`] when
     /// the document has changed since `expected` was captured.
+    #[allow(dead_code)] // first consumed by the preview/apply commands of the feature PRs
     pub fn check_revision(&self, expected: u64) -> AppResult<()> {
         if self.revision == expected {
             Ok(())

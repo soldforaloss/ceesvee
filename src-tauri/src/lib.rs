@@ -11,7 +11,9 @@ mod error;
 mod export;
 mod filter;
 mod find;
-mod job;
+/// Public so downstream features (and the test harness) can treat the job
+/// registry, progress plumbing and cancellation as a stable internal API.
+pub mod job;
 mod parse;
 mod sort;
 mod state;
