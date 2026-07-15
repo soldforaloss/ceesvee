@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::parse::RaggedSample;
+
 /// Metadata describing an open document. Returned by `open_file` and refreshed
 /// by structural commands.
 #[derive(Debug, Clone, Serialize)]
@@ -208,6 +210,69 @@ pub struct FilterGroup {
 pub enum FilterNode {
     Condition(FilterCondition),
     Group(FilterGroup),
+}
+
+/// Identity snapshot of the backing file, used to detect edits made outside
+/// CEESVEE. Captured at open/reparse/save time and compared against the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileFingerprint {
+    pub size: u64,
+    pub modified_at_ms: u64,
+}
+
+/// One setting whose value would change under a proposed reparse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReparseDiff {
+    /// Machine-readable field name (e.g. "delimiter", "rowCount").
+    pub field: String,
+    pub current: String,
+    pub proposed: String,
+}
+
+/// Non-destructive preview of reopening the source file with new settings.
+/// Nothing in the open document changes while one of these exists.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReparsePreview {
+    /// The first records exactly as parsed (the header row, when one is
+    /// detected, is the first entry).
+    pub records: Vec<Vec<String>>,
+    /// One-character delimiter that was used.
+    pub delimiter: String,
+    /// Canonical encoding name that was used.
+    pub encoding: String,
+    pub had_bom: bool,
+    /// "lf" or "crlf".
+    pub line_ending: String,
+    /// Effective header mode (forced by the caller or auto-detected).
+    pub has_header_row: bool,
+    /// Data rows the reopened document would have (header excluded).
+    pub row_count: usize,
+    pub col_count: usize,
+    /// Import diagnostics of the previewed parse (see F01).
+    pub had_decode_errors: bool,
+    pub ragged_total: usize,
+    pub modal_field_count: usize,
+    pub ragged_samples: Vec<RaggedSample>,
+    /// Settings/shape that differ from the current interpretation.
+    pub differences: Vec<ReparseDiff>,
+    /// Document revision this preview was generated against; echoed back to
+    /// `apply_reparse`, which rejects the apply when it no longer matches.
+    pub expected_revision: u64,
+}
+
+/// Result of comparing the stored source fingerprint against the disk file.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalChange {
+    /// Whether the file on disk no longer matches what this document loaded.
+    pub changed: bool,
+    /// Whether the file still exists at all.
+    pub exists: bool,
+    pub disk: Option<FileFingerprint>,
+    pub stored: Option<FileFingerprint>,
 }
 
 /// Options controlling how a document is serialized on save.

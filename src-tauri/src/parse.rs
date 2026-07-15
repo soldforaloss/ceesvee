@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use encoding_rs::Encoding;
+use serde::Serialize;
 
 use crate::error::{AppError, AppResult};
 use crate::{delimiter, encoding};
@@ -12,7 +13,8 @@ use crate::{delimiter, encoding};
 const RAGGED_SAMPLE_LIMIT: usize = 1000;
 
 /// One source record whose field count differed from the modal count.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RaggedSample {
     /// 1-based line number in the source file where the record starts
     /// (embedded newlines inside quoted fields are accounted for).

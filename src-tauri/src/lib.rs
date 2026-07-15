@@ -16,6 +16,7 @@ mod find;
 /// registry, progress plumbing and cancellation as a stable internal API.
 pub mod job;
 mod parse;
+mod reopen;
 mod sort;
 mod state;
 mod util;
@@ -75,7 +76,10 @@ pub fn run() {
         .manage(DiagnosticsCache::default())
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
-            commands::reparse,
+            commands::preview_reparse,
+            commands::apply_reparse,
+            commands::get_file_fingerprint,
+            commands::check_external_change,
             commands::new_document,
             commands::close_document,
             commands::get_meta,
