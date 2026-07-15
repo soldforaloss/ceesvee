@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useState } from "react";
 
 import { ColumnExplorerPanel } from "./components/ColumnExplorerPanel";
+import { CompareDialog } from "./components/CompareDialog";
 import { DedupDialog } from "./components/DedupDialog";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { EmptyState } from "./components/EmptyState";
@@ -44,6 +45,7 @@ export default function App() {
   const [profilesOpen, setProfilesOpen] = useState(false);
   const [transformOpen, setTransformOpen] = useState(false);
   const [dedupOpen, setDedupOpen] = useState(false);
+  const [compareOpen, setCompareOpen] = useState(false);
   const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const [dragOver, setDragOver] = useState(false);
@@ -225,6 +227,7 @@ export default function App() {
         onProfiles={() => setProfilesOpen(true)}
         onTransform={() => setTransformOpen(true)}
         onDedup={() => setDedupOpen(true)}
+        onCompare={() => setCompareOpen(true)}
       />
       <Tabs />
       <SourceBar />
@@ -264,6 +267,7 @@ export default function App() {
           }}
         />
       )}
+      {compareOpen && <CompareDialog onClose={() => setCompareOpen(false)} />}
       <ReopenDialog />
       <ExternalChangeDialog />
       <QuitDialog />

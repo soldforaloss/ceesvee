@@ -7,6 +7,7 @@ import {
   Bookmark,
   ChevronDown,
   ColumnPlus,
+  Diff,
   Dots,
   Download,
   FilePlus,
@@ -37,6 +38,7 @@ interface ToolbarProps {
   onProfiles: () => void;
   onTransform: () => void;
   onDedup: () => void;
+  onCompare: () => void;
 }
 
 interface ToolItem {
@@ -56,6 +58,7 @@ export function Toolbar({
   onProfiles,
   onTransform,
   onDedup,
+  onCompare,
 }: ToolbarProps) {
   const meta = useActiveMeta();
   const theme = useStore((s) => s.theme);
@@ -140,6 +143,13 @@ export function Toolbar({
       title: "Find and remove duplicate rows",
       icon: <Layers />,
       onClick: onDedup,
+      disabled: !hasDoc,
+    },
+    {
+      label: "Compare…",
+      title: "Compare with another open document",
+      icon: <Diff />,
+      onClick: onCompare,
       disabled: !hasDoc,
     },
     { label: "Column summaries", icon: <Stats />, onClick: onSummaries, disabled: !hasDoc },

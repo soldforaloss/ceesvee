@@ -25,6 +25,8 @@ import type {
   FindOptions,
   JobFinished,
   JobProgress,
+  CompareInfo,
+  CompareSpec,
   DedupSpec,
   DuplicateKeepStrategy,
   DuplicateReport,
@@ -204,6 +206,25 @@ export interface ProfileSuggestion {
   profile: FileProfile;
 }
 
+/** Compare state (F09): one comparison at a time, across two documents. */
+export interface CompareState {
+  jobId: number | null;
+  processed: number;
+  total: number | null;
+  compareId: number | null;
+  info: CompareInfo | null;
+  error: string | null;
+}
+
+const initialCompare: CompareState = {
+  jobId: null,
+  processed: 0,
+  total: null,
+  compareId: null,
+  info: null,
+  error: null,
+};
+
 /** Duplicate-finder state (F07), for the ACTIVE document. */
 export interface DedupState {
   scanJobId: number | null;
@@ -313,6 +334,8 @@ interface Store {
   explorer: ExplorerState;
   /** Duplicate-finder state (F07). */
   dedup: DedupState;
+  /** Compare state (F09). */
+  compare: CompareState;
 
   // lifecycle / chrome
   init: () => void;
@@ -372,6 +395,15 @@ interface Store {
     policy: TransformErrorPolicy,
     expectedRevision: number,
   ) => Promise<boolean>;
+
+  // compare (F09)
+  runCompare: (rightDocId: number, spec: CompareSpec) => Promise<void>;
+  cancelCompare: () => Promise<void>;
+  clearCompare: () => void;
+  /** Export added/removed/changed rows or the JSON report (prompts for path). */
+  exportCompare: (which: import("../types").DiffStatus | "report") => Promise<void>;
+  /** Activate a document and jump the grid to a row. */
+  jumpToDocCell: (docId: number, row: number) => Promise<void>;
 
   // duplicate finder (F07)
   startDuplicateScan: (spec: DedupSpec, scope: ExportScope) => Promise<void>;
@@ -766,6 +798,7 @@ export const useStore = create<Store>((set, get) => {
     profileValidation: null,
     explorer: initialExplorer,
     dedup: initialDedup,
+    compare: initialCompare,
 
     init: () => {
       const theme = loadTheme();
@@ -1176,6 +1209,14 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
+      if (progress.kind === "compare") {
+        if (get().compare.jobId !== progress.jobId) return;
+        set((s) => ({
+          compare: { ...s.compare, processed: progress.processed, total: progress.total },
+        }));
+        return;
+      }
+
       if (progress.kind !== "diagnostics") return;
       // Only track the scan we started (guards against reused ids after e.g.
       // an app-side restart of the job system).
@@ -1196,6 +1237,25 @@ export const useStore = create<Store>((set, get) => {
           delete fileJobs[finished.jobId];
           return { fileJobs };
         });
+        return;
+      }
+
+      if (finished.kind === "compare") {
+        if (get().compare.jobId !== finished.jobId) return;
+        if (finished.status === "done") {
+          const info = await api.getCompareInfo(finished.jobId).catch(() => null);
+          set((s) => ({
+            compare: { ...s.compare, jobId: null, compareId: finished.jobId, info },
+          }));
+        } else {
+          set((s) => ({
+            compare: {
+              ...s.compare,
+              jobId: null,
+              error: finished.status === "failed" ? (finished.error ?? "comparison failed") : null,
+            },
+          }));
+        }
         return;
       }
 
@@ -1494,6 +1554,72 @@ export const useStore = create<Store>((set, get) => {
       // Remember the options per document, to seed the next export dialog.
       set({ lastExportOptions: options });
       await runExportJob(meta.id, chosen, options, scope, split, writeManifest);
+    },
+
+    // ----- compare (F09) -----------------------------------------------------------
+
+    runCompare: async (rightDocId, spec) => {
+      const left = activeMeta();
+      const right = get().tabs.find((t) => t.id === rightDocId);
+      if (!left || !right || get().compare.jobId != null) return;
+      try {
+        const jobId = await api.startCompare(
+          left.id,
+          rightDocId,
+          spec,
+          left.revision,
+          right.revision,
+        );
+        set({
+          compare: { ...initialCompare, jobId },
+        });
+      } catch (e) {
+        set((s) => ({ compare: { ...s.compare, error: String(e) } }));
+      }
+    },
+
+    cancelCompare: async () => {
+      const jobId = get().compare.jobId;
+      if (jobId != null) await api.cancelJob(jobId).catch(() => undefined);
+    },
+
+    clearCompare: () => set({ compare: initialCompare }),
+
+    exportCompare: async (which) => {
+      const { compare } = get();
+      if (compare.compareId == null || !compare.info) return;
+      const left = get().tabs.find((t) => t.id === compare.info?.leftDoc);
+      const suggested =
+        which === "report"
+          ? `${left?.fileName ?? "compare"}.changes.json`
+          : `${left?.fileName ?? "compare"}.${which}.csv`;
+      const chosen = await saveFileDialog({ defaultPath: suggested, filters: FILE_FILTERS });
+      if (!chosen) return;
+      const options: ExportOptions = {
+        delimiter: left?.delimiter || ",",
+        encoding: "UTF-8",
+        quoteStyle: "minimal",
+        lineEnding: left?.lineEnding ?? "lf",
+        bom: false,
+        includeHeaders: true,
+        backup: "none",
+      };
+      try {
+        const jobId = await api.startCompareExport(compare.compareId, which, chosen, options);
+        const finished = await awaitJob(jobId);
+        if (finished.status === "failed") {
+          set({ error: finished.error ?? "export failed" });
+        }
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    jumpToDocCell: async (docId, row) => {
+      if (get().activeId !== docId && get().tabs.some((t) => t.id === docId)) {
+        get().setActive(docId);
+      }
+      await get().jumpToCell(row, 0);
     },
 
     // ----- duplicate finder (F07) -------------------------------------------------

@@ -326,6 +326,62 @@ export interface TransformPreview {
   expectedRevision: number;
 }
 
+/** How two documents are compared (F09). */
+export type CompareMode = "positional" | "keyed";
+
+export interface CompareSpec {
+  mode: CompareMode;
+  /** LEFT columns forming the row key (keyed mode). */
+  keyColumns: number[];
+  /** (left column, right column) pairs; empty = identity by position. */
+  columnMapping: [number, number][];
+  trim: boolean;
+  caseInsensitive: boolean;
+  blankEqual: boolean;
+  numericEqual: boolean;
+  dateEqual: boolean;
+}
+
+export type DiffStatus = "added" | "removed" | "changed" | "unchanged" | "conflict";
+
+export interface CellDifference {
+  leftCol: number;
+  rightCol: number;
+  left: string;
+  right: string;
+}
+
+export interface DiffRecord {
+  status: DiffStatus;
+  key: string[];
+  leftRow: number | null;
+  rightRow: number | null;
+  cells: CellDifference[];
+}
+
+export interface CompareSummary {
+  added: number;
+  removed: number;
+  changed: number;
+  unchanged: number;
+  conflicts: number;
+  total: number;
+}
+
+export interface CompareInfo {
+  compareId: number;
+  leftDoc: number;
+  rightDoc: number;
+  leftRevision: number;
+  rightRevision: number;
+  summary: CompareSummary;
+}
+
+export interface ComparePage {
+  records: DiffRecord[];
+  totalFiltered: number;
+}
+
 /** Key definition + normalization options for duplicate detection (F07). */
 export interface DedupSpec {
   keyColumns: number[];

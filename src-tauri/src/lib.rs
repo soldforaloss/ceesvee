@@ -3,6 +3,7 @@
 
 mod analyze;
 mod commands;
+mod compare;
 mod dedup;
 mod delimiter;
 mod diagnostics;
@@ -29,6 +30,7 @@ mod util;
 
 use std::sync::Mutex;
 
+use crate::compare::CompareCache;
 use crate::dedup::DedupCache;
 use crate::diagnostics::DiagnosticsCache;
 use crate::job::JobRegistry;
@@ -84,6 +86,7 @@ pub fn run() {
         .manage(DiagnosticsCache::default())
         .manage(ProfileCache::default())
         .manage(DedupCache::default())
+        .manage(CompareCache::default())
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
             commands::preview_reparse,
@@ -135,6 +138,10 @@ pub fn run() {
             commands::start_duplicate_scan,
             commands::apply_duplicate_filter,
             commands::apply_deduplicate,
+            commands::start_compare,
+            commands::get_compare_info,
+            commands::get_compare_results,
+            commands::start_compare_export,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
