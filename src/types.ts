@@ -284,6 +284,48 @@ export interface ScopeCounts {
   cols: number;
 }
 
+/** The supported cleanup operations (F06). Closed set: never user code. */
+export type TransformSpec =
+  | { type: "trim" }
+  | { type: "collapseWhitespace" }
+  | { type: "uppercase" }
+  | { type: "lowercase" }
+  | { type: "titleCase" }
+  | { type: "replaceText"; find: string; replace: string; caseSensitive: boolean }
+  | { type: "replaceRegex"; pattern: string; replace: string }
+  | { type: "fillBlank"; value: string }
+  | { type: "normalizeBooleans"; trueValue: string; falseValue: string }
+  | { type: "normalizeDates"; format: string }
+  | { type: "normalizeNumbers"; decimalComma: boolean }
+  | { type: "addPrefix"; prefix: string }
+  | { type: "addSuffix"; suffix: string }
+  | { type: "splitByDelimiter"; column: number; delimiter: string }
+  | { type: "splitByRegex"; column: number; pattern: string }
+  | { type: "mergeColumns"; columns: number[]; separator: string };
+
+export type TransformErrorPolicy = "failAll" | "skipInvalid";
+
+export interface TransformExample {
+  row: number;
+  col: number;
+  before: string;
+  after: string;
+}
+
+/** Preview of a transform's full effect; nothing has been mutated. */
+export interface TransformPreview {
+  affectedCells: number;
+  parseFailures: number;
+  examples: TransformExample[];
+  failureExamples: TransformExample[];
+  columnsInserted: string[];
+  columnsRemoved: string[];
+  /** True when the values of every row change regardless of row scope. */
+  appliesToAllRows: boolean;
+  /** Echo back to applyTransform; rejected when the document moved on. */
+  expectedRevision: number;
+}
+
 /** Which rows a column profile covers (F05). */
 export type ProfileScope = "all" | "visibleRows";
 

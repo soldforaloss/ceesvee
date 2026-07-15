@@ -23,6 +23,7 @@ mod save;
 mod settings;
 mod sort;
 mod state;
+mod transform;
 mod util;
 
 use std::sync::Mutex;
@@ -125,6 +126,8 @@ pub fn run() {
             commands::validate_profile,
             commands::get_column_profile,
             commands::start_column_profile,
+            commands::preview_transform,
+            commands::apply_transform,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

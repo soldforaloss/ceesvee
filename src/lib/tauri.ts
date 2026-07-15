@@ -29,6 +29,9 @@ import type {
   SelectionStats,
   SortKey,
   SplitOptions,
+  TransformErrorPolicy,
+  TransformPreview,
+  TransformSpec,
 } from "../types";
 
 export const openFile = (path: string, options?: OpenOptions) =>
@@ -168,6 +171,26 @@ export const startSave = (
   options: ExportOptions,
   expectedRevision: number,
 ) => invoke<number>("start_save", { docId, path, options, expectedRevision });
+
+/** Compute a transform's full effect without mutating anything (F06). */
+export const previewTransform = (
+  docId: number,
+  spec: TransformSpec,
+  scope: ExportScope,
+  expectedRevision: number,
+) => invoke<TransformPreview>("preview_transform", { docId, spec, scope, expectedRevision });
+
+/**
+ * Apply a previewed transform as one undoable operation (F06); resolves with
+ * the job id (cancellable before commit via cancelJob).
+ */
+export const applyTransform = (
+  docId: number,
+  spec: TransformSpec,
+  scope: ExportScope,
+  policy: TransformErrorPolicy,
+  expectedRevision: number,
+) => invoke<number>("apply_transform", { docId, spec, scope, policy, expectedRevision });
 
 /** A still-valid cached column profile, if one exists (F05). */
 export const getColumnProfile = (docId: number, column: number, scope: ProfileScope) =>

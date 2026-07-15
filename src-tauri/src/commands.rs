@@ -27,6 +27,7 @@ use crate::profile::{self, ColumnProfile, ProfileCache, ProfileOptions, ProfileS
 use crate::reopen::{self, CurrentInterpretation};
 use crate::settings::{self, AppSettings, FileProfile, ProfileValidation};
 use crate::state::{AppState, PendingFiles, SharedDocument};
+use crate::transform::{self, TransformErrorPolicy, TransformPreview, TransformSpec};
 use crate::{
     encoding, export, export_scope, filter as filter_mod, find as find_mod, save as save_mod, util,
 };
@@ -406,6 +407,85 @@ pub fn validate_profile(
     read_doc(&state, doc_id, |doc| {
         settings::validate_profile(doc, &profile)
     })
+}
+
+// ----- data-cleaning transformations (F06) -----------------------------------
+
+/// Compute a transform's full effect WITHOUT mutating the document: affected
+/// counts, before/after examples, parse failures, and column changes. Bad
+/// parameters (invalid regex or date format) fail here, before any scan.
+#[tauri::command]
+pub async fn preview_transform(
+    doc_id: u64,
+    spec: TransformSpec,
+    scope: ExportScope,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<TransformPreview> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+        Ok(transform::compute(&doc, &spec, &scope, None)?.preview)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Apply a previewed transform as ONE undoable operation, guarded by the
+/// preview's revision. Runs as a job: the change list is computed under the
+/// read lock (cancellable, with progress), then committed under a brief
+/// write lock. `failAll` refuses to commit when any cell cannot convert.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn apply_transform(
+    doc_id: u64,
+    spec: TransformSpec,
+    scope: ExportScope,
+    policy: TransformErrorPolicy,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+    }
+
+    let ctx = jobs.begin_for_app(&app, "transform", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let computed = {
+                let doc = handle.read().map_err(poisoned)?;
+                doc.check_revision(expected_revision)?;
+                transform::compute(&doc, &spec, &scope, Some(ctx))?
+                // Read lock released here; commit re-validates below.
+            };
+            if policy == TransformErrorPolicy::FailAll && computed.preview.parse_failures > 0 {
+                return Err(AppError::invalid(format!(
+                    "{} cell(s) cannot be converted — fix them or apply with \"skip invalid\"",
+                    computed.preview.parse_failures
+                )));
+            }
+            ctx.check()?; // last cancellation point before the commit
+
+            let mut doc = handle.write().map_err(poisoned)?;
+            // An edit may have raced between the locks; never commit against
+            // data the preview didn't see.
+            doc.check_revision(expected_revision)?;
+            // Cell values (and possibly column structure) change: the filter
+            // view may no longer be correct, so drop it. The front end
+            // re-applies its filter spec afterwards.
+            doc.clear_filter();
+            transform::commit(&mut doc, computed.changes)?;
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
 }
 
 // ----- column profiling (F05) -----------------------------------------------
