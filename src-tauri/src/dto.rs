@@ -33,6 +33,10 @@ pub struct DocumentMeta {
     pub dirty: bool,
     pub can_undo: bool,
     pub can_redo: bool,
+    /// Monotonically increasing revision, bumped on every mutation. Previews
+    /// and deferred operations echo this back as `expectedRevision` and are
+    /// rejected when the document has moved on.
+    pub revision: u64,
 }
 
 /// Overrides supplied when (re)opening a file. Any `None` field is auto-detected.

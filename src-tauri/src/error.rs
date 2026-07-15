@@ -26,6 +26,15 @@ pub enum AppError {
     #[error("nothing to redo")]
     NothingToRedo,
 
+    /// A long-running job observed its cancellation flag and stopped.
+    #[error("operation cancelled")]
+    Cancelled,
+
+    /// A deferred operation (preview apply, scan result, …) was generated
+    /// against an older document revision and must be discarded.
+    #[error("stale revision: the document changed since this operation was prepared (expected revision {expected}, document is at {actual})")]
+    StaleRevision { expected: u64, actual: u64 },
+
     #[error("{0}")]
     Other(String),
 }

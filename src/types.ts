@@ -21,6 +21,35 @@ export interface DocumentMeta {
   dirty: boolean;
   canUndo: boolean;
   canRedo: boolean;
+  /**
+   * Monotonically increasing revision, bumped on every mutation. Previews and
+   * deferred operations echo this back as `expectedRevision` and are rejected
+   * by the backend when the document has moved on.
+   */
+  revision: number;
+}
+
+/** Incremental progress for a background job (event: "job-progress"). */
+export interface JobProgress {
+  jobId: number;
+  docId: number | null;
+  kind: string;
+  processed: number;
+  total: number | null;
+  bytesWritten: number | null;
+  part: number | null;
+  message: string | null;
+}
+
+export type JobStatus = "done" | "cancelled" | "failed";
+
+/** Terminal state of a background job (event: "job-finished"). */
+export interface JobFinished {
+  jobId: number;
+  docId: number | null;
+  kind: string;
+  status: JobStatus;
+  error: string | null;
 }
 
 export interface RowsResponse {

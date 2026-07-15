@@ -11,6 +11,7 @@ mod error;
 mod export;
 mod filter;
 mod find;
+mod job;
 mod parse;
 mod sort;
 mod state;
@@ -18,6 +19,7 @@ mod util;
 
 use std::sync::Mutex;
 
+use crate::job::JobRegistry;
 use crate::state::{AppState, PendingFiles};
 
 /// Extract file paths from a process argument list, skipping the executable and
@@ -65,6 +67,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(Mutex::new(AppState::default()))
         .manage(PendingFiles(Mutex::new(initial_files)))
+        .manage(JobRegistry::default())
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
             commands::reparse,
@@ -73,6 +76,7 @@ pub fn run() {
             commands::get_meta,
             commands::list_encodings,
             commands::take_pending_files,
+            commands::cancel_job,
             commands::get_rows,
             commands::selection_stats,
             commands::column_summaries,

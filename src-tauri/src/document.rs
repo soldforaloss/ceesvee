@@ -121,6 +121,12 @@ pub struct Document {
     /// when unfiltered. A non-undoable view: recomputed on `set_filter` and
     /// cleared by structural mutations (handled in the command layer).
     filter_view: Option<Vec<usize>>,
+    /// Monotonically increasing revision, bumped on every change that could
+    /// invalidate a deferred operation: data and structural mutations,
+    /// undo/redo, header-mode toggles and filter-view changes. Previews and
+    /// long-running results carry the revision they were computed against and
+    /// are rejected when it no longer matches (see [`Document::check_revision`]).
+    revision: u64,
 }
 
 impl Document {
@@ -171,6 +177,7 @@ impl Document {
             redo_stack: Vec::new(),
             saved_marker: 0,
             filter_view: None,
+            revision: 1,
         }
     }
 
@@ -198,6 +205,7 @@ impl Document {
             redo_stack: Vec::new(),
             saved_marker: 0,
             filter_view: None,
+            revision: 1,
         }
     }
 
@@ -223,6 +231,31 @@ impl Document {
         self.has_header_row
     }
 
+    /// Current document revision (see the field docs for what bumps it).
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Continue the revision sequence from a previous incarnation of this
+    /// document. Used when reparsing replaces the whole `Document` value, so a
+    /// preview taken before the swap can never match the new document.
+    pub fn set_revision(&mut self, revision: u64) {
+        self.revision = revision;
+    }
+
+    /// Guard a deferred operation: fail with [`AppError::StaleRevision`] when
+    /// the document has changed since `expected` was captured.
+    pub fn check_revision(&self, expected: u64) -> AppResult<()> {
+        if self.revision == expected {
+            Ok(())
+        } else {
+            Err(AppError::StaleRevision {
+                expected,
+                actual: self.revision,
+            })
+        }
+    }
+
     // ----- row filter view -------------------------------------------------
 
     /// Visible row count: the filtered count when a filter is active, else the
@@ -242,10 +275,15 @@ impl Document {
     /// Replace the active filter with a precomputed view (absolute row indices).
     pub fn set_filter(&mut self, view: Vec<usize>) {
         self.filter_view = Some(view);
+        // The visible-row set is an input to scoped previews, so changing it
+        // must invalidate them.
+        self.revision += 1;
     }
 
     pub fn clear_filter(&mut self) {
-        self.filter_view = None;
+        if self.filter_view.take().is_some() {
+            self.revision += 1;
+        }
     }
 
     /// Translate a visible (display) row index to its absolute index. Identity
@@ -454,6 +492,7 @@ impl Document {
             dirty: self.is_dirty(),
             can_undo: self.can_undo(),
             can_redo: self.can_redo(),
+            revision: self.revision,
         }
     }
 
@@ -695,12 +734,14 @@ impl Document {
         self.redo_stack.clear();
         self.dirty_cells.clear();
         self.saved_marker = usize::MAX;
+        self.revision += 1;
     }
 
     pub fn undo(&mut self) -> AppResult<()> {
         let op = self.undo_stack.pop().ok_or(AppError::NothingToUndo)?;
         self.revert(&op);
         self.redo_stack.push(op);
+        self.revision += 1;
         Ok(())
     }
 
@@ -708,6 +749,7 @@ impl Document {
         let op = self.redo_stack.pop().ok_or(AppError::NothingToRedo)?;
         self.apply(&op);
         self.undo_stack.push(op);
+        self.revision += 1;
         Ok(())
     }
 
@@ -724,6 +766,7 @@ impl Document {
         }
         self.undo_stack.push(op);
         self.redo_stack.clear();
+        self.revision += 1;
     }
 
     fn check_cell(&self, row: usize, col: usize) -> AppResult<()> {
@@ -1243,5 +1286,89 @@ mod tests {
         });
         assert_eq!(stats.count, 2);
         assert_eq!(stats.sum, 3.0);
+    }
+
+    /// Assert that running `mutate` strictly increases the revision.
+    fn assert_bumps(d: &mut Document, what: &str, mutate: impl FnOnce(&mut Document)) {
+        let before = d.revision();
+        mutate(d);
+        assert!(d.revision() > before, "{what} must bump the revision");
+    }
+
+    #[test]
+    fn revision_bumps_on_every_mutation_kind() {
+        let mut d = doc_from("a,b\n1,2\n3,4\n5,6", true);
+        assert_bumps(&mut d, "set_cell", |d| {
+            d.set_cell(0, 0, "X".into()).unwrap()
+        });
+        assert_bumps(&mut d, "insert_rows", |d| d.insert_rows(0, 1).unwrap());
+        assert_bumps(&mut d, "delete_rows", |d| d.delete_rows(vec![0]).unwrap());
+        assert_bumps(&mut d, "move_row", |d| d.move_row(0, 1).unwrap());
+        assert_bumps(&mut d, "insert_column", |d| {
+            d.insert_column(0, "new".into()).unwrap()
+        });
+        assert_bumps(&mut d, "delete_columns", |d| {
+            d.delete_columns(vec![0]).unwrap()
+        });
+        assert_bumps(&mut d, "rename_column", |d| {
+            d.rename_column(0, "renamed".into()).unwrap()
+        });
+        assert_bumps(&mut d, "move_column", |d| d.move_column(0, 1).unwrap());
+        assert_bumps(&mut d, "paste", |d| {
+            d.paste(0, 0, vec![vec!["p".into()]]).unwrap()
+        });
+        assert_bumps(&mut d, "sort", |d| {
+            d.sort(&[SortKey {
+                column: 0,
+                descending: true,
+            }])
+            .unwrap()
+        });
+        assert_bumps(&mut d, "undo", |d| d.undo().unwrap());
+        assert_bumps(&mut d, "redo", |d| d.redo().unwrap());
+        assert_bumps(&mut d, "set_header_mode", |d| d.set_header_mode(false));
+        assert_bumps(&mut d, "set_filter", |d| d.set_filter(vec![0]));
+        assert_bumps(&mut d, "clear_filter", |d| d.clear_filter());
+    }
+
+    #[test]
+    fn revision_unchanged_by_noops_and_saves() {
+        let mut d = doc_from("a\n1", true);
+        let r = d.revision();
+        // Writing the identical value registers no edit.
+        d.set_cell(0, 0, "1".into()).unwrap();
+        assert_eq!(d.revision(), r);
+        // Clearing a filter that isn't set changes nothing.
+        d.clear_filter();
+        assert_eq!(d.revision(), r);
+        // Toggling the header mode to its current value changes nothing.
+        d.set_header_mode(true);
+        assert_eq!(d.revision(), r);
+        // Reads and save markers don't count as mutations.
+        let _ = d.get_rows(0, 10);
+        d.mark_saved(None);
+        assert_eq!(d.revision(), r);
+    }
+
+    #[test]
+    fn check_revision_guards_stale_operations() {
+        let mut d = doc_from("a\n1", true);
+        let captured = d.revision();
+        assert!(d.check_revision(captured).is_ok());
+        d.set_cell(0, 0, "2".into()).unwrap();
+        assert!(matches!(
+            d.check_revision(captured),
+            Err(AppError::StaleRevision { .. })
+        ));
+        assert!(d.check_revision(d.revision()).is_ok());
+    }
+
+    #[test]
+    fn set_revision_continues_sequence_across_reparse() {
+        let mut replacement = doc_from("a\n9", true);
+        replacement.set_revision(41);
+        assert_eq!(replacement.revision(), 41);
+        replacement.set_cell(0, 0, "8".into()).unwrap();
+        assert_eq!(replacement.revision(), 42);
     }
 }

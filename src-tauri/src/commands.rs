@@ -1,5 +1,11 @@
 //! The Tauri command surface. The front end drives every interaction through
 //! these; heavy file I/O and parsing run off the UI thread.
+//!
+//! Locking model: the document registry (`Mutex<AppState>`) is held only long
+//! enough to look up a document's `Arc<RwLock<Document>>`. Commands then lock
+//! that single document, so long-running work on one tab never blocks the
+//! others. Long scans/exports go through [`crate::job`] for progress and
+//! cancellation instead of holding any lock across the whole operation.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -12,8 +18,9 @@ use crate::dto::{
     OpenOptions, ReplaceResult, RowsResponse, SelectionStats, SortKey,
 };
 use crate::error::{AppError, AppResult};
+use crate::job::JobRegistry;
 use crate::parse::{parse, ParseSettings, ParsedFile};
-use crate::state::{AppState, PendingFiles};
+use crate::state::{AppState, PendingFiles, SharedDocument};
 use crate::{encoding, export, filter as filter_mod, find as find_mod, util};
 
 type Db<'a> = State<'a, Mutex<AppState>>;
@@ -22,6 +29,38 @@ fn lock<'g>(state: &'g Db<'_>) -> AppResult<MutexGuard<'g, AppState>> {
     state
         .lock()
         .map_err(|_| AppError::Other("internal state lock error".into()))
+}
+
+/// Fetch the shared handle for a document, holding the registry lock only for
+/// the lookup.
+fn doc_handle(state: &Db<'_>, doc_id: u64) -> AppResult<SharedDocument> {
+    lock(state)?.doc(doc_id)
+}
+
+fn poisoned<T>(_: T) -> AppError {
+    AppError::Other("internal document lock error".into())
+}
+
+/// Run `f` with shared (read) access to one document.
+fn read_doc<T>(
+    state: &Db<'_>,
+    doc_id: u64,
+    f: impl FnOnce(&Document) -> AppResult<T>,
+) -> AppResult<T> {
+    let handle = doc_handle(state, doc_id)?;
+    let doc = handle.read().map_err(poisoned)?;
+    f(&doc)
+}
+
+/// Run `f` with exclusive (write) access to one document.
+fn write_doc<T>(
+    state: &Db<'_>,
+    doc_id: u64,
+    f: impl FnOnce(&mut Document) -> AppResult<T>,
+) -> AppResult<T> {
+    let handle = doc_handle(state, doc_id)?;
+    let mut doc = handle.write().map_err(poisoned)?;
+    f(&mut doc)
 }
 
 /// Translate a visible (display) row index to its absolute index, erroring if
@@ -86,15 +125,13 @@ pub async fn open_file(
 /// Re-read the document's file with new delimiter/encoding/header overrides.
 #[tauri::command]
 pub async fn reparse(doc_id: u64, options: OpenOptions, state: Db<'_>) -> AppResult<DocumentMeta> {
-    let (path, current_header) = {
-        let guard = lock(&state)?;
-        let doc = guard.get(doc_id)?;
+    let (path, current_header) = read_doc(&state, doc_id, |doc| {
         let path = doc
             .path
             .clone()
             .ok_or_else(|| AppError::invalid("document has no file to reparse"))?;
-        (path, doc.has_header_row())
-    };
+        Ok((path, doc.has_header_row()))
+    })?;
 
     let opt_delim = options.delimiter.as_deref().map(util::delimiter_to_byte);
     let opt_enc = options.encoding.as_deref().map(encoding::from_name);
@@ -114,11 +151,15 @@ pub async fn reparse(doc_id: u64, options: OpenOptions, state: Db<'_>) -> AppRes
 
     let has_header = forced_header.unwrap_or_else(|| looks_like_header(&parsed.records));
 
-    let mut guard = lock(&state)?;
-    let doc = Document::from_parsed(doc_id, Some(path), parsed, has_header);
-    let meta = doc.meta();
-    *guard.get_mut(doc_id)? = doc;
-    Ok(meta)
+    write_doc(&state, doc_id, |doc| {
+        let mut fresh = Document::from_parsed(doc_id, Some(path), parsed, has_header);
+        // Continue the revision sequence so anything captured against the old
+        // incarnation can never accidentally match the new one.
+        fresh.set_revision(doc.revision() + 1);
+        let meta = fresh.meta();
+        *doc = fresh;
+        Ok(meta)
+    })
 }
 
 #[tauri::command]
@@ -143,7 +184,7 @@ pub fn close_document(doc_id: u64, state: Db<'_>) -> AppResult<()> {
 
 #[tauri::command]
 pub fn get_meta(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
-    Ok(lock(&state)?.get(doc_id)?.meta())
+    read_doc(&state, doc_id, |doc| Ok(doc.meta()))
 }
 
 #[tauri::command]
@@ -161,21 +202,30 @@ pub fn take_pending_files(pending: State<'_, PendingFiles>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+// ----- jobs ----------------------------------------------------------------
+
+/// Request cooperative cancellation of a running background job. Returns
+/// whether a job with that id was still running.
+#[tauri::command]
+pub fn cancel_job(job_id: u64, jobs: State<'_, JobRegistry>) -> bool {
+    jobs.cancel(job_id)
+}
+
 // ----- windowed reads ----------------------------------------------------
 
 #[tauri::command]
 pub fn get_rows(doc_id: u64, start: usize, count: usize, state: Db<'_>) -> AppResult<RowsResponse> {
-    Ok(lock(&state)?.get(doc_id)?.get_rows(start, count))
+    read_doc(&state, doc_id, |doc| Ok(doc.get_rows(start, count)))
 }
 
 #[tauri::command]
 pub fn selection_stats(doc_id: u64, rect: CellRect, state: Db<'_>) -> AppResult<SelectionStats> {
-    Ok(lock(&state)?.get(doc_id)?.selection_stats(rect))
+    read_doc(&state, doc_id, |doc| Ok(doc.selection_stats(rect)))
 }
 
 #[tauri::command]
 pub fn column_summaries(doc_id: u64, state: Db<'_>) -> AppResult<Vec<ColumnSummary>> {
-    Ok(lock(&state)?.get(doc_id)?.column_summaries())
+    read_doc(&state, doc_id, |doc| Ok(doc.column_summaries()))
 }
 
 // ----- cell editing ------------------------------------------------------
@@ -188,11 +238,11 @@ pub fn set_cell(
     value: String,
     state: Db<'_>,
 ) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    let abs = abs_row(doc, row)?;
-    doc.set_cell(abs, col, value)?;
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        let abs = abs_row(doc, row)?;
+        doc.set_cell(abs, col, value)?;
+        Ok(doc.meta())
+    })
 }
 
 #[tauri::command]
@@ -201,14 +251,14 @@ pub fn set_cells(
     changes: Vec<(usize, usize, String)>,
     state: Db<'_>,
 ) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    let mut translated = Vec::with_capacity(changes.len());
-    for (row, col, value) in changes {
-        translated.push((abs_row(doc, row)?, col, value));
-    }
-    doc.set_cells(translated)?;
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        let mut translated = Vec::with_capacity(changes.len());
+        for (row, col, value) in changes {
+            translated.push((abs_row(doc, row)?, col, value));
+        }
+        doc.set_cells(translated)?;
+        Ok(doc.meta())
+    })
 }
 
 #[tauri::command]
@@ -219,50 +269,50 @@ pub fn paste(
     block: Vec<Vec<String>>,
     state: Db<'_>,
 ) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    // Pasting can grow/reshape the grid, so it drops any active filter and
-    // operates on the absolute anchor position.
-    let abs = abs_insert_row(doc, anchor_row)?;
-    doc.clear_filter();
-    doc.paste(abs, anchor_col, block)?;
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        // Pasting can grow/reshape the grid, so it drops any active filter and
+        // operates on the absolute anchor position.
+        let abs = abs_insert_row(doc, anchor_row)?;
+        doc.clear_filter();
+        doc.paste(abs, anchor_col, block)?;
+        Ok(doc.meta())
+    })
 }
 
 // ----- row operations ----------------------------------------------------
 
 #[tauri::command]
 pub fn insert_rows(doc_id: u64, at: usize, count: usize, state: Db<'_>) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    let abs = abs_insert_row(doc, at)?;
-    doc.clear_filter();
-    doc.insert_rows(abs, count)?;
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        let abs = abs_insert_row(doc, at)?;
+        doc.clear_filter();
+        doc.insert_rows(abs, count)?;
+        Ok(doc.meta())
+    })
 }
 
 #[tauri::command]
 pub fn delete_rows(doc_id: u64, indices: Vec<usize>, state: Db<'_>) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    let mut abs = Vec::with_capacity(indices.len());
-    for d in indices {
-        abs.push(abs_row(doc, d)?);
-    }
-    doc.clear_filter();
-    doc.delete_rows(abs)?;
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        let mut abs = Vec::with_capacity(indices.len());
+        for d in indices {
+            abs.push(abs_row(doc, d)?);
+        }
+        doc.clear_filter();
+        doc.delete_rows(abs)?;
+        Ok(doc.meta())
+    })
 }
 
 #[tauri::command]
 pub fn move_row(doc_id: u64, from: usize, to: usize, state: Db<'_>) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    let from_abs = abs_row(doc, from)?;
-    let to_abs = abs_row(doc, to)?;
-    doc.clear_filter();
-    doc.move_row(from_abs, to_abs)?;
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        let from_abs = abs_row(doc, from)?;
+        let to_abs = abs_row(doc, to)?;
+        doc.clear_filter();
+        doc.move_row(from_abs, to_abs)?;
+        Ok(doc.meta())
+    })
 }
 
 // ----- column operations -------------------------------------------------
@@ -274,21 +324,21 @@ pub fn insert_column(
     name: String,
     state: Db<'_>,
 ) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    // Column structure shifts the indices a filter references, so drop it.
-    doc.clear_filter();
-    doc.insert_column(at, name)?;
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        // Column structure shifts the indices a filter references, so drop it.
+        doc.clear_filter();
+        doc.insert_column(at, name)?;
+        Ok(doc.meta())
+    })
 }
 
 #[tauri::command]
 pub fn delete_columns(doc_id: u64, indices: Vec<usize>, state: Db<'_>) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    doc.clear_filter();
-    doc.delete_columns(indices)?;
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        doc.clear_filter();
+        doc.delete_columns(indices)?;
+        Ok(doc.meta())
+    })
 }
 
 #[tauri::command]
@@ -298,48 +348,46 @@ pub fn rename_column(
     name: String,
     state: Db<'_>,
 ) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    doc.rename_column(col, name)?;
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        doc.rename_column(col, name)?;
+        Ok(doc.meta())
+    })
 }
 
 #[tauri::command]
 pub fn move_column(doc_id: u64, from: usize, to: usize, state: Db<'_>) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    doc.clear_filter();
-    doc.move_column(from, to)?;
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        doc.clear_filter();
+        doc.move_column(from, to)?;
+        Ok(doc.meta())
+    })
 }
 
 // ----- analysis ----------------------------------------------------------
 
 #[tauri::command]
 pub fn sort(doc_id: u64, keys: Vec<SortKey>, state: Db<'_>) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    // Sorting reorders all rows, invalidating a filter view; drop it.
-    doc.clear_filter();
-    doc.sort(&keys)?;
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        // Sorting reorders all rows, invalidating a filter view; drop it.
+        doc.clear_filter();
+        doc.sort(&keys)?;
+        Ok(doc.meta())
+    })
 }
 
 #[tauri::command]
 pub fn set_header_mode(doc_id: u64, has_header: bool, state: Db<'_>) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    // Re-interpreting the header row shifts all row indices; drop any filter.
-    doc.clear_filter();
-    doc.set_header_mode(has_header);
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        // Re-interpreting the header row shifts all row indices; drop any filter.
+        doc.clear_filter();
+        doc.set_header_mode(has_header);
+        Ok(doc.meta())
+    })
 }
 
 #[tauri::command]
 pub fn find(doc_id: u64, options: FindOptions, state: Db<'_>) -> AppResult<Vec<FindMatch>> {
-    let guard = lock(&state)?;
-    let doc = guard.get(doc_id)?;
-    find_mod::find(doc, &options)
+    read_doc(&state, doc_id, |doc| find_mod::find(doc, &options))
 }
 
 #[tauri::command]
@@ -349,14 +397,14 @@ pub fn replace_all(
     replacement: String,
     state: Db<'_>,
 ) -> AppResult<ReplaceResult> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    let changes = find_mod::replace_all(doc, &options, &replacement)?;
-    let replaced = changes.len();
-    doc.set_cells(changes)?;
-    Ok(ReplaceResult {
-        replaced,
-        meta: doc.meta(),
+    write_doc(&state, doc_id, |doc| {
+        let changes = find_mod::replace_all(doc, &options, &replacement)?;
+        let replaced = changes.len();
+        doc.set_cells(changes)?;
+        Ok(ReplaceResult {
+            replaced,
+            meta: doc.meta(),
+        })
     })
 }
 
@@ -364,47 +412,47 @@ pub fn replace_all(
 
 #[tauri::command]
 pub fn set_filter(doc_id: u64, spec: FilterGroup, state: Db<'_>) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    let view = filter_mod::matching_rows(doc, &spec)?;
-    // A filter that excludes nothing isn't an active filter — avoids reporting
-    // "N of N rows · filtered" for a match-all or empty spec.
-    if view.len() == doc.n_rows() {
-        doc.clear_filter();
-    } else {
-        doc.set_filter(view);
-    }
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        let view = filter_mod::matching_rows(doc, &spec)?;
+        // A filter that excludes nothing isn't an active filter — avoids reporting
+        // "N of N rows · filtered" for a match-all or empty spec.
+        if view.len() == doc.n_rows() {
+            doc.clear_filter();
+        } else {
+            doc.set_filter(view);
+        }
+        Ok(doc.meta())
+    })
 }
 
 #[tauri::command]
 pub fn clear_filter(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    doc.clear_filter();
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        doc.clear_filter();
+        Ok(doc.meta())
+    })
 }
 
 // ----- history -----------------------------------------------------------
 
 #[tauri::command]
 pub fn undo(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    // Undo/redo may reinstate rows the filter view doesn't account for, so the
-    // view is dropped to keep coordinates consistent.
-    doc.clear_filter();
-    doc.undo()?;
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        // Undo/redo may reinstate rows the filter view doesn't account for, so the
+        // view is dropped to keep coordinates consistent.
+        doc.clear_filter();
+        doc.undo()?;
+        Ok(doc.meta())
+    })
 }
 
 #[tauri::command]
 pub fn redo(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    doc.clear_filter();
-    doc.redo()?;
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        doc.clear_filter();
+        doc.redo()?;
+        Ok(doc.meta())
+    })
 }
 
 // ----- save --------------------------------------------------------------
@@ -416,12 +464,9 @@ pub async fn save(
     options: ExportOptions,
     state: Db<'_>,
 ) -> AppResult<DocumentMeta> {
-    // Serialize while briefly holding the lock (CPU work, no await inside).
-    let bytes = {
-        let guard = lock(&state)?;
-        let doc = guard.get(doc_id)?;
-        export::serialize(doc, &options)?
-    };
+    // Serialize while briefly holding the document's read lock (CPU work, no
+    // await inside; other documents stay fully available).
+    let bytes = read_doc(&state, doc_id, |doc| export::serialize(doc, &options))?;
 
     // Write to disk off the UI thread.
     let write_path = PathBuf::from(&path);
@@ -430,8 +475,8 @@ pub async fn save(
         .map_err(|e| AppError::Other(format!("background task failed: {e}")))??;
 
     // Record the save point.
-    let mut guard = lock(&state)?;
-    let doc = guard.get_mut(doc_id)?;
-    doc.mark_saved(Some(PathBuf::from(&path)));
-    Ok(doc.meta())
+    write_doc(&state, doc_id, |doc| {
+        doc.mark_saved(Some(PathBuf::from(&path)));
+        Ok(doc.meta())
+    })
 }

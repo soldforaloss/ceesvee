@@ -35,6 +35,9 @@ export const listEncodings = () => invoke<string[]>("list_encodings");
 
 export const takePendingFiles = () => invoke<string[]>("take_pending_files");
 
+/** Request cooperative cancellation of a running background job. */
+export const cancelJob = (jobId: number) => invoke<boolean>("cancel_job", { jobId });
+
 export const getRows = (docId: number, start: number, count: number) =>
   invoke<RowsResponse>("get_rows", { docId, start, count });
 
