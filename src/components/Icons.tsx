@@ -161,3 +161,9 @@ export const Pulse = ({ className }: IconProps) => (
     <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
   </svg>
 );
+
+export const Bookmark = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+  </svg>
+);

@@ -3,6 +3,7 @@ import { useState } from "react";
 import { checkForUpdates } from "../lib/updater";
 import { useActiveMeta, useStore } from "../store/useStore";
 import {
+  Bookmark,
   ChevronDown,
   ColumnPlus,
   Dots,
@@ -30,6 +31,7 @@ interface ToolbarProps {
   onExport: () => void;
   onSummaries: () => void;
   onFilter: () => void;
+  onProfiles: () => void;
 }
 
 interface ToolItem {
@@ -41,7 +43,7 @@ interface ToolItem {
   active?: boolean;
 }
 
-export function Toolbar({ onSort, onExport, onSummaries, onFilter }: ToolbarProps) {
+export function Toolbar({ onSort, onExport, onSummaries, onFilter, onProfiles }: ToolbarProps) {
   const meta = useActiveMeta();
   const theme = useStore((s) => s.theme);
   const recent = useStore((s) => s.recent);
@@ -121,6 +123,7 @@ export function Toolbar({ onSort, onExport, onSummaries, onFilter }: ToolbarProp
       disabled: !hasDoc,
     },
     { label: "Export…", icon: <Download />, onClick: onExport, disabled: !hasDoc },
+    { label: "File profiles…", icon: <Bookmark />, onClick: onProfiles },
   ];
 
   return (

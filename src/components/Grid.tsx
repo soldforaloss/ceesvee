@@ -12,6 +12,7 @@ import {
 } from "@glideapps/glide-data-grid";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { indicesToRanges } from "../lib/gridSelection";
 import { darkGridTheme, dirtyCellOverride, lightGridTheme } from "../lib/gridTheme";
 import * as api from "../lib/tauri";
 import { useStore } from "../store/useStore";
@@ -69,7 +70,6 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   docIdRef.current = docId;
   colCountRef.current = colCount;
 
-  const [colWidths, setColWidths] = useState<Record<number, number>>({});
   const [selection, setSelectionState] = useState<GridSelection>({
     columns: CompactSelection.empty(),
     rows: CompactSelection.empty(),
@@ -78,7 +78,12 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
 
   const findMatches = useStore((s) => s.find.matches);
   const findIndex = useStore((s) => s.find.index);
-  const frozenCols = useStore((s) => s.frozenCols[docId] ?? 0);
+  // Per-document UI state (F08), saved/restored by the store on tab switches.
+  const colWidths = useStore((s) => s.columnWidths);
+  const setColumnWidth = useStore((s) => s.setColumnWidth);
+  const resetColumnWidths = useStore((s) => s.resetColumnWidths);
+  const frozenCols = useStore((s) => s.frozenColumnCount);
+  const setScrollPosition = useStore((s) => s.setScrollPosition);
   const summaries = useStore((s) => (s.summariesDocId === docId ? s.summaries : null));
   const jumpTarget = useStore((s) => s.jumpTarget);
 
@@ -169,19 +174,56 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     (range: Rectangle) => {
       visibleRegion.current = range;
       loadRange(Math.max(0, range.y - PAGE), range.height + 2 * PAGE);
+      // Persist (debounced) so the position survives tab switches (F08).
+      setScrollPosition(Math.max(0, range.y), Math.max(0, range.x));
     },
-    [loadRange],
+    [loadRange, setScrollPosition],
   );
 
-  // Column widths are keyed by position, so reset them when columns are
-  // inserted/removed to avoid a width sticking to the wrong column.
+  // Column widths are keyed by position, so reset them when THIS document's
+  // column count changes (insert/remove); a tab switch restores the other
+  // document's widths instead.
   const prevColCount = useRef(colCount);
+  const prevDocId = useRef(docId);
   useEffect(() => {
-    if (prevColCount.current !== colCount) {
-      setColWidths({});
-      prevColCount.current = colCount;
+    if (prevDocId.current === docId && prevColCount.current !== colCount) {
+      resetColumnWidths();
     }
-  }, [colCount]);
+    prevDocId.current = docId;
+    prevColCount.current = colCount;
+  }, [docId, colCount, resetColumnWidths]);
+
+  // Restore the saved scroll position and selection after a tab switch.
+  useEffect(() => {
+    const s = useStore.getState();
+    const pos = s.scrollPosition;
+    const rect = s.selectionRect;
+
+    let rows = CompactSelection.empty();
+    for (const [start, end] of indicesToRanges(s.selectedRows)) rows = rows.add([start, end]);
+    let cols = CompactSelection.empty();
+    for (const [start, end] of indicesToRanges(s.selectedCols)) cols = cols.add([start, end]);
+    setSelectionState({
+      columns: cols,
+      rows,
+      current: rect
+        ? {
+            cell: [rect.x, rect.y],
+            range: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+            rangeStack: [],
+          }
+        : undefined,
+    });
+
+    if (pos.row > 0 || pos.column > 0) {
+      // Next frame: the editor has swapped to the new document by then.
+      requestAnimationFrame(() => {
+        gridRef.current?.scrollTo(pos.column, pos.row, "both", 0, 0);
+      });
+    }
+    // Reads go through getState() on purpose: this must run only when the
+    // document switches, not on every scroll/selection change.
+  }, [docId]);
 
   // Copy/fill must read the FULL selected range from the backend, not the
   // windowed cache (off-screen rows aren't cached and would copy as blanks).
@@ -251,9 +293,12 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     return false; // applied via the backend, which triggers a reload
   }, []);
 
-  const onColumnResize = useCallback((_col: GridColumn, newSize: number, colIndex: number) => {
-    setColWidths((prev) => ({ ...prev, [colIndex]: newSize }));
-  }, []);
+  const onColumnResize = useCallback(
+    (_col: GridColumn, newSize: number, colIndex: number) => {
+      setColumnWidth(colIndex, newSize);
+    },
+    [setColumnWidth],
+  );
 
   const onGridSelectionChange = useCallback((next: GridSelection) => {
     setSelectionState(next);

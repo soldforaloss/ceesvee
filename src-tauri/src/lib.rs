@@ -19,6 +19,7 @@ pub mod job;
 mod parse;
 mod reopen;
 mod save;
+mod settings;
 mod sort;
 mod state;
 mod util;
@@ -116,6 +117,9 @@ pub fn run() {
             commands::export_scope_counts,
             commands::start_save,
             commands::start_export,
+            commands::get_settings,
+            commands::set_settings,
+            commands::validate_profile,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
