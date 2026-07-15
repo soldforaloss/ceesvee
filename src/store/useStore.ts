@@ -25,6 +25,9 @@ import type {
   FindOptions,
   JobFinished,
   JobProgress,
+  DedupSpec,
+  DuplicateKeepStrategy,
+  DuplicateReport,
   OpenOptions,
   ProfileScope,
   ProfileValidation,
@@ -201,6 +204,23 @@ export interface ProfileSuggestion {
   profile: FileProfile;
 }
 
+/** Duplicate-finder state (F07), for the ACTIVE document. */
+export interface DedupState {
+  scanJobId: number | null;
+  processed: number;
+  total: number | null;
+  report: DuplicateReport | null;
+  error: string | null;
+}
+
+const initialDedup: DedupState = {
+  scanJobId: null,
+  processed: 0,
+  total: null,
+  report: null,
+  error: null,
+};
+
 /** Column-explorer panel state (F05); profile data is for the ACTIVE doc. */
 export interface ExplorerState {
   open: boolean;
@@ -291,6 +311,8 @@ interface Store {
   profileValidation: ProfileValidation | null;
   /** Column-explorer panel state (F05). */
   explorer: ExplorerState;
+  /** Duplicate-finder state (F07). */
+  dedup: DedupState;
 
   // lifecycle / chrome
   init: () => void;
@@ -348,6 +370,19 @@ interface Store {
     spec: TransformSpec,
     scope: ExportScope,
     policy: TransformErrorPolicy,
+    expectedRevision: number,
+  ) => Promise<boolean>;
+
+  // duplicate finder (F07)
+  startDuplicateScan: (spec: DedupSpec, scope: ExportScope) => Promise<void>;
+  cancelDuplicateScan: () => Promise<void>;
+  clearDuplicateReport: () => void;
+  filterToDuplicates: (spec: DedupSpec, scope: ExportScope) => Promise<void>;
+  /** Remove duplicates (one undo step). Returns whether it was committed. */
+  applyDedup: (
+    spec: DedupSpec,
+    scope: ExportScope,
+    keep: DuplicateKeepStrategy,
     expectedRevision: number,
   ) => Promise<boolean>;
 
@@ -502,6 +537,7 @@ export const useStore = create<Store>((set, get) => {
         total: null,
         error: null,
       },
+      dedup: initialDedup,
     };
   };
 
@@ -729,6 +765,7 @@ export const useStore = create<Store>((set, get) => {
     profileSuggestion: null,
     profileValidation: null,
     explorer: initialExplorer,
+    dedup: initialDedup,
 
     init: () => {
       const theme = loadTheme();
@@ -1131,6 +1168,14 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
+      if (progress.kind === "dedup") {
+        if (get().dedup.scanJobId !== progress.jobId) return;
+        set((s) => ({
+          dedup: { ...s.dedup, processed: progress.processed, total: progress.total },
+        }));
+        return;
+      }
+
       if (progress.kind !== "diagnostics") return;
       // Only track the scan we started (guards against reused ids after e.g.
       // an app-side restart of the job system).
@@ -1151,6 +1196,26 @@ export const useStore = create<Store>((set, get) => {
           delete fileJobs[finished.jobId];
           return { fileJobs };
         });
+        return;
+      }
+
+      if (finished.kind === "dedup") {
+        // Only the SCAN job feeds the report; apply jobs resolve via waiters.
+        if (get().dedup.scanJobId !== finished.jobId) return;
+        if (finished.status === "done") {
+          const report = finished.docId
+            ? await api.getDuplicateReport(finished.docId).catch(() => null)
+            : null;
+          set((s) => ({ dedup: { ...s.dedup, scanJobId: null, report, error: null } }));
+        } else {
+          set((s) => ({
+            dedup: {
+              ...s.dedup,
+              scanJobId: null,
+              error: finished.status === "failed" ? (finished.error ?? "scan failed") : null,
+            },
+          }));
+        }
         return;
       }
 
@@ -1429,6 +1494,61 @@ export const useStore = create<Store>((set, get) => {
       // Remember the options per document, to seed the next export dialog.
       set({ lastExportOptions: options });
       await runExportJob(meta.id, chosen, options, scope, split, writeManifest);
+    },
+
+    // ----- duplicate finder (F07) -------------------------------------------------
+
+    startDuplicateScan: async (spec, scope) => {
+      const meta = activeMeta();
+      if (!meta || get().dedup.scanJobId != null) return;
+      try {
+        const jobId = await api.startDuplicateScan(meta.id, spec, scope, meta.revision);
+        set((s) => ({
+          dedup: { ...s.dedup, scanJobId: jobId, processed: 0, total: null, error: null },
+        }));
+      } catch (e) {
+        set((s) => ({ dedup: { ...s.dedup, error: String(e) } }));
+      }
+    },
+
+    cancelDuplicateScan: async () => {
+      const jobId = get().dedup.scanJobId;
+      if (jobId != null) await api.cancelJob(jobId).catch(() => undefined);
+    },
+
+    clearDuplicateReport: () => set({ dedup: initialDedup }),
+
+    filterToDuplicates: async (spec, scope) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      try {
+        const updated = await api.applyDuplicateFilter(meta.id, spec, scope, meta.revision);
+        reloadDoc(updated);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    applyDedup: async (spec, scope, keep, expectedRevision) => {
+      const meta = activeMeta();
+      if (!meta) return false;
+      try {
+        const jobId = await api.applyDeduplicate(meta.id, spec, scope, keep, expectedRevision);
+        const finished = await awaitJob(jobId);
+        if (finished.status !== "done") {
+          if (finished.status === "failed") {
+            set({ error: finished.error ?? "deduplication failed" });
+          }
+          return false;
+        }
+        const updated = await api.getMeta(meta.id);
+        reloadDoc(updated);
+        set((s) => ({ dedup: { ...s.dedup, report: null } }));
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
     },
 
     // ----- data-cleaning transforms (F06) ----------------------------------------

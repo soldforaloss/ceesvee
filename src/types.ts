@@ -326,6 +326,40 @@ export interface TransformPreview {
   expectedRevision: number;
 }
 
+/** Key definition + normalization options for duplicate detection (F07). */
+export interface DedupSpec {
+  keyColumns: number[];
+  trim: boolean;
+  caseInsensitive: boolean;
+  collapseWhitespace: boolean;
+  /** Whether rows whose COMPLETE key is blank group with each other. */
+  blankKeysEqual: boolean;
+  /** Drop rows whose complete key is blank from consideration entirely. */
+  excludeBlankKeys: boolean;
+}
+
+export type DuplicateKeepStrategy = "first" | "last" | "mostComplete";
+
+export interface DuplicateGroup {
+  /** Normalized key values, for display. */
+  key: string[];
+  /** Absolute row indices, in source order (possibly truncated). */
+  rows: number[];
+  /** Exact size of the group. */
+  size: number;
+}
+
+export interface DuplicateReport {
+  /** Document revision this report was computed against. */
+  revision: number;
+  consideredRows: number;
+  groupCount: number;
+  /** Excess rows: what "remove duplicates" would delete. */
+  duplicateRows: number;
+  remainingRows: number;
+  sampleGroups: DuplicateGroup[];
+}
+
 /** Which rows a column profile covers (F05). */
 export type ProfileScope = "all" | "visibleRows";
 

@@ -168,6 +168,14 @@ export const Bookmark = ({ className }: IconProps) => (
   </svg>
 );
 
+export const Layers = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <polygon points="12 2 2 7 12 12 22 7 12 2" />
+    <polyline points="2 17 12 22 22 17" />
+    <polyline points="2 12 12 17 22 12" />
+  </svg>
+);
+
 export const Wand = ({ className }: IconProps) => (
   <svg {...base} className={className}>
     <path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8L19 13M15 9h0M17.8 6.2L19 5M12.2 6.2L11 5" />
