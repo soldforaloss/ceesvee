@@ -10,6 +10,7 @@ import type {
   DocumentMeta,
   EncodingCompatibility,
   ExportOptions,
+  ExportScope,
   ExternalChange,
   FileFingerprint,
   FilterGroup,
@@ -19,8 +20,10 @@ import type {
   ReparsePreview,
   ReplaceResult,
   RowsResponse,
+  ScopeCounts,
   SelectionStats,
   SortKey,
+  SplitOptions,
 } from "../types";
 
 export const openFile = (path: string, options?: OpenOptions) =>
@@ -138,13 +141,21 @@ export const undo = (docId: number) => invoke<DocumentMeta>("undo", { docId });
 
 export const redo = (docId: number) => invoke<DocumentMeta>("redo", { docId });
 
-/** Scan for characters the target encoding cannot represent. */
-export const checkEncodingCompatibility = (docId: number, encoding: string) =>
-  invoke<EncodingCompatibility>("check_encoding_compatibility", { docId, encoding });
+/**
+ * Scan for characters the target encoding cannot represent, optionally
+ * limited to the slice an export will actually write.
+ */
+export const checkEncodingCompatibility = (docId: number, encoding: string, scope?: ExportScope) =>
+  invoke<EncodingCompatibility>("check_encoding_compatibility", { docId, encoding, scope });
+
+/** The row/column counts a scoped export would write. */
+export const exportScopeCounts = (docId: number, scope: ExportScope) =>
+  invoke<ScopeCounts>("export_scope_counts", { docId, scope });
 
 /**
- * Start an atomic streaming save; resolves with the job id. Completion (and
- * the refreshed metadata) arrives via the job events + getMeta.
+ * Start an atomic streaming save of the complete document; resolves with the
+ * job id. Completion (and refreshed metadata) arrives via the job events +
+ * getMeta.
  */
 export const startSave = (
   docId: number,
@@ -153,10 +164,25 @@ export const startSave = (
   expectedRevision: number,
 ) => invoke<number>("start_save", { docId, path, options, expectedRevision });
 
-/** Start an atomic streaming export (no save point / fingerprint update). */
+/**
+ * Start a scoped, optionally split, atomic streaming export (never touches
+ * the document's save point, path, or fingerprint).
+ */
 export const startExport = (
   docId: number,
   path: string,
   options: ExportOptions,
+  scope: ExportScope,
+  split: SplitOptions,
+  writeManifest: boolean,
   expectedRevision: number,
-) => invoke<number>("start_export", { docId, path, options, expectedRevision });
+) =>
+  invoke<number>("start_export", {
+    docId,
+    path,
+    options,
+    scope,
+    split,
+    writeManifest,
+    expectedRevision,
+  });

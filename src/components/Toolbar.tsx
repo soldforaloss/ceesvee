@@ -120,7 +120,7 @@ export function Toolbar({ onSort, onExport, onSummaries, onFilter }: ToolbarProp
       active: diagnosticsOpen,
       disabled: !hasDoc,
     },
-    { label: "Export / Save As…", icon: <Download />, onClick: onExport, disabled: !hasDoc },
+    { label: "Export…", icon: <Download />, onClick: onExport, disabled: !hasDoc },
   ];
 
   return (

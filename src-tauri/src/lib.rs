@@ -10,6 +10,7 @@ mod dto;
 mod encoding;
 mod error;
 mod export;
+mod export_scope;
 mod filter;
 mod find;
 /// Public so downstream features (and the test harness) can treat the job
@@ -112,6 +113,7 @@ pub fn run() {
             commands::undo,
             commands::redo,
             commands::check_encoding_compatibility,
+            commands::export_scope_counts,
             commands::start_save,
             commands::start_export,
         ])
