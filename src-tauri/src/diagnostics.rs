@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
-use crate::analyze;
+use crate::analyze::{classify, CellClass};
 use crate::document::Document;
 use crate::error::{AppError, AppResult};
 use crate::job::JobCtx;
@@ -107,31 +107,7 @@ impl DiagnosticsCache {
     }
 }
 
-// ----- per-cell classification ---------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CellClass {
-    Blank,
-    Number,
-    Date,
-    Bool,
-    Text,
-}
-
-fn classify(cell: &str) -> CellClass {
-    let trimmed = cell.trim();
-    if trimmed.is_empty() {
-        CellClass::Blank
-    } else if analyze::as_number(trimmed).is_some() {
-        CellClass::Number
-    } else if analyze::is_bool(trimmed) {
-        CellClass::Bool
-    } else if analyze::is_date(trimmed) {
-        CellClass::Date
-    } else {
-        CellClass::Text
-    }
-}
+// ----- per-cell presentation --------------------------------------------------
 
 fn class_name(class: CellClass) -> &'static str {
     match class {

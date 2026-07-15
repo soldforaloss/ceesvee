@@ -23,6 +23,7 @@ use crate::dto::{
 use crate::error::{AppError, AppResult};
 use crate::job::JobRegistry;
 use crate::parse::{parse, ParseSettings, ParsedFile};
+use crate::profile::{self, ColumnProfile, ProfileCache, ProfileOptions, ProfileScope};
 use crate::reopen::{self, CurrentInterpretation};
 use crate::settings::{self, AppSettings, FileProfile, ProfileValidation};
 use crate::state::{AppState, PendingFiles, SharedDocument};
@@ -263,9 +264,11 @@ pub fn close_document(
     doc_id: u64,
     state: Db<'_>,
     diagnostics_cache: State<'_, DiagnosticsCache>,
+    profile_cache: State<'_, ProfileCache>,
 ) -> AppResult<()> {
     lock(&state)?.remove(doc_id);
     diagnostics_cache.remove(doc_id);
+    profile_cache.remove_doc(doc_id);
     Ok(())
 }
 
@@ -403,6 +406,67 @@ pub fn validate_profile(
     read_doc(&state, doc_id, |doc| {
         settings::validate_profile(doc, &profile)
     })
+}
+
+// ----- column profiling (F05) -----------------------------------------------
+
+/// A still-valid cached profile for (column, scope), if one exists. Validity
+/// is per column: edits to other columns don't evict it.
+#[tauri::command]
+pub fn get_column_profile(
+    doc_id: u64,
+    column: usize,
+    scope: ProfileScope,
+    state: Db<'_>,
+    profile_cache: State<'_, ProfileCache>,
+) -> AppResult<Option<ColumnProfile>> {
+    let handle = doc_handle(&state, doc_id)?;
+    let doc = handle.read().map_err(poisoned)?;
+    Ok(profile_cache.get_valid(&doc, column, scope))
+}
+
+/// Start a background profile scan for one column; returns the job id.
+/// Progress/cancellation via the shared job events; on completion the result
+/// is cached and available through `get_column_profile`.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn start_column_profile(
+    doc_id: u64,
+    column: usize,
+    scope: ProfileScope,
+    options: Option<ProfileOptions>,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    profile_cache: State<'_, ProfileCache>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+        if column >= doc.n_cols() {
+            return Err(AppError::invalid("column out of range"));
+        }
+    }
+
+    let options = options.unwrap_or_default();
+    let ctx = jobs.begin_for_app(&app, "profile", Some(doc_id));
+    let job_id = ctx.id;
+    let sink = profile_cache.share();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            let profile = profile::profile_column(&doc, column, scope, &options, ctx)?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert((doc_id, column, scope), profile);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
 }
 
 // ----- windowed reads ----------------------------------------------------

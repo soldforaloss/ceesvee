@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AppSettings,
   CellRect,
+  ColumnProfile,
   ColumnSummary,
   DiagnosticsReport,
   DocumentMeta,
@@ -19,6 +20,7 @@ import type {
   FindMatch,
   FindOptions,
   OpenOptions,
+  ProfileScope,
   ProfileValidation,
   ReparsePreview,
   ReplaceResult,
@@ -166,6 +168,25 @@ export const startSave = (
   options: ExportOptions,
   expectedRevision: number,
 ) => invoke<number>("start_save", { docId, path, options, expectedRevision });
+
+/** A still-valid cached column profile, if one exists (F05). */
+export const getColumnProfile = (docId: number, column: number, scope: ProfileScope) =>
+  invoke<ColumnProfile | null>("get_column_profile", { docId, column, scope });
+
+/** Start a background column-profile scan; resolves with the job id (F05). */
+export const startColumnProfile = (
+  docId: number,
+  column: number,
+  scope: ProfileScope,
+  expectedRevision: number,
+) =>
+  invoke<number>("start_column_profile", {
+    docId,
+    column,
+    scope,
+    options: null,
+    expectedRevision,
+  });
 
 /** Load persisted profiles + preferences (safe defaults on corruption). */
 export const getSettings = () => invoke<AppSettings>("get_settings");
