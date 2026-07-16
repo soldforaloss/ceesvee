@@ -15,6 +15,7 @@ mod export;
 mod export_scope;
 mod filter;
 mod find;
+mod index;
 /// Public so downstream features (and the test harness) can treat the job
 /// registry, progress plumbing and cancellation as a stable internal API.
 pub mod job;
@@ -87,8 +88,22 @@ pub fn run() {
         .manage(ProfileCache::default())
         .manage(DedupCache::default())
         .manage(CompareCache::default())
+        .setup(|app| {
+            // Delete index caches orphaned by an abnormal termination. Live
+            // instances hold their cache's lock file, so they are skipped.
+            use tauri::Manager;
+            if let Ok(cache_dir) = app.path().app_cache_dir() {
+                let root = cache_dir.join("indexes");
+                std::thread::spawn(move || index::sweep_stale(&root));
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
+            commands::probe_open,
+            commands::start_open_indexed,
+            commands::start_convert_to_editable,
+            commands::start_reindex,
             commands::preview_reparse,
             commands::apply_reparse,
             commands::get_file_fingerprint,

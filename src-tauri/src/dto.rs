@@ -39,6 +39,8 @@ pub struct DocumentMeta {
     /// and deferred operations echo this back as `expectedRevision` and are
     /// rejected when the document has moved on.
     pub revision: u64,
+    /// Row storage: "editable" (in memory) or "indexedReadOnly" (F10).
+    pub backing: String,
 }
 
 /// Overrides supplied when (re)opening a file. Any `None` field is auto-detected.
@@ -48,6 +50,19 @@ pub struct OpenOptions {
     pub delimiter: Option<String>,
     pub encoding: Option<String>,
     pub has_header_row: Option<bool>,
+    /// Open fully in memory even when the size estimate recommends asking
+    /// (the "Open editable" choice in the F10 decision dialog).
+    #[serde(default)]
+    pub force_in_memory: bool,
+}
+
+/// Handles returned by `start_open_indexed`: the job to watch and the
+/// document id it will register on success.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexedOpenStart {
+    pub job_id: u64,
+    pub doc_id: u64,
 }
 
 /// A window of rows plus a parallel dirty-flag matrix for highlighting.
@@ -91,6 +106,10 @@ pub struct FindOptions {
     pub whole_cell: bool,
     #[serde(default)]
     pub selection: Option<CellRect>,
+    /// Stop after this many matches (indexed documents paginate find so a
+    /// multi-GB scan cannot materialise millions of hits). `None` = no cap.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// A single find hit, in data-row coordinates.

@@ -88,13 +88,19 @@ export function DedupDialog({
           <button onClick={() => void doExport()} disabled={!canAct} className={btnGhost}>
             Export duplicates…
           </button>
-          <button
-            onClick={() => void doRemove()}
-            disabled={!canAct || report?.duplicateRows === 0}
-            className="rounded border border-red-300 px-3 py-1.5 text-sm text-red-700 hover:bg-red-50 disabled:opacity-40 dark:border-red-500/40 dark:text-red-300 dark:hover:bg-red-500/10"
-          >
-            {working ? "Removing…" : `Remove ${report?.duplicateRows.toLocaleString() ?? ""} rows`}
-          </button>
+          {/* Removal mutates the document, so it isn't offered for indexed
+              read-only documents (F10); scan/filter/export still work. */}
+          {meta.backing !== "indexedReadOnly" && (
+            <button
+              onClick={() => void doRemove()}
+              disabled={!canAct || report?.duplicateRows === 0}
+              className="rounded border border-red-300 px-3 py-1.5 text-sm text-red-700 hover:bg-red-50 disabled:opacity-40 dark:border-red-500/40 dark:text-red-300 dark:hover:bg-red-500/10"
+            >
+              {working
+                ? "Removing…"
+                : `Remove ${report?.duplicateRows.toLocaleString() ?? ""} rows`}
+            </button>
+          )}
         </>
       }
     >

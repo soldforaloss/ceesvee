@@ -15,7 +15,14 @@ use crate::dto::{
     RowsResponse, SelectionStats, SortKey,
 };
 use crate::error::{AppError, AppResult};
+use crate::index::{IndexHandle, IndexedFile};
 use crate::parse::{ImportInfo, ParsedFile};
+
+/// Rows scanned for [`Document::column_summaries`] on an INDEXED document.
+/// Editable documents scan everything (cheap); indexed ones sample so the
+/// grid's type badges never trigger a full multi-GB file scan (the F05
+/// profiler remains the exact tool).
+const INDEXED_SUMMARY_SAMPLE: usize = 100_000;
 
 /// Line-ending style, tracked per document and configurable on export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +107,101 @@ enum EditOp {
     Composite(Vec<EditOp>),
 }
 
+/// Single-pass accumulator behind [`Document::column_summaries`].
+struct SummaryAccumulator {
+    nulls: usize,
+    numeric: usize,
+    booly: usize,
+    datey: usize,
+    unique: HashSet<String>,
+    sum: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Default for SummaryAccumulator {
+    fn default() -> Self {
+        SummaryAccumulator {
+            nulls: 0,
+            numeric: 0,
+            booly: 0,
+            datey: 0,
+            unique: HashSet::new(),
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        }
+    }
+}
+
+impl SummaryAccumulator {
+    fn record(&mut self, cell: &str) {
+        let trimmed = cell.trim();
+        if trimmed.is_empty() {
+            self.nulls += 1;
+            return;
+        }
+        if !self.unique.contains(trimmed) {
+            self.unique.insert(trimmed.to_string());
+        }
+        if let Some(n) = analyze::as_number(trimmed) {
+            self.numeric += 1;
+            self.sum += n;
+            if n < self.min {
+                self.min = n;
+            }
+            if n > self.max {
+                self.max = n;
+            }
+        } else if analyze::is_bool(trimmed) {
+            self.booly += 1;
+        } else if analyze::is_date(trimmed) {
+            self.datey += 1;
+        }
+    }
+
+    fn into_summary(self, col: usize, count: usize) -> ColumnSummary {
+        // A column takes a non-text kind only when *every* non-empty cell
+        // matches it; otherwise it is text (blanks never decide the kind).
+        let non_empty = count - self.nulls;
+        let kind = if non_empty == 0 {
+            ColumnKind::Text
+        } else if self.numeric == non_empty {
+            ColumnKind::Number
+        } else if self.booly == non_empty {
+            ColumnKind::Bool
+        } else if self.datey == non_empty {
+            ColumnKind::Date
+        } else {
+            ColumnKind::Text
+        };
+
+        let numeric_summary = (self.numeric > 0).then_some(NumericSummary {
+            min: self.min,
+            max: self.max,
+            mean: self.sum / self.numeric as f64,
+        });
+
+        ColumnSummary {
+            column: col,
+            kind,
+            count,
+            nulls: self.nulls,
+            unique: self.unique.len(),
+            numeric: numeric_summary,
+        }
+    }
+}
+
+/// How a document's rows are stored (F10).
+pub enum Backing {
+    /// Fully materialised and mutable (the default).
+    Memory,
+    /// Streaming, read-only access through a record index; `rows` stays
+    /// empty and every mutation fails with [`AppError::ReadOnly`].
+    Indexed(IndexHandle),
+}
+
 /// An open document.
 pub struct Document {
     pub id: u64,
@@ -141,6 +243,8 @@ pub struct Document {
     /// Identity of the backing file as of the last open/reparse/save, used to
     /// detect external modification. `None` for unsaved documents.
     fingerprint: Option<FileFingerprint>,
+    /// Row storage: in-memory (editable) or a streaming record index (F10).
+    backing: Backing,
 }
 
 impl Document {
@@ -198,6 +302,7 @@ impl Document {
             filter_revision: 1,
             import_info: import,
             fingerprint: None,
+            backing: Backing::Memory,
         }
     }
 
@@ -230,6 +335,47 @@ impl Document {
             filter_revision: 1,
             import_info: ImportInfo::default(),
             fingerprint: None,
+            backing: Backing::Memory,
+        }
+    }
+
+    /// Build a read-only document over a freshly built record index (F10).
+    pub fn from_index(id: u64, path: Option<PathBuf>, indexed: IndexedFile) -> Document {
+        let IndexedFile {
+            handle,
+            headers,
+            has_header_row,
+            encoding_name,
+            had_bom,
+            uses_crlf,
+            import,
+        } = indexed;
+        let n_cols = headers.len();
+        Document {
+            id,
+            path,
+            headers,
+            rows: Vec::new(),
+            has_header_row,
+            delimiter: handle.delimiter(),
+            encoding_name,
+            had_bom,
+            line_ending: if uses_crlf {
+                LineEnding::Crlf
+            } else {
+                LineEnding::Lf
+            },
+            dirty_cells: HashSet::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            saved_marker: 0,
+            filter_view: None,
+            revision: 1,
+            col_revisions: vec![1; n_cols],
+            filter_revision: 1,
+            import_info: import,
+            fingerprint: None,
+            backing: Backing::Indexed(handle),
         }
     }
 
@@ -240,15 +386,119 @@ impl Document {
     }
 
     pub fn n_rows(&self) -> usize {
-        self.rows.len()
+        match &self.backing {
+            Backing::Memory => self.rows.len(),
+            Backing::Indexed(handle) => handle.n_data_records(),
+        }
     }
 
     pub fn headers(&self) -> &[String] {
         &self.headers
     }
 
+    /// The in-memory row slice. EDITABLE backing only: for indexed documents
+    /// this is always empty — mutation paths must gate with
+    /// [`Document::ensure_editable`] first, and read paths must go through
+    /// [`Document::visit_rows`] / [`Document::visit_rows_at`] instead.
     pub fn rows(&self) -> &[Vec<String>] {
         &self.rows
+    }
+
+    /// Whether the document supports mutation (in-memory backing).
+    pub fn is_editable(&self) -> bool {
+        matches!(self.backing, Backing::Memory)
+    }
+
+    /// Guard for mutation paths: fail with [`AppError::ReadOnly`] on an
+    /// indexed document.
+    pub fn ensure_editable(&self) -> AppResult<()> {
+        if self.is_editable() {
+            Ok(())
+        } else {
+            Err(AppError::ReadOnly)
+        }
+    }
+
+    /// Wire name of the backing, carried on [`DocumentMeta`].
+    pub fn backing_name(&self) -> &'static str {
+        match self.backing {
+            Backing::Memory => "editable",
+            Backing::Indexed(_) => "indexedReadOnly",
+        }
+    }
+
+    /// Swap an indexed document to fully materialised editable rows (F10
+    /// convert-to-editable). The caller streams `rows` out of the index
+    /// beforehand; the grid is expected to be rectangular already.
+    pub fn make_editable(&mut self, rows: Vec<Vec<String>>) -> AppResult<()> {
+        if self.is_editable() {
+            return Err(AppError::invalid("document is already editable"));
+        }
+        debug_assert!(rows.iter().all(|r| r.len() == self.headers.len()));
+        self.rows = rows;
+        self.backing = Backing::Memory;
+        // The row storage changed identity; anything captured against the
+        // indexed incarnation must be invalidated.
+        self.revision += 1;
+        self.touch_all_columns();
+        Ok(())
+    }
+
+    // ----- row access (both backings) --------------------------------------
+
+    /// Visit data rows `[range)` in order (absolute coordinates). Indexed
+    /// documents stream bounded blocks from disk; the borrowed row is only
+    /// valid during the callback. Return `Ok(false)` to stop early.
+    pub fn visit_rows(
+        &self,
+        range: std::ops::Range<usize>,
+        f: &mut dyn FnMut(usize, &[String]) -> AppResult<bool>,
+    ) -> AppResult<()> {
+        match &self.backing {
+            Backing::Memory => {
+                let end = range.end.min(self.rows.len());
+                for i in range.start.min(end)..end {
+                    if !f(i, &self.rows[i])? {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
+            Backing::Indexed(handle) => handle.visit(range, f),
+        }
+    }
+
+    /// Visit specific absolute rows in CALLER order. Indexed documents
+    /// coalesce nearby indices into shared contiguous reads.
+    pub fn visit_rows_at(
+        &self,
+        indices: &[usize],
+        f: &mut dyn FnMut(usize, &[String]) -> AppResult<bool>,
+    ) -> AppResult<()> {
+        match &self.backing {
+            Backing::Memory => {
+                if let Some(&bad) = indices.iter().find(|&&i| i >= self.rows.len()) {
+                    return Err(AppError::invalid(format!("row {bad} is out of range")));
+                }
+                for &i in indices {
+                    if !f(i, &self.rows[i])? {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
+            Backing::Indexed(handle) => handle.visit_at(indices, f),
+        }
+    }
+
+    /// Owned copies of specific absolute rows, in caller order.
+    pub fn fetch_rows(&self, indices: &[usize]) -> AppResult<Vec<Vec<String>>> {
+        let mut out = Vec::with_capacity(indices.len());
+        self.visit_rows_at(indices, &mut |_, row| {
+            out.push(row.to_vec());
+            Ok(true)
+        })?;
+        Ok(out)
     }
 
     pub fn has_header_row(&self) -> bool {
@@ -322,7 +572,7 @@ impl Document {
         self.filter_view
             .as_ref()
             .map(Vec::len)
-            .unwrap_or(self.rows.len())
+            .unwrap_or_else(|| self.n_rows())
     }
 
     /// The active filter's matching absolute row indices, in order, if any.
@@ -351,7 +601,7 @@ impl Document {
     pub fn display_to_abs(&self, display: usize) -> Option<usize> {
         match &self.filter_view {
             Some(view) => view.get(display).copied(),
-            None => (display < self.rows.len()).then_some(display),
+            None => (display < self.n_rows()).then_some(display),
         }
     }
 
@@ -360,7 +610,7 @@ impl Document {
     /// bottom can append.
     pub fn display_to_abs_insert(&self, display: usize) -> Option<usize> {
         if display == self.visible_len() {
-            return Some(self.rows.len());
+            return Some(self.n_rows());
         }
         self.display_to_abs(display)
     }
@@ -385,32 +635,32 @@ impl Document {
     // ----- metadata / windowed reads --------------------------------------
 
     /// A window of rows plus a parallel dirty-flag matrix.
-    pub fn get_rows(&self, start: usize, count: usize) -> RowsResponse {
+    pub fn get_rows(&self, start: usize, count: usize) -> AppResult<RowsResponse> {
         let visible = self.visible_len();
         let start = start.min(visible);
         let end = start.saturating_add(count).min(visible);
         // Map a display-row index to its absolute index (identity when unfiltered).
-        let abs_at = |display: usize| -> usize {
-            match &self.filter_view {
+        let abs: Vec<usize> = (start..end)
+            .map(|display| match &self.filter_view {
                 Some(view) => view[display],
                 None => display,
-            }
-        };
-        let rows: Vec<Vec<String>> = (start..end).map(|d| self.rows[abs_at(d)].clone()).collect();
-        let dirty: Vec<Vec<bool>> = (start..end)
-            .map(|d| {
-                let r = abs_at(d);
+            })
+            .collect();
+        let rows = self.fetch_rows(&abs)?;
+        let dirty: Vec<Vec<bool>> = abs
+            .iter()
+            .map(|&r| {
                 (0..self.headers.len())
                     .map(|c| self.dirty_cells.contains(&(r, c)))
                     .collect()
             })
             .collect();
-        RowsResponse { start, rows, dirty }
+        Ok(RowsResponse { start, rows, dirty })
     }
 
     /// Aggregate numeric statistics over a rectangular selection (data-row
     /// coordinates). Computed in Rust so it scales to any selection size.
-    pub fn selection_stats(&self, rect: CellRect) -> SelectionStats {
+    pub fn selection_stats(&self, rect: CellRect) -> AppResult<SelectionStats> {
         let row_end = rect.y.saturating_add(rect.height).min(self.visible_len());
         let col_end = rect.x.saturating_add(rect.width).min(self.headers.len());
 
@@ -420,110 +670,75 @@ impl Document {
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
 
-        for d in rect.y..row_end {
-            // Resolve display row to absolute (identity when unfiltered).
-            let r = match &self.filter_view {
-                Some(view) => view[d],
-                None => d,
-            };
-            for c in rect.x..col_end {
-                count += 1;
-                if let Some(n) = analyze::as_number(&self.rows[r][c]) {
-                    numeric_count += 1;
-                    sum += n;
-                    if n < min {
-                        min = n;
-                    }
-                    if n > max {
-                        max = n;
+        if rect.y < row_end {
+            let mut per_row = |row: &[String]| {
+                for c in rect.x..col_end {
+                    count += 1;
+                    if let Some(n) = row.get(c).and_then(|cell| analyze::as_number(cell)) {
+                        numeric_count += 1;
+                        sum += n;
+                        if n < min {
+                            min = n;
+                        }
+                        if n > max {
+                            max = n;
+                        }
                     }
                 }
+            };
+            // Resolve display rows to absolute (identity when unfiltered).
+            match &self.filter_view {
+                None => self.visit_rows(rect.y..row_end, &mut |_, row| {
+                    per_row(row);
+                    Ok(true)
+                })?,
+                Some(view) => self.visit_rows_at(&view[rect.y..row_end], &mut |_, row| {
+                    per_row(row);
+                    Ok(true)
+                })?,
             }
         }
 
         let has_numeric = numeric_count > 0;
-        SelectionStats {
+        Ok(SelectionStats {
             count,
             numeric_count,
             sum,
             avg: has_numeric.then(|| sum / numeric_count as f64),
             min: has_numeric.then_some(min),
             max: has_numeric.then_some(max),
-        }
+        })
     }
 
-    /// Detect the type of, and summarise, every column over all data rows.
-    /// Computed in Rust because the front end only caches the visible window;
-    /// recomputed on demand (no cache, so it can never go stale after an edit).
-    pub fn column_summaries(&self) -> Vec<ColumnSummary> {
-        (0..self.headers.len())
-            .map(|c| self.column_summary(c))
-            .collect()
+    /// Detect the type of, and summarise, every column in ONE pass over the
+    /// data. Recomputed on demand (no cache, so it can never go stale after
+    /// an edit). Editable documents scan every row; indexed documents scan
+    /// the first [`INDEXED_SUMMARY_SAMPLE`] rows so the grid's type badges
+    /// never trigger a full multi-GB scan (the F05 profiler is the exact tool).
+    pub fn column_summaries(&self) -> AppResult<Vec<ColumnSummary>> {
+        let mut accs: Vec<SummaryAccumulator> = (0..self.headers.len())
+            .map(|_| SummaryAccumulator::default())
+            .collect();
+        let scan_end = self.summary_scan_len();
+        self.visit_rows(0..scan_end, &mut |_, row| {
+            for (c, acc) in accs.iter_mut().enumerate() {
+                acc.record(row.get(c).map(String::as_str).unwrap_or(""));
+            }
+            Ok(true)
+        })?;
+        Ok(accs
+            .into_iter()
+            .enumerate()
+            .map(|(c, acc)| acc.into_summary(c, scan_end))
+            .collect())
     }
 
-    /// Type detection + summary for a single column.
-    pub fn column_summary(&self, col: usize) -> ColumnSummary {
-        let count = self.rows.len();
-        let mut nulls = 0usize;
-        let mut numeric = 0usize;
-        let mut booly = 0usize;
-        let mut datey = 0usize;
-        let mut unique: HashSet<&str> = HashSet::new();
-        let mut sum = 0.0f64;
-        let mut min = f64::INFINITY;
-        let mut max = f64::NEG_INFINITY;
-
-        for row in &self.rows {
-            let trimmed = row.get(col).map(|s| s.trim()).unwrap_or("");
-            if trimmed.is_empty() {
-                nulls += 1;
-                continue;
-            }
-            unique.insert(trimmed);
-            if let Some(n) = analyze::as_number(trimmed) {
-                numeric += 1;
-                sum += n;
-                if n < min {
-                    min = n;
-                }
-                if n > max {
-                    max = n;
-                }
-            } else if analyze::is_bool(trimmed) {
-                booly += 1;
-            } else if analyze::is_date(trimmed) {
-                datey += 1;
-            }
-        }
-
-        // A column takes a non-text kind only when *every* non-empty cell
-        // matches it; otherwise it is text (blanks never decide the kind).
-        let non_empty = count - nulls;
-        let kind = if non_empty == 0 {
-            ColumnKind::Text
-        } else if numeric == non_empty {
-            ColumnKind::Number
-        } else if booly == non_empty {
-            ColumnKind::Bool
-        } else if datey == non_empty {
-            ColumnKind::Date
-        } else {
-            ColumnKind::Text
-        };
-
-        let numeric_summary = (numeric > 0).then_some(NumericSummary {
-            min,
-            max,
-            mean: sum / numeric as f64,
-        });
-
-        ColumnSummary {
-            column: col,
-            kind,
-            count,
-            nulls,
-            unique: unique.len(),
-            numeric: numeric_summary,
+    /// How many rows the column summaries scan (everything, or a bounded
+    /// sample for the indexed backing).
+    fn summary_scan_len(&self) -> usize {
+        match self.backing {
+            Backing::Memory => self.n_rows(),
+            Backing::Indexed(_) => self.n_rows().min(INDEXED_SUMMARY_SAMPLE),
         }
     }
 
@@ -540,7 +755,7 @@ impl Document {
             path: self.path.as_ref().map(|p| p.to_string_lossy().to_string()),
             file_name,
             row_count: self.visible_len(),
-            total_row_count: self.rows.len(),
+            total_row_count: self.n_rows(),
             filtered: self.filter_view.is_some(),
             col_count: self.headers.len(),
             headers: self.headers.clone(),
@@ -553,6 +768,7 @@ impl Document {
             can_undo: self.can_undo(),
             can_redo: self.can_redo(),
             revision: self.revision,
+            backing: self.backing_name().to_string(),
         }
     }
 
@@ -574,6 +790,7 @@ impl Document {
 
     /// Apply a batch of cell changes as a single undoable action.
     pub fn set_cells(&mut self, changes: Vec<(usize, usize, String)>) -> AppResult<()> {
+        self.ensure_editable()?;
         for &(row, col, _) in &changes {
             self.check_cell(row, col)?;
         }
@@ -584,6 +801,7 @@ impl Document {
     }
 
     pub fn insert_rows(&mut self, at: usize, count: usize) -> AppResult<()> {
+        self.ensure_editable()?;
         if at > self.rows.len() {
             return Err(AppError::invalid("row index out of range"));
         }
@@ -596,6 +814,7 @@ impl Document {
     }
 
     pub fn delete_rows(&mut self, mut indices: Vec<usize>) -> AppResult<()> {
+        self.ensure_editable()?;
         indices.sort_unstable();
         indices.dedup();
         if let Some(&max) = indices.last() {
@@ -611,6 +830,7 @@ impl Document {
     }
 
     pub fn move_row(&mut self, from: usize, to: usize) -> AppResult<()> {
+        self.ensure_editable()?;
         let n = self.rows.len();
         if from >= n || to >= n {
             return Err(AppError::invalid("row index out of range"));
@@ -625,6 +845,7 @@ impl Document {
     }
 
     pub fn insert_column(&mut self, at: usize, name: String) -> AppResult<()> {
+        self.ensure_editable()?;
         if at > self.headers.len() {
             return Err(AppError::invalid("column index out of range"));
         }
@@ -634,6 +855,7 @@ impl Document {
     }
 
     pub fn delete_columns(&mut self, mut indices: Vec<usize>) -> AppResult<()> {
+        self.ensure_editable()?;
         indices.sort_unstable();
         indices.dedup();
         if let Some(&max) = indices.last() {
@@ -652,6 +874,7 @@ impl Document {
     }
 
     pub fn rename_column(&mut self, col: usize, name: String) -> AppResult<()> {
+        self.ensure_editable()?;
         if col >= self.headers.len() {
             return Err(AppError::invalid("column index out of range"));
         }
@@ -670,6 +893,7 @@ impl Document {
     }
 
     pub fn move_column(&mut self, from: usize, to: usize) -> AppResult<()> {
+        self.ensure_editable()?;
         let n = self.headers.len();
         if from >= n || to >= n {
             return Err(AppError::invalid("column index out of range"));
@@ -691,6 +915,7 @@ impl Document {
         anchor_col: usize,
         block: Vec<Vec<String>>,
     ) -> AppResult<()> {
+        self.ensure_editable()?;
         if block.is_empty() {
             return Ok(());
         }
@@ -754,6 +979,7 @@ impl Document {
         insert_at: usize,
         new_columns: Vec<(String, Vec<String>)>,
     ) -> AppResult<()> {
+        self.ensure_editable()?;
         remove.sort_unstable();
         remove.dedup();
         if let Some(&max) = remove.last() {
@@ -801,6 +1027,7 @@ impl Document {
 
     /// Sort rows by one or more keys. Empty `keys` is a no-op.
     pub fn sort(&mut self, keys: &[SortKey]) -> AppResult<()> {
+        self.ensure_editable()?;
         if keys.is_empty() || self.rows.len() < 2 {
             return Ok(());
         }
@@ -828,9 +1055,10 @@ impl Document {
 
     /// Toggle whether the first row is treated as a header. This re-interprets
     /// the data, so it clears the undo history and dirty highlights.
-    pub fn set_header_mode(&mut self, has_header: bool) {
+    pub fn set_header_mode(&mut self, has_header: bool) -> AppResult<()> {
+        self.ensure_editable()?;
         if has_header == self.has_header_row {
-            return;
+            return Ok(());
         }
         if has_header {
             if !self.rows.is_empty() {
@@ -852,6 +1080,7 @@ impl Document {
         self.saved_marker = usize::MAX;
         self.revision += 1;
         self.touch_all_columns();
+        Ok(())
     }
 
     pub fn undo(&mut self) -> AppResult<()> {
@@ -1382,10 +1611,10 @@ mod tests {
         let mut d = doc_from("a,b\n1,2", true);
         assert_eq!(d.headers(), &["a", "b"]);
         assert_eq!(d.n_rows(), 1);
-        d.set_header_mode(false);
+        d.set_header_mode(false).unwrap();
         assert_eq!(d.n_rows(), 2);
         assert_eq!(d.cell(0, 0), "a");
-        d.set_header_mode(true);
+        d.set_header_mode(true).unwrap();
         assert_eq!(d.headers(), &["a", "b"]);
         assert_eq!(d.n_rows(), 1);
     }
@@ -1394,7 +1623,7 @@ mod tests {
     fn dirty_cell_follows_sort() {
         let mut d = doc_from("n\n3\n1\n2", true);
         d.set_cell(0, 0, "9".into()).unwrap(); // row with value 3 -> 9
-        let win = d.get_rows(0, 3);
+        let win = d.get_rows(0, 3).unwrap();
         assert!(win.dirty[0][0]);
         d.sort(&[SortKey {
             column: 0,
@@ -1402,7 +1631,7 @@ mod tests {
         }])
         .unwrap();
         // "9" sorts last; its dirty flag should travel with it.
-        let win = d.get_rows(0, 3);
+        let win = d.get_rows(0, 3).unwrap();
         assert!(!win.dirty[0][0]);
         assert!(win.dirty[2][0]);
     }
@@ -1430,12 +1659,14 @@ mod tests {
     fn selection_stats_numeric_and_text() {
         let d = doc_from("a,b\n10,x\n20,y\n30,z", true);
         // The whole 3x2 selection: 6 cells, 3 numeric (10/20/30).
-        let stats = d.selection_stats(CellRect {
-            x: 0,
-            y: 0,
-            width: 2,
-            height: 3,
-        });
+        let stats = d
+            .selection_stats(CellRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 3,
+            })
+            .unwrap();
         assert_eq!(stats.count, 6);
         assert_eq!(stats.numeric_count, 3);
         assert_eq!(stats.sum, 60.0);
@@ -1447,12 +1678,14 @@ mod tests {
     #[test]
     fn selection_stats_clamps_out_of_range() {
         let d = doc_from("a\n1\n2", true);
-        let stats = d.selection_stats(CellRect {
-            x: 0,
-            y: 0,
-            width: 10,
-            height: 100,
-        });
+        let stats = d
+            .selection_stats(CellRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 100,
+            })
+            .unwrap();
         assert_eq!(stats.count, 2);
         assert_eq!(stats.sum, 3.0);
     }
@@ -1495,7 +1728,9 @@ mod tests {
         });
         assert_bumps(&mut d, "undo", |d| d.undo().unwrap());
         assert_bumps(&mut d, "redo", |d| d.redo().unwrap());
-        assert_bumps(&mut d, "set_header_mode", |d| d.set_header_mode(false));
+        assert_bumps(&mut d, "set_header_mode", |d| {
+            d.set_header_mode(false).unwrap()
+        });
         assert_bumps(&mut d, "set_filter", |d| d.set_filter(vec![0]));
         assert_bumps(&mut d, "clear_filter", |d| d.clear_filter());
     }
@@ -1511,7 +1746,7 @@ mod tests {
         d.clear_filter();
         assert_eq!(d.revision(), r);
         // Toggling the header mode to its current value changes nothing.
-        d.set_header_mode(true);
+        d.set_header_mode(true).unwrap();
         assert_eq!(d.revision(), r);
         // Reads and save markers don't count as mutations.
         let _ = d.get_rows(0, 10);
@@ -1622,5 +1857,329 @@ mod tests {
         assert_eq!(replacement.revision(), 41);
         replacement.set_cell(0, 0, "8".into()).unwrap();
         assert_eq!(replacement.revision(), 42);
+    }
+}
+
+/// F10: an indexed document must behave exactly like the same file opened
+/// editable for every read path, and refuse every mutation.
+#[cfg(test)]
+mod indexed_tests {
+    use super::*;
+    use crate::index::{build_index, IndexSettings};
+    use crate::parse::{parse, ParseSettings};
+
+    /// Build (editable, indexed) documents over the same bytes, plus the temp
+    /// root to clean up.
+    fn golden_pair(csv: &str) -> (Document, Document, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "ceesvee-doc-indexed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("data.csv");
+        std::fs::write(&source, csv.as_bytes()).unwrap();
+
+        let parsed = parse(csv.as_bytes(), &ParseSettings::default()).unwrap();
+        let indexed_file = build_index(
+            &source,
+            &root.join("indexes"),
+            &IndexSettings::default(),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        let has_header = indexed_file.has_header_row;
+        let editable = Document::from_parsed(1, Some(source.clone()), parsed, has_header);
+        let indexed = Document::from_index(2, Some(source), indexed_file);
+        (editable, indexed, root)
+    }
+
+    const SAMPLE: &str = "name,qty,price\nApple,3,1.50\n\"Doe, Jane\",7,2.00\napricot,,0.75\n\"multi\nline\",9,3.25\n";
+
+    #[test]
+    fn reads_match_editable_document() {
+        let (editable, indexed, root) = golden_pair(SAMPLE);
+        assert_eq!(indexed.backing_name(), "indexedReadOnly");
+        assert!(!indexed.is_editable());
+        assert_eq!(indexed.n_rows(), editable.n_rows());
+        assert_eq!(indexed.n_cols(), editable.n_cols());
+        assert_eq!(indexed.headers(), editable.headers());
+        assert_eq!(indexed.meta().backing, "indexedReadOnly");
+        assert_eq!(editable.meta().backing, "editable");
+
+        let e = editable.get_rows(0, 100).unwrap();
+        let i = indexed.get_rows(0, 100).unwrap();
+        assert_eq!(e.rows, i.rows);
+        assert!(i.dirty.iter().flatten().all(|&d| !d));
+
+        // fetch_rows in arbitrary order.
+        let want = [3usize, 0, 2];
+        assert_eq!(
+            indexed.fetch_rows(&want).unwrap(),
+            editable.fetch_rows(&want).unwrap()
+        );
+
+        // Selection stats over the numeric columns.
+        let rect = CellRect {
+            x: 1,
+            y: 0,
+            width: 2,
+            height: 4,
+        };
+        let es = editable.selection_stats(rect).unwrap();
+        let is = indexed.selection_stats(rect).unwrap();
+        assert_eq!(es.numeric_count, is.numeric_count);
+        assert_eq!(es.sum, is.sum);
+
+        // Column summaries (kind + unique counts).
+        let ec = editable.column_summaries().unwrap();
+        let ic = indexed.column_summaries().unwrap();
+        assert_eq!(ec.len(), ic.len());
+        for (a, b) in ec.iter().zip(&ic) {
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.nulls, b.nulls);
+            assert_eq!(a.unique, b.unique);
+        }
+        drop(indexed);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn engines_match_editable_document() {
+        let (editable, indexed, root) = golden_pair(SAMPLE);
+
+        // find
+        let opts = crate::dto::FindOptions {
+            query: "ap".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::find::find(&editable, &opts).unwrap(),
+            crate::find::find(&indexed, &opts).unwrap()
+        );
+
+        // find with a limit stops early.
+        let limited = crate::dto::FindOptions {
+            query: "a".into(),
+            limit: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(crate::find::find(&indexed, &limited).unwrap().len(), 1);
+
+        // filter
+        let spec = crate::dto::FilterGroup {
+            conjunction: crate::dto::Conjunction::And,
+            nodes: vec![crate::dto::FilterNode::Condition(
+                crate::dto::FilterCondition {
+                    column: 1,
+                    op: crate::dto::FilterOp::Gt,
+                    value: "4".into(),
+                    case_sensitive: false,
+                },
+            )],
+        };
+        assert_eq!(
+            crate::filter::matching_rows(&editable, &spec).unwrap(),
+            crate::filter::matching_rows(&indexed, &spec).unwrap()
+        );
+
+        // export bytes are identical
+        let opts = crate::dto::ExportOptions {
+            delimiter: ",".into(),
+            encoding: "UTF-8".into(),
+            quote_style: "minimal".into(),
+            line_ending: "lf".into(),
+            bom: false,
+            include_headers: true,
+            backup: Default::default(),
+        };
+        let mut e_out = Vec::new();
+        let mut i_out = Vec::new();
+        crate::export::write_document(&editable, &opts, &mut e_out, None).unwrap();
+        crate::export::write_document(&indexed, &opts, &mut i_out, None).unwrap();
+        assert_eq!(e_out, i_out);
+
+        drop(indexed);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn analysis_engines_match_editable_document() {
+        let (editable, indexed, root) = golden_pair(SAMPLE);
+        let registry = crate::job::JobRegistry::default();
+
+        // Diagnostics: same issue kinds and affected counts.
+        let e = crate::diagnostics::scan(&editable, &registry.begin("d", None, |_| {})).unwrap();
+        let i = crate::diagnostics::scan(&indexed, &registry.begin("d", None, |_| {})).unwrap();
+        let issue_shape = |r: &crate::diagnostics::DiagnosticsReport| {
+            r.current
+                .iter()
+                .map(|x| (x.kind.clone(), x.affected_count))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(issue_shape(&e), issue_shape(&i));
+
+        // Column profile of the name column: identical counts.
+        let opts = crate::profile::ProfileOptions::default();
+        let ep = crate::profile::profile_column(
+            &editable,
+            0,
+            crate::profile::ProfileScope::All,
+            &opts,
+            &registry.begin("p", None, |_| {}),
+        )
+        .unwrap();
+        let ip = crate::profile::profile_column(
+            &indexed,
+            0,
+            crate::profile::ProfileScope::All,
+            &opts,
+            &registry.begin("p", None, |_| {}),
+        )
+        .unwrap();
+        assert_eq!(ep.row_count, ip.row_count);
+        assert_eq!(ep.blank_count, ip.blank_count);
+        assert_eq!(ep.distinct_count, ip.distinct_count);
+        assert_eq!(ep.top_values.len(), ip.top_values.len());
+
+        // Dedup grouping over the qty column.
+        let spec = crate::dedup::DedupSpec {
+            key_columns: vec![1],
+            trim: true,
+            case_insensitive: true,
+            collapse_whitespace: false,
+            blank_keys_equal: true,
+            exclude_blank_keys: false,
+        };
+        let er =
+            crate::dedup::find_duplicates(&editable, &spec, &crate::dto::ExportScope::All, None)
+                .unwrap();
+        let ir =
+            crate::dedup::find_duplicates(&indexed, &spec, &crate::dto::ExportScope::All, None)
+                .unwrap();
+        assert_eq!(er.group_count, ir.group_count);
+        assert_eq!(er.duplicate_rows, ir.duplicate_rows);
+        assert_eq!(er.considered_rows, ir.considered_rows);
+
+        // Comparing the editable and indexed documents positionally finds no
+        // differences: every record classifies as unchanged.
+        let cspec = crate::compare::CompareSpec {
+            mode: crate::compare::CompareMode::Positional,
+            key_columns: Vec::new(),
+            column_mapping: Vec::new(),
+            trim: false,
+            case_insensitive: false,
+            blank_equal: false,
+            numeric_equal: false,
+            date_equal: false,
+        };
+        let result = crate::compare::compare(
+            &editable,
+            &indexed,
+            &cspec,
+            &registry.begin("c", None, |_| {}),
+        )
+        .unwrap();
+        use crate::compare::DiffStatus;
+        let not_unchanged = [
+            DiffStatus::Added,
+            DiffStatus::Removed,
+            DiffStatus::Changed,
+            DiffStatus::Conflict,
+        ];
+        let (_, differing) = crate::compare::results_page(
+            &result,
+            &editable,
+            &indexed,
+            0,
+            100,
+            Some(&not_unchanged),
+        )
+        .unwrap();
+        assert_eq!(differing, 0, "identical data must classify as unchanged");
+        let (all, total) =
+            crate::compare::results_page(&result, &editable, &indexed, 0, 100, None).unwrap();
+        assert_eq!(total, editable.n_rows());
+        assert_eq!(all.len(), editable.n_rows());
+
+        drop(indexed);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn filtered_reads_work_on_indexed_documents() {
+        let (_, mut indexed, root) = golden_pair(SAMPLE);
+        indexed.set_filter(vec![1, 3]);
+        assert_eq!(indexed.visible_len(), 2);
+        let win = indexed.get_rows(0, 10).unwrap();
+        assert_eq!(win.rows.len(), 2);
+        assert_eq!(win.rows[0][0], "Doe, Jane");
+        assert_eq!(win.rows[1][0], "multi\nline");
+        indexed.clear_filter();
+        assert_eq!(indexed.visible_len(), 4);
+        drop(indexed);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn every_mutation_is_rejected_read_only() {
+        let (_, mut d, root) = golden_pair(SAMPLE);
+        let is_read_only = |r: AppResult<()>| matches!(r, Err(AppError::ReadOnly));
+        assert!(is_read_only(d.set_cell(0, 0, "x".into())));
+        assert!(is_read_only(d.set_cells(vec![(0, 0, "x".into())])));
+        assert!(is_read_only(d.insert_rows(0, 1)));
+        assert!(is_read_only(d.delete_rows(vec![0])));
+        assert!(is_read_only(d.move_row(0, 1)));
+        assert!(is_read_only(d.insert_column(0, "new".into())));
+        assert!(is_read_only(d.delete_columns(vec![0])));
+        assert!(is_read_only(d.rename_column(0, "renamed".into())));
+        assert!(is_read_only(d.move_column(0, 1)));
+        assert!(is_read_only(d.paste(0, 0, vec![vec!["p".into()]])));
+        assert!(is_read_only(d.replace_columns(vec![0], 0, Vec::new())));
+        assert!(is_read_only(d.sort(&[SortKey {
+            column: 0,
+            descending: false,
+        }])));
+        assert!(is_read_only(d.set_header_mode(false)));
+        // Nothing was ever registered, so undo/redo report their usual state.
+        assert!(matches!(d.undo(), Err(AppError::NothingToUndo)));
+        assert!(matches!(d.redo(), Err(AppError::NothingToRedo)));
+        assert!(!d.meta().can_undo);
+        assert!(!d.meta().dirty);
+        drop(d);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn convert_to_editable_materialises_and_unlocks() {
+        let (editable, mut indexed, root) = golden_pair(SAMPLE);
+        let revision_before = indexed.revision();
+
+        let n = indexed.n_rows();
+        let mut rows = Vec::with_capacity(n);
+        indexed
+            .visit_rows(0..n, &mut |_, row| {
+                rows.push(row.to_vec());
+                Ok(true)
+            })
+            .unwrap();
+        indexed.make_editable(rows).unwrap();
+
+        assert!(indexed.is_editable());
+        assert_eq!(indexed.backing_name(), "editable");
+        assert!(indexed.revision() > revision_before);
+        assert_eq!(
+            indexed.get_rows(0, 100).unwrap().rows,
+            editable.get_rows(0, 100).unwrap().rows
+        );
+        // Mutations now work.
+        indexed.set_cell(0, 0, "edited".into()).unwrap();
+        assert_eq!(indexed.get_rows(0, 1).unwrap().rows[0][0], "edited");
+        // Double-convert is rejected.
+        assert!(indexed.make_editable(Vec::new()).is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

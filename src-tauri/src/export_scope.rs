@@ -139,15 +139,14 @@ pub fn plan_outputs(
             if *max_bytes == 0 {
                 return Err(AppError::invalid("byte budget must be positive"));
             }
-            let rows = doc.rows();
             let mut chunks: Vec<Vec<usize>> = Vec::new();
             let mut current: Vec<usize> = Vec::new();
             let mut current_bytes: u64 = 0;
-            for &r in &resolved.rows {
+            doc.visit_rows_at(&resolved.rows, &mut |r, row| {
                 let row_bytes: u64 = resolved
                     .cols
                     .iter()
-                    .map(|&c| rows[r][c].len() as u64 + 1)
+                    .map(|&c| row[c].len() as u64 + 1)
                     .sum::<u64>()
                     + 1;
                 // Never split a row; a single row larger than the budget gets
@@ -158,7 +157,8 @@ pub fn plan_outputs(
                 }
                 current.push(r);
                 current_bytes += row_bytes;
-            }
+                Ok(true)
+            })?;
             if !current.is_empty() {
                 chunks.push(current);
             }
@@ -168,18 +168,18 @@ pub fn plan_outputs(
             if *column >= doc.n_cols() {
                 return Err(AppError::invalid("group column is out of range"));
             }
-            let rows = doc.rows();
             // Group rows by value, preserving first-seen group order and
             // source row order within each group.
             let mut order: Vec<String> = Vec::new();
             let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-            for &r in &resolved.rows {
-                let value = &rows[r][*column];
+            doc.visit_rows_at(&resolved.rows, &mut |r, row| {
+                let value = &row[*column];
                 if !groups.contains_key(value) {
                     order.push(value.clone());
                 }
                 groups.entry(value.clone()).or_default().push(r);
-            }
+                Ok(true)
+            })?;
 
             // Sanitize names; resolve collisions deterministically by
             // first-seen order (-2, -3, …).

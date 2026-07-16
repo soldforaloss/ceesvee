@@ -56,21 +56,41 @@ fn abs(view: Option<&[usize]>, display: usize) -> usize {
     }
 }
 
-/// Return every matching cell. Rows are reported in DISPLAY coordinates (what
-/// the grid sees), so a find under an active filter scrolls to the right cell.
+/// Return every matching cell (up to `opts.limit`, when set). Rows are
+/// reported in DISPLAY coordinates (what the grid sees), so a find under an
+/// active filter scrolls to the right cell. Streams through the document's
+/// row-visit API, so it works for both editable and indexed backings.
 pub fn find(doc: &Document, opts: &FindOptions) -> AppResult<Vec<FindMatch>> {
     let re = build_regex(opts)?;
     let (row_start, row_end, col_start, col_end) = scan_bounds(doc, opts);
-    let rows = doc.rows();
-    let view = doc.filter_view();
+    let limit = opts.limit.unwrap_or(usize::MAX);
 
-    let mut matches = Vec::new();
-    for disp in row_start..row_end {
-        let row = &rows[abs(view, disp)];
+    let mut matches: Vec<FindMatch> = Vec::new();
+    if row_start >= row_end || limit == 0 {
+        return Ok(matches);
+    }
+    // Scan one row; returns whether the caller should keep going.
+    let mut on_row = |disp: usize, row: &[String]| -> bool {
         for (c, cell) in row.iter().enumerate().take(col_end).skip(col_start) {
             if re.is_match(cell) {
                 matches.push(FindMatch { row: disp, col: c });
+                if matches.len() >= limit {
+                    return false;
+                }
             }
+        }
+        true
+    };
+    match doc.filter_view() {
+        // Unfiltered: display == absolute.
+        None => doc.visit_rows(row_start..row_end, &mut |i, row| Ok(on_row(i, row)))?,
+        Some(view) => {
+            let mut display = row_start;
+            doc.visit_rows_at(&view[row_start..row_end], &mut |_, row| {
+                let keep_going = on_row(display, row);
+                display += 1;
+                Ok(keep_going)
+            })?
         }
     }
     Ok(matches)
@@ -84,6 +104,9 @@ pub fn replace_all(
     opts: &FindOptions,
     replacement: &str,
 ) -> AppResult<Vec<(usize, usize, String)>> {
+    // Replace is a mutation; the in-memory row slice below is only valid for
+    // the editable backing.
+    doc.ensure_editable()?;
     let re = build_regex(opts)?;
     let (row_start, row_end, col_start, col_end) = scan_bounds(doc, opts);
     let rows = doc.rows();

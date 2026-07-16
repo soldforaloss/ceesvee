@@ -19,8 +19,8 @@ use crate::document::Document;
 use crate::dto::{
     CellRect, ColumnSummary, DocumentMeta, EncodingCompatibility, EncodingIncompatibility,
     ExportOptions, ExportScope, ExternalChange, FileFingerprint, FilterGroup, FindMatch,
-    FindOptions, OpenOptions, ReparsePreview, ReplaceResult, RowsResponse, ScopeCounts,
-    SelectionStats, SortKey, SplitOptions,
+    FindOptions, IndexedOpenStart, OpenOptions, ReparsePreview, ReplaceResult, RowsResponse,
+    ScopeCounts, SelectionStats, SortKey, SplitOptions,
 };
 use crate::error::{AppError, AppResult};
 use crate::job::JobRegistry;
@@ -31,7 +31,8 @@ use crate::settings::{self, AppSettings, FileProfile, ProfileValidation};
 use crate::state::{AppState, PendingFiles, SharedDocument};
 use crate::transform::{self, TransformErrorPolicy, TransformPreview, TransformSpec};
 use crate::{
-    encoding, export, export_scope, filter as filter_mod, find as find_mod, save as save_mod, util,
+    encoding, export, export_scope, filter as filter_mod, find as find_mod, index,
+    save as save_mod, util,
 };
 
 type Db<'a> = State<'a, Mutex<AppState>>;
@@ -89,13 +90,9 @@ fn abs_insert_row(doc: &Document, display: usize) -> AppResult<usize> {
 
 /// Heuristic: treat the first row as a header when none of its cells is numeric.
 fn looks_like_header(records: &[Vec<String>]) -> bool {
-    match records.first() {
-        None => false,
-        Some(first) => first.iter().all(|cell| {
-            let trimmed = cell.trim();
-            trimmed.is_empty() || trimmed.parse::<f64>().is_err()
-        }),
-    }
+    records
+        .first()
+        .is_some_and(|first| util::looks_like_header(first))
 }
 
 /// Read and parse a file off the UI thread, also capturing its fingerprint.
@@ -119,6 +116,20 @@ async fn parse_file(
 
 // ----- open / new / close ------------------------------------------------
 
+/// Files smaller than this skip the open-time memory estimate entirely (the
+/// materialised size of a <64 MiB file can never cross the decision line).
+const ESTIMATE_GUARD_MIN: u64 = 64 * 1024 * 1024;
+
+/// The app-cache directory that index caches live under.
+fn index_cache_root(app: &tauri::AppHandle) -> AppResult<PathBuf> {
+    use tauri::Manager;
+    Ok(app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| AppError::Other(format!("no cache directory: {e}")))?
+        .join("indexes"))
+}
+
 #[tauri::command]
 pub async fn open_file(
     path: String,
@@ -130,6 +141,24 @@ pub async fn open_file(
     let opt_enc = options.encoding.as_deref().map(encoding::from_name);
     let forced_header = options.has_header_row;
 
+    // Guard rail: a file expected to blow the in-memory budget must not be
+    // loaded eagerly. The UI probes first and shows the open-mode dialog;
+    // "Open editable" comes back here with `force_in_memory`.
+    if !options.force_in_memory {
+        let probe_path = PathBuf::from(&path);
+        let size = std::fs::metadata(&probe_path).map(|m| m.len()).unwrap_or(0);
+        if size > ESTIMATE_GUARD_MIN {
+            let est = tauri::async_runtime::spawn_blocking(move || index::estimate(&probe_path))
+                .await
+                .map_err(|e| AppError::Other(format!("background task failed: {e}")))??;
+            if est.needs_decision {
+                return Err(AppError::invalid(
+                    "this file is large — choose how to open it (read-only indexed, or fully in memory)",
+                ));
+            }
+        }
+    }
+
     let (parsed, fingerprint) = parse_file(PathBuf::from(&path), opt_delim, opt_enc).await?;
     let has_header = forced_header.unwrap_or_else(|| looks_like_header(&parsed.records));
 
@@ -140,6 +169,193 @@ pub async fn open_file(
     let meta = doc.meta();
     guard.insert(doc);
     Ok(meta)
+}
+
+/// Sample a file and estimate the in-memory cost of opening it editable, so
+/// the UI can offer read-only (indexed) mode for huge files (F10).
+#[tauri::command]
+pub async fn probe_open(path: String) -> AppResult<index::OpenEstimate> {
+    tauri::async_runtime::spawn_blocking(move || index::estimate(Path::new(&path)))
+        .await
+        .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Open a file in indexed read-only mode (F10): a background job scans the
+/// file once (progress = bytes, cancellable), builds the record index, and
+/// registers the document under the returned `doc_id` when it finishes. The
+/// front end fetches the meta after the job's `job-finished` event.
+#[tauri::command]
+pub async fn start_open_indexed(
+    path: String,
+    options: Option<OpenOptions>,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<IndexedOpenStart> {
+    let options = options.unwrap_or_default();
+    let doc_id = lock(&state)?.alloc_id();
+    let cache_root = index_cache_root(&app)?;
+
+    let ctx = jobs.begin_for_app(&app, "openIndexed", Some(doc_id));
+    let job_id = ctx.id;
+    let app_for_job = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            use tauri::Manager;
+            let source = PathBuf::from(&path);
+            let total = std::fs::metadata(&source).map(|m| m.len()).unwrap_or(0);
+            ctx.set_total(total);
+            // Fingerprint from BEFORE the scan: if the file changes while
+            // scanning, the external-change watcher flags it afterwards.
+            let fingerprint = util::stat_fingerprint(&source);
+            let settings = index::IndexSettings {
+                delimiter: options.delimiter.as_deref().map(util::delimiter_to_byte),
+                encoding: options.encoding.as_deref().map(encoding::from_name),
+                has_header_row: options.has_header_row,
+                chunk_size: 0,
+            };
+            let indexed = index::build_index(&source, &cache_root, &settings, &mut |delta| {
+                ctx.advance(delta)
+            })?;
+            let mut doc = Document::from_index(doc_id, Some(source), indexed);
+            doc.set_fingerprint(fingerprint);
+            let registry = app_for_job.state::<Mutex<AppState>>();
+            registry
+                .lock()
+                .map_err(|_| AppError::Other("internal state lock error".into()))?
+                .insert(doc);
+            Ok(())
+        })
+        .await;
+    });
+    Ok(IndexedOpenStart { job_id, doc_id })
+}
+
+/// Materialise an indexed document into a fully editable in-memory document
+/// (F10 convert-to-editable). Re-runs the memory estimate first; pass `force`
+/// to convert anyway. Runs as a job (progress = rows, cancellable).
+#[tauri::command]
+pub async fn start_convert_to_editable(
+    doc_id: u64,
+    force: bool,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        if doc.is_editable() {
+            return Err(AppError::invalid("document is already editable"));
+        }
+        if !force {
+            if let Some(path) = doc.path.as_deref() {
+                let est = index::estimate(path)?;
+                if est.needs_decision {
+                    return Err(AppError::invalid(format!(
+                        "the estimated in-memory size is about {} MB, which may exhaust memory — \
+                         export a slice instead, or convert anyway",
+                        est.estimated_memory / (1024 * 1024)
+                    )));
+                }
+            }
+        }
+    }
+
+    let ctx = jobs.begin_for_app(&app, "convertEditable", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            // Stream the rows out under a read lock (reads stay available),
+            // then commit under a brief write lock, revision-guarded.
+            let (rows, revision) = {
+                let doc = handle.read().map_err(poisoned)?;
+                if doc.is_editable() {
+                    return Err(AppError::invalid("document is already editable"));
+                }
+                let n = doc.n_rows();
+                ctx.set_total(n as u64);
+                let mut rows: Vec<Vec<String>> = Vec::with_capacity(n);
+                let mut pending = 0u64;
+                doc.visit_rows(0..n, &mut |_, row| {
+                    rows.push(row.to_vec());
+                    pending += 1;
+                    if pending >= 4096 {
+                        ctx.advance(pending)?;
+                        pending = 0;
+                    }
+                    Ok(true)
+                })?;
+                ctx.advance(pending)?;
+                (rows, doc.revision())
+            };
+            ctx.check()?; // last cancellation point before the commit
+
+            let mut doc = handle.write().map_err(poisoned)?;
+            // A concurrent reindex/filter would have bumped the revision; the
+            // materialised rows would no longer match.
+            doc.check_revision(revision)?;
+            doc.make_editable(rows)?;
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// Rebuild an indexed document's record index from its file (the reload path
+/// after an external change). Encoding and delimiter are re-detected; the
+/// header choice is kept. Runs as a job (progress = bytes, cancellable).
+#[tauri::command]
+pub async fn start_reindex(
+    doc_id: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    let (path, has_header) = {
+        let doc = handle.read().map_err(poisoned)?;
+        if doc.is_editable() {
+            return Err(AppError::invalid(
+                "only indexed documents reload by re-indexing",
+            ));
+        }
+        let path = doc
+            .path
+            .clone()
+            .ok_or_else(|| AppError::invalid("document has no file to reload"))?;
+        (path, doc.has_header_row())
+    };
+    let cache_root = index_cache_root(&app)?;
+
+    let ctx = jobs.begin_for_app(&app, "reindex", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            ctx.set_total(total);
+            let fingerprint = util::stat_fingerprint(&path);
+            let settings = index::IndexSettings {
+                has_header_row: Some(has_header),
+                ..Default::default()
+            };
+            let indexed = index::build_index(&path, &cache_root, &settings, &mut |delta| {
+                ctx.advance(delta)
+            })?;
+
+            let mut doc = handle.write().map_err(poisoned)?;
+            let mut fresh = Document::from_index(doc_id, Some(path.clone()), indexed);
+            // Continue the revision sequence so anything captured against the
+            // old incarnation can never accidentally match the new one.
+            fresh.set_revision(doc.revision() + 1);
+            fresh.set_fingerprint(fingerprint);
+            *doc = fresh;
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
 }
 
 /// Parse the document's file with new delimiter/encoding/header overrides and
@@ -182,6 +398,9 @@ pub async fn apply_reparse(
     state: Db<'_>,
 ) -> AppResult<DocumentMeta> {
     let (path, current_header) = read_doc(&state, doc_id, |doc| {
+        // Indexed documents reload through `start_reindex` (streaming), never
+        // by materialising the whole file here.
+        doc.ensure_editable()?;
         doc.check_revision(expected_revision)?;
         let path = doc
             .path
@@ -759,6 +978,8 @@ pub async fn preview_transform(
     let handle = doc_handle(&state, doc_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let doc = handle.read().map_err(poisoned)?;
+        // Transforms mutate; the engine reads the in-memory rows directly.
+        doc.ensure_editable()?;
         doc.check_revision(expected_revision)?;
         Ok(transform::compute(&doc, &spec, &scope, None)?.preview)
     })
@@ -785,6 +1006,7 @@ pub async fn apply_transform(
     let handle = doc_handle(&state, doc_id)?;
     {
         let doc = handle.read().map_err(poisoned)?;
+        doc.ensure_editable()?;
         doc.check_revision(expected_revision)?;
     }
 
@@ -887,17 +1109,17 @@ pub async fn start_column_profile(
 
 #[tauri::command]
 pub fn get_rows(doc_id: u64, start: usize, count: usize, state: Db<'_>) -> AppResult<RowsResponse> {
-    read_doc(&state, doc_id, |doc| Ok(doc.get_rows(start, count)))
+    read_doc(&state, doc_id, |doc| doc.get_rows(start, count))
 }
 
 #[tauri::command]
 pub fn selection_stats(doc_id: u64, rect: CellRect, state: Db<'_>) -> AppResult<SelectionStats> {
-    read_doc(&state, doc_id, |doc| Ok(doc.selection_stats(rect)))
+    read_doc(&state, doc_id, |doc| doc.selection_stats(rect))
 }
 
 #[tauri::command]
 pub fn column_summaries(doc_id: u64, state: Db<'_>) -> AppResult<Vec<ColumnSummary>> {
-    read_doc(&state, doc_id, |doc| Ok(doc.column_summaries()))
+    read_doc(&state, doc_id, |doc| doc.column_summaries())
 }
 
 // ----- cell editing ------------------------------------------------------
@@ -1051,8 +1273,9 @@ pub fn sort(doc_id: u64, keys: Vec<SortKey>, state: Db<'_>) -> AppResult<Documen
 pub fn set_header_mode(doc_id: u64, has_header: bool, state: Db<'_>) -> AppResult<DocumentMeta> {
     write_doc(&state, doc_id, |doc| {
         // Re-interpreting the header row shifts all row indices; drop any filter.
+        doc.ensure_editable()?;
         doc.clear_filter();
-        doc.set_header_mode(has_header);
+        doc.set_header_mode(has_header)?;
         Ok(doc.meta())
     })
 }
@@ -1165,14 +1388,14 @@ pub async fn check_encoding_compatibility(
                 }
             }
         }
-        let rows = doc.rows();
-        for &r in &resolved.rows {
+        doc.visit_rows_at(&resolved.rows, &mut |r, row| {
             for &c in &resolved.cols {
-                if encoding::has_unmappable(&rows[r][c], target) {
-                    record(Some(r), c, &rows[r][c]);
+                if encoding::has_unmappable(&row[c], target) {
+                    record(Some(r), c, &row[c]);
                 }
             }
-        }
+            Ok(true)
+        })?;
         Ok(EncodingCompatibility {
             encoding: target.name().to_string(),
             compatible: affected == 0,
@@ -1214,6 +1437,10 @@ pub async fn start_save(
     // Fail fast (before spawning a job) when the caller's snapshot is stale.
     {
         let doc = handle.read().map_err(poisoned)?;
+        // Saving an indexed document in place is meaningless (its content IS
+        // the file) and Save As would desync the index from `doc.path`; use
+        // Export, or convert to editable first.
+        doc.ensure_editable()?;
         doc.check_revision(expected_revision)?;
     }
 

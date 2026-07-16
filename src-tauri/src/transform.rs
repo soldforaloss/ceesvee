@@ -415,7 +415,7 @@ fn compute_cells(
 
     for (i, &r) in resolved.rows.iter().enumerate() {
         if let Some(ctx) = ctx {
-            if i % ROW_CHUNK == 0 {
+            if i.is_multiple_of(ROW_CHUNK) {
                 ctx.advance(if i == 0 { 0 } else { ROW_CHUNK as u64 })?;
             }
         }
@@ -491,7 +491,7 @@ fn compute_split(
     let mut examples = Vec::new();
     for (r, row) in rows.iter().enumerate() {
         if let Some(ctx) = ctx {
-            if r % ROW_CHUNK == 0 {
+            if r.is_multiple_of(ROW_CHUNK) {
                 ctx.advance(if r == 0 { 0 } else { ROW_CHUNK as u64 })?;
             }
         }
@@ -581,7 +581,7 @@ fn compute_merge(
     let mut examples = Vec::new();
     for (r, row) in rows.iter().enumerate() {
         if let Some(ctx) = ctx {
-            if r % ROW_CHUNK == 0 {
+            if r.is_multiple_of(ROW_CHUNK) {
                 ctx.advance(if r == 0 { 0 } else { ROW_CHUNK as u64 })?;
             }
         }

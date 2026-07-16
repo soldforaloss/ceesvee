@@ -30,7 +30,14 @@ pub fn write_document<W: Write>(
     ctx: Option<&JobCtx>,
 ) -> AppResult<u64> {
     let cols: Vec<usize> = (0..doc.n_cols()).collect();
-    write_rows(doc, 0..doc.n_rows(), &cols, opts, out, ctx)
+    write_rows(
+        doc,
+        RowSelection::Range(0..doc.n_rows()),
+        &cols,
+        opts,
+        out,
+        ctx,
+    )
 }
 
 /// Stream a row/column subset of `doc` (F04 scoped exports). `rows` are
@@ -44,12 +51,20 @@ pub fn write_view<W: Write>(
     out: &mut W,
     ctx: Option<&JobCtx>,
 ) -> AppResult<u64> {
-    write_rows(doc, rows.iter().copied(), cols, opts, out, ctx)
+    write_rows(doc, RowSelection::Indices(rows), cols, opts, out, ctx)
+}
+
+/// Which rows to stream: a contiguous range (whole document) or explicit
+/// absolute indices (scoped exports). Both stream through the document's
+/// visit API, so exports work identically for editable and indexed backings.
+enum RowSelection<'a> {
+    Range(std::ops::Range<usize>),
+    Indices(&'a [usize]),
 }
 
 fn write_rows<W: Write>(
     doc: &Document,
-    row_indices: impl Iterator<Item = usize>,
+    rows: RowSelection<'_>,
     cols: &[usize],
     opts: &ExportOptions,
     out: &mut W,
@@ -102,24 +117,32 @@ fn write_rows<W: Write>(
     // to decide when to rotate (the csv writer hides its inner buffer).
     let mut estimated = 0usize;
     let mut pending_rows = 0u64;
-    let all_rows = doc.rows();
 
-    for r in row_indices {
-        let row = &all_rows[r];
-        writer.write_record(cols.iter().map(|&c| row[c].as_bytes()))?;
-        pending_rows += 1;
-        estimated += cols.iter().map(|&c| row[c].len()).sum::<usize>() + cols.len() + 2;
+    {
+        let mut write_one = |row: &[String]| -> AppResult<bool> {
+            writer.write_record(cols.iter().map(|&c| row[c].as_bytes()))?;
+            pending_rows += 1;
+            estimated += cols.iter().map(|&c| row[c].len()).sum::<usize>() + cols.len() + 2;
 
-        if estimated >= FLUSH_THRESHOLD {
-            writer.flush()?;
-            let mut buf = drain(writer)?;
-            total += transcode_chunk(&mut buf, target, out, ctx)?;
-            writer = make_writer(buf); // reuse the (now cleared) allocation
-            estimated = 0;
-            if let Some(ctx) = ctx {
-                ctx.advance(pending_rows)?;
+            if estimated >= FLUSH_THRESHOLD {
+                writer.flush()?;
+                let rotated = std::mem::replace(&mut writer, make_writer(Vec::new()));
+                let mut buf = drain(rotated)?;
+                total += transcode_chunk(&mut buf, target, out, ctx)?;
+                writer = make_writer(buf); // reuse the (now cleared) allocation
+                estimated = 0;
+                if let Some(ctx) = ctx {
+                    ctx.advance(pending_rows)?;
+                }
+                pending_rows = 0;
             }
-            pending_rows = 0;
+            Ok(true)
+        };
+        match rows {
+            RowSelection::Range(range) => doc.visit_rows(range, &mut |_, row| write_one(row))?,
+            RowSelection::Indices(indices) => {
+                doc.visit_rows_at(indices, &mut |_, row| write_one(row))?
+            }
         }
     }
 

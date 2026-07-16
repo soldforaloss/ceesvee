@@ -128,27 +128,28 @@ fn group_rows(
     if let Some(ctx) = ctx {
         ctx.set_total(resolved.rows.len() as u64);
     }
-    let rows = doc.rows();
 
     let mut order: Vec<String> = Vec::new();
     let mut map: HashMap<String, (Vec<String>, Vec<usize>)> = HashMap::new();
     let mut considered = 0usize;
     let mut unique_blanks = 0usize;
 
-    for (i, &r) in resolved.rows.iter().enumerate() {
+    let mut i = 0usize;
+    doc.visit_rows_at(&resolved.rows, &mut |r, row| {
         if let Some(ctx) = ctx {
-            if i % ROW_CHUNK == 0 {
+            if i.is_multiple_of(ROW_CHUNK) {
                 ctx.advance(if i == 0 { 0 } else { ROW_CHUNK as u64 })?;
             }
         }
+        i += 1;
         let parts: Vec<String> = spec
             .key_columns
             .iter()
-            .map(|&c| normalize(spec, &rows[r][c]))
+            .map(|&c| normalize(spec, &row[c]))
             .collect();
         let blank = parts.iter().all(|p| p.trim().is_empty());
         if blank && spec.exclude_blank_keys {
-            continue;
+            return Ok(true);
         }
         considered += 1;
         if blank && !spec.blank_keys_equal {
@@ -160,7 +161,7 @@ fn group_rows(
                 (parts.clone(), Vec::new())
             });
             // Deliberately no push: a lone member can never form a group.
-            continue;
+            return Ok(true);
         }
         let key = parts.join("\u{1f}");
         map.entry(key.clone())
@@ -170,7 +171,8 @@ fn group_rows(
             })
             .1
             .push(r);
-    }
+        Ok(true)
+    })?;
     if let Some(ctx) = ctx {
         ctx.flush_progress();
     }
@@ -237,7 +239,6 @@ pub fn removal_rows(
     ctx: Option<&JobCtx>,
 ) -> AppResult<Vec<usize>> {
     let grouped = group_rows(doc, spec, scope, ctx)?;
-    let rows = doc.rows();
     let mut removals = Vec::new();
     for (_, members) in grouped.groups {
         let keeper = match keep {
@@ -247,12 +248,15 @@ pub fn removal_rows(
                 // Most non-blank cells wins; ties resolve to the EARLIEST row
                 // (members are in source order, and max_by_key returns the
                 // last maximum, so compare on (count, reverse-position)).
-                *members
+                let group_rows = doc.fetch_rows(&members)?;
+                members
                     .iter()
-                    .max_by_key(|&&r| {
-                        let non_blank = rows[r].iter().filter(|c| !c.trim().is_empty()).count();
+                    .zip(&group_rows)
+                    .max_by_key(|(&r, row)| {
+                        let non_blank = row.iter().filter(|c| !c.trim().is_empty()).count();
                         (non_blank, std::cmp::Reverse(r))
                     })
+                    .map(|(&r, _)| r)
                     .expect("groups have members")
             }
         };

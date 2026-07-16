@@ -56,15 +56,17 @@ fn norm(s: &str, case_sensitive: bool) -> String {
 }
 
 /// Evaluate a filter spec over every data row, returning matching absolute
-/// row indices in document order.
+/// row indices in document order. Streams through [`Document::visit_rows`],
+/// so it works for both editable and indexed backings.
 pub fn matching_rows(doc: &Document, spec: &FilterGroup) -> AppResult<Vec<usize>> {
     let compiled = compile_group(spec)?;
     let mut out = Vec::new();
-    for (i, row) in doc.rows().iter().enumerate() {
+    doc.visit_rows(0..doc.n_rows(), &mut |i, row| {
         if eval(&compiled, row) {
             out.push(i);
         }
-    }
+        Ok(true)
+    })?;
     Ok(out)
 }
 
@@ -246,7 +248,7 @@ mod tests {
         assert_eq!(d.display_to_abs(1), Some(3));
         assert_eq!(d.display_to_abs(2), None);
         assert_eq!(d.display_to_abs_insert(2), Some(4)); // append at end
-        let resp = d.get_rows(0, 10);
+        let resp = d.get_rows(0, 10).unwrap();
         assert_eq!(resp.rows.len(), 2);
         assert_eq!(resp.rows[0][0], "b");
         assert_eq!(resp.rows[1][0], "d");
@@ -262,7 +264,7 @@ mod tests {
             width: 1,
             height: 2,
         };
-        let stats = d.selection_stats(rect);
+        let stats = d.selection_stats(rect).unwrap();
         assert_eq!(stats.numeric_count, 2);
         assert_eq!(stats.sum, 6.0); // 2 + 4, not the hidden 1 or 3
     }

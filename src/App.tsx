@@ -17,6 +17,7 @@ import { Grid } from "./components/Grid";
 import { Close } from "./components/Icons";
 import { ProfilesDialog } from "./components/ProfilesDialog";
 import { ProfileSuggestionBar } from "./components/ProfileSuggestionBar";
+import { OpenModeDialog } from "./components/OpenModeDialog";
 import { QuitDialog } from "./components/QuitDialog";
 import { ReopenDialog } from "./components/ReopenDialog";
 import { SortDialog } from "./components/SortDialog";
@@ -270,6 +271,7 @@ export default function App() {
       {compareOpen && <CompareDialog onClose={() => setCompareOpen(false)} />}
       <ReopenDialog />
       <ExternalChangeDialog />
+      <OpenModeDialog />
       <QuitDialog />
       <EncodingIssuesDialog />
 

@@ -13,6 +13,18 @@ pub fn delimiter_to_byte(s: &str) -> u8 {
     }
 }
 
+/// Heuristic shared by every open path: treat the first record as a header
+/// when none of its cells is numeric.
+pub fn looks_like_header(first_record: &[String]) -> bool {
+    if first_record.is_empty() {
+        return false;
+    }
+    first_record.iter().all(|cell| {
+        let trimmed = cell.trim();
+        trimmed.is_empty() || trimmed.parse::<f64>().is_err()
+    })
+}
+
 /// Stat a file into its identity fingerprint (size + mtime in millis).
 /// `None` when the file is missing or its metadata is unreadable.
 pub fn stat_fingerprint(path: &Path) -> Option<FileFingerprint> {

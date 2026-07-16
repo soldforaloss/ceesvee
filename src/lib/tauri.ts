@@ -26,6 +26,8 @@ import type {
   FilterGroup,
   FindMatch,
   FindOptions,
+  IndexedOpenStart,
+  OpenEstimate,
   OpenOptions,
   ProfileScope,
   ProfileValidation,
@@ -43,6 +45,23 @@ import type {
 
 export const openFile = (path: string, options?: OpenOptions) =>
   invoke<DocumentMeta>("open_file", { path, options });
+
+/** Estimate the in-memory cost of opening a file editable (F10). */
+export const probeOpen = (path: string) => invoke<OpenEstimate>("probe_open", { path });
+
+/**
+ * Open a file in indexed read-only mode (F10). The document registers under
+ * the returned docId when the job finishes.
+ */
+export const startOpenIndexed = (path: string, options?: OpenOptions) =>
+  invoke<IndexedOpenStart>("start_open_indexed", { path, options });
+
+/** Materialise an indexed document into an editable one (job id). */
+export const startConvertToEditable = (docId: number, force: boolean) =>
+  invoke<number>("start_convert_to_editable", { docId, force });
+
+/** Rebuild an indexed document's index from its file (reload path; job id). */
+export const startReindex = (docId: number) => invoke<number>("start_reindex", { docId });
 
 /**
  * Parse the document's file with new settings and describe the outcome
