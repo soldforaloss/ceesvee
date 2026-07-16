@@ -315,7 +315,17 @@ pub struct InputPreview {
 
 pub fn preview(inputs: &[ResolvedInput], options: &AppendOptions) -> AppResult<AppendPreview> {
     let headers = input_headers(inputs)?;
-    let (output, mappings) = build_schema(options, &headers)?;
+    let (mut output, mappings) = build_schema(options, &headers)?;
+    // The run path appends provenance columns AFTER the schema; the preview
+    // must show the schema the output will actually have.
+    if options.add_source_file {
+        let name = unique_column_name(&output, "source_file");
+        output.push(name);
+    }
+    if options.add_source_row {
+        let name = unique_column_name(&output, "source_row");
+        output.push(name);
+    }
 
     let mut projected_rows = 0u64;
     let mut rows_estimated = false;
@@ -359,7 +369,10 @@ pub fn preview(inputs: &[ResolvedInput], options: &AppendOptions) -> AppResult<A
         output_columns: output,
         projected_rows,
         rows_estimated,
-        projected_indexed: estimated_memory > index::MEMORY_DECISION_THRESHOLD,
+        // The builder spills at ITS budget, not the open-mode decision line;
+        // predicting with the larger threshold would promise "editable" for
+        // outputs that actually open read-only.
+        projected_indexed: estimated_memory > crate::derived::SPILL_BUDGET,
         per_input,
     })
 }
@@ -407,6 +420,9 @@ pub fn run(
     });
     let width = output.len();
 
+    // Temporary per-file record indexes stream large inputs (below); they
+    // guard their own cache subdirectories under the same root.
+    let input_cache_root = cache_root.clone();
     let mut builder =
         DerivedDocumentBuilder::new(output.clone(), cache_root, crate::derived::SPILL_BUDGET);
     let mut outcomes: Vec<InputOutcome> = Vec::with_capacity(inputs.len());
@@ -451,16 +467,28 @@ pub fn run(
                 })
             }
             ResolvedInput::File { path, .. } => (|| {
-                let bytes = std::fs::read(path)?;
-                let parsed = parse(&bytes, &ParseSettings::default())?;
-                let mut records = parsed.records.into_iter();
-                let _headers = records.next(); // consumed by the schema pass
-                for (r, cells) in records.enumerate() {
+                // Stream the file through a TEMPORARY record index instead of
+                // materializing every record: bounded memory and cooperative
+                // cancellation regardless of file size (UTF-8 sources are
+                // indexed in place; others decode into a guarded cache dir
+                // that is removed as soon as this input is consumed).
+                let indexed = index::build_index(
+                    path,
+                    &input_cache_root,
+                    &index::IndexSettings::default(),
+                    &mut |_| ctx.check(),
+                )?;
+                let temp = Document::from_index(u64::MAX, None, indexed);
+                // The schema pass consumed the first record as headers; when
+                // the index classified it as data instead, skip it here so
+                // the header line never lands in the output as a row.
+                let start = usize::from(!temp.meta().has_header_row);
+                temp.visit_rows(start..temp.n_rows(), &mut |r, cells| {
                     ctx.check()?;
                     rows_in += 1;
-                    push(r, &cells, &mut builder)?;
-                }
-                Ok(())
+                    push(r - start, cells, &mut builder)?;
+                    Ok(true)
+                })
             })(),
         };
 
