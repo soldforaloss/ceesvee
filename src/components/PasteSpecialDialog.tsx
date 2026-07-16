@@ -28,6 +28,11 @@ export function PasteSpecialDialog({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [working, setWorking] = useState(false);
   const previewRequest = useRef(0);
+  // What the CURRENT preview was computed for: Apply stays disabled until a
+  // fresh preview matches the current options AND the apply is guarded by
+  // the revision the preview saw, so nothing ever mutates unpreviewed.
+  const [previewedKey, setPreviewedKey] = useState<string | null>(null);
+  const [previewRevision, setPreviewRevision] = useState<number | null>(null);
 
   const anchorRow = selectionRect?.y ?? 0;
   const anchorCol = selectionRect?.x ?? 0;
@@ -42,6 +47,18 @@ export function PasteSpecialDialog({ onClose }: { onClose: () => void }) {
     repeatToFill,
     firstRowHeaders,
   };
+  const optionsKey = JSON.stringify([
+    mode,
+    transpose,
+    skipBlanks,
+    trim,
+    repeatToFill,
+    firstRowHeaders,
+    anchorRow,
+    anchorCol,
+    selectionRows,
+    selectionCols,
+  ]);
 
   // Read the clipboard once when the dialog opens.
   useEffect(() => {
@@ -60,6 +77,8 @@ export function PasteSpecialDialog({ onClose }: { onClose: () => void }) {
       return;
     }
     const request = ++previewRequest.current;
+    const requestKey = optionsKey;
+    const requestRevision = meta.revision;
     const handle = setTimeout(() => {
       api
         .previewPasteSpecial(
@@ -74,27 +93,45 @@ export function PasteSpecialDialog({ onClose }: { onClose: () => void }) {
         .then((p) => {
           if (previewRequest.current === request) {
             setPreview(p);
+            setPreviewedKey(requestKey);
+            setPreviewRevision(requestRevision);
             setError(null);
           }
         })
         .catch((e) => {
           if (previewRequest.current === request) {
             setPreview(null);
+            setPreviewedKey(null);
             setError(String(e));
           }
         });
     }, 150);
     return () => clearTimeout(handle);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meta?.id, text, mode, transpose, skipBlanks, trim, repeatToFill, firstRowHeaders]);
+  }, [
+    meta?.id,
+    meta?.revision,
+    text,
+    mode,
+    transpose,
+    skipBlanks,
+    trim,
+    repeatToFill,
+    firstRowHeaders,
+  ]);
 
   if (!meta) return null;
   const readOnly = meta.backing === "indexedReadOnly";
 
+  // Fresh preview matching the current options — the only state Apply accepts.
+  const previewCurrent = preview !== null && previewedKey === optionsKey;
+
   const apply = async () => {
-    if (text === null || readOnly) return;
+    if (text === null || readOnly || !previewCurrent || previewRevision === null) return;
     setWorking(true);
     try {
+      // Guarded by the revision the PREVIEW was computed against, so an edit
+      // made while the dialog is open is rejected instead of applied blind.
       await api.applyPasteSpecial(
         meta.id,
         text,
@@ -103,7 +140,7 @@ export function PasteSpecialDialog({ onClose }: { onClose: () => void }) {
         anchorCol,
         selectionRows,
         selectionCols,
-        meta.revision,
+        previewRevision,
       );
       await reloadActive();
       onClose();
@@ -146,11 +183,11 @@ export function PasteSpecialDialog({ onClose }: { onClose: () => void }) {
           </button>
           <button
             onClick={() => void apply()}
-            disabled={working || !preview || readOnly}
+            disabled={working || !previewCurrent || readOnly}
             title={readOnly ? "Read-only (indexed) document" : undefined}
             className="rounded bg-violet-600 px-3 py-1.5 text-sm text-white hover:bg-violet-500 disabled:opacity-40"
           >
-            {working ? "Applying…" : "Apply"}
+            {working ? "Applying…" : previewCurrent || !preview ? "Apply" : "Previewing…"}
           </button>
         </>
       }
