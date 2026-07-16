@@ -757,11 +757,14 @@ pub async fn start_compare_export(
     let ctx = jobs.begin_for_app(&app, "export", None);
     let job_id = ctx.id;
     let sink = compare_cache.share();
-    let state_docs = lock(&state)?;
-    // Resolve document handles up front (the job outlives this command).
+    // Resolve the compare's documents BEFORE touching AppState: every path
+    // nests the cache mutex outside the registry mutex (get_compare_results
+    // does cache -> doc lookup too), so an ABBA deadlock cannot form.
     let (left_doc, right_doc) = compare_cache
         .with(compare_id, |r| (r.left_doc, r.right_doc))
         .ok_or_else(|| AppError::invalid("comparison no longer exists"))?;
+    // Resolve document handles up front (the job outlives this command).
+    let state_docs = lock(&state)?;
     let left_handle = state_docs.doc(left_doc)?;
     let right_handle = state_docs.doc(right_doc)?;
     drop(state_docs);
@@ -1360,6 +1363,7 @@ pub async fn check_encoding_compatibility(
     doc_id: u64,
     encoding: String,
     scope: Option<ExportScope>,
+    include_headers: Option<bool>,
     state: Db<'_>,
 ) -> AppResult<EncodingCompatibility> {
     const SAMPLE_LIMIT: usize = 100;
@@ -1380,7 +1384,9 @@ pub async fn check_encoding_compatibility(
                 });
             }
         };
-        if doc.has_header_row() {
+        // Skipped headers are never written, so they must not block the
+        // export (default: included, matching the export options default).
+        if include_headers.unwrap_or(true) && doc.has_header_row() {
             let headers = doc.headers();
             for &col in &resolved.cols {
                 if encoding::has_unmappable(&headers[col], target) {

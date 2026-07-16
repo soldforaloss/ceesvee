@@ -240,6 +240,37 @@ fn key_of(spec: &CompareSpec, row: &[String], columns: &[usize]) -> Vec<String> 
     columns.iter().map(|&c| normalize(spec, &row[c])).collect()
 }
 
+/// Canonical form of one key part under EVERY enabled equivalence, so keyed
+/// matching pairs exactly the values [`cells_equal`] would call equal
+/// (`1`/`1.0` under numeric-equal, `03/01/2024`/`2024-03-01` under
+/// date-equal, any blanks under blanks-equal). The prefixes keep a canonical
+/// number/date from colliding with identical literal text. Display keys stay
+/// on [`key_of`]; this is for matching only.
+fn match_key_part(spec: &CompareSpec, value: &str) -> String {
+    if spec.blank_equal && value.trim().is_empty() {
+        return String::new();
+    }
+    if spec.numeric_equal {
+        if let Some(n) = analyze::as_number(value) {
+            return format!("\u{1}n{n}");
+        }
+    }
+    if spec.date_equal {
+        if let Some(d) = analyze::parse_date(value) {
+            return format!("\u{1}d{}", d.format("%Y-%m-%dT%H:%M:%S"));
+        }
+    }
+    normalize(spec, value)
+}
+
+/// The matching key for a row (see [`match_key_part`]).
+fn match_key_of(spec: &CompareSpec, row: &[String], columns: &[usize]) -> Vec<String> {
+    columns
+        .iter()
+        .map(|&c| match_key_part(spec, &row[c]))
+        .collect()
+}
+
 // ----- classification ----------------------------------------------------------------
 
 /// Run the comparison. Read-only; progress and cancellation via `ctx`.
@@ -334,7 +365,7 @@ pub fn compare(
                     ctx.advance(if r == 0 { 0 } else { ROW_CHUNK as u64 })?;
                 }
                 right_index
-                    .entry(key_of(spec, row, &right_key_cols))
+                    .entry(match_key_of(spec, row, &right_key_cols))
                     .or_default()
                     .push(r);
                 Ok(true)
@@ -349,7 +380,7 @@ pub fn compare(
                     ctx.advance(if l == 0 { 0 } else { ROW_CHUNK as u64 })?;
                 }
                 *left_counts
-                    .entry(key_of(spec, row, &spec.key_columns))
+                    .entry(match_key_of(spec, row, &spec.key_columns))
                     .or_insert(0) += 1;
                 Ok(true)
             })?;
@@ -366,16 +397,20 @@ pub fn compare(
                 let mut pending: Vec<(usize, usize, usize)> = Vec::new();
                 for (bi, lrow) in lblock.iter().enumerate() {
                     let li = l + bi;
-                    let key = key_of(spec, lrow, &spec.key_columns);
+                    let key = match_key_of(spec, lrow, &spec.key_columns);
                     let left_dup = left_counts.get(&key).copied().unwrap_or(0) > 1;
                     match right_index.get(&key) {
                         Some(matches) => {
-                            for &r in matches {
-                                right_matched[r] = true;
-                            }
                             if left_dup || matches.len() > 1 {
                                 // Duplicate keys on either side: surface as a
                                 // conflict rather than silently pairing rows.
+                                // Only the referenced right row is consumed;
+                                // the REMAINING right duplicates fall through
+                                // to the unmatched pass below so every record
+                                // is classified (as its own conflict).
+                                if let Some(&first) = matches.first() {
+                                    right_matched[first] = true;
+                                }
                                 entries.push(Entry {
                                     status: DiffStatus::Conflict,
                                     left_row: Some(li as u32),
@@ -383,6 +418,7 @@ pub fn compare(
                                 });
                             } else {
                                 let r = matches[0];
+                                right_matched[r] = true;
                                 pending.push((entries.len(), bi, r));
                                 entries.push(Entry {
                                     status: DiffStatus::Unchanged, // provisional
@@ -724,6 +760,45 @@ mod tests {
         assert_eq!(s[3], DiffStatus::Conflict);
         assert_eq!(s[4], DiffStatus::Conflict);
         assert_eq!(result.summary.conflicts, 4);
+    }
+
+    #[test]
+    fn every_right_duplicate_of_a_matched_key_is_classified() {
+        // One left row, two right rows with the same key: the pair entry
+        // consumes only the referenced right row; the OTHER right duplicate
+        // must still surface as its own conflict instead of vanishing.
+        let left = doc(1, "id,v\n1,a");
+        let right = doc(2, "id,v\n1,x\n1,y");
+        let (_r, ctx) = ctx();
+        let result = compare(&left, &right, &keyed_spec(vec![0]), &ctx).unwrap();
+        assert_eq!(result.summary.conflicts, 2, "{:?}", statuses(&result));
+        assert_eq!(result.summary.total, 2);
+        // Both right rows appear across the entries.
+        let right_rows: Vec<Option<u32>> = result.entries.iter().map(|e| e.right_row).collect();
+        assert!(right_rows.contains(&Some(0)));
+        assert!(right_rows.contains(&Some(1)));
+    }
+
+    #[test]
+    fn keyed_matching_honours_numeric_and_date_equivalence() {
+        // With numeric/date equivalence on, `1` and `1.0` (and the two date
+        // spellings) must PAIR as the same key, not classify as added+removed.
+        let left = doc(1, "id,v\n1,a\n2024-03-01,b");
+        let right = doc(2, "id,v\n1.0,a\n03/01/2024,b");
+        let mut spec = keyed_spec(vec![0]);
+        spec.numeric_equal = true;
+        spec.date_equal = true;
+        let (_r, equivalent_ctx) = ctx();
+        let result = compare(&left, &right, &spec, &equivalent_ctx).unwrap();
+        assert_eq!(result.summary.unchanged, 2, "{:?}", statuses(&result));
+        assert_eq!(result.summary.added, 0);
+        assert_eq!(result.summary.removed, 0);
+
+        // Without the toggles the same rows do NOT pair.
+        let (_r2, strict_ctx) = ctx();
+        let strict = compare(&left, &right, &keyed_spec(vec![0]), &strict_ctx).unwrap();
+        assert_eq!(strict.summary.removed, 2);
+        assert_eq!(strict.summary.added, 2);
     }
 
     #[test]

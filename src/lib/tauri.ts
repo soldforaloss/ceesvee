@@ -179,8 +179,18 @@ export const redo = (docId: number) => invoke<DocumentMeta>("redo", { docId });
  * Scan for characters the target encoding cannot represent, optionally
  * limited to the slice an export will actually write.
  */
-export const checkEncodingCompatibility = (docId: number, encoding: string, scope?: ExportScope) =>
-  invoke<EncodingCompatibility>("check_encoding_compatibility", { docId, encoding, scope });
+export const checkEncodingCompatibility = (
+  docId: number,
+  encoding: string,
+  scope?: ExportScope,
+  includeHeaders?: boolean,
+) =>
+  invoke<EncodingCompatibility>("check_encoding_compatibility", {
+    docId,
+    encoding,
+    scope,
+    includeHeaders,
+  });
 
 /** The row/column counts a scoped export would write. */
 export const exportScopeCounts = (docId: number, scope: ExportScope) =>

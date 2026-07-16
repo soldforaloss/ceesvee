@@ -182,16 +182,20 @@ pub fn plan_outputs(
             })?;
 
             // Sanitize names; resolve collisions deterministically by
-            // first-seen order (-2, -3, …).
-            let mut used: HashMap<String, usize> = HashMap::new();
+            // first-seen order (-2, -3, …). Every FINAL name is reserved, so
+            // a suffixed name can never collide with a later group whose raw
+            // value already looks suffixed (e.g. `a/b`, `a_b`, literal
+            // `a_b-2` all get distinct files).
+            let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut outputs = Vec::with_capacity(order.len());
             for value in order {
                 let group_rows = groups.remove(&value).unwrap_or_default();
-                let mut label = sanitize_filename_part(&value);
-                let n = used.entry(label.clone()).or_insert(0);
-                *n += 1;
-                if *n > 1 {
-                    label = format!("{label}-{n}");
+                let base_label = sanitize_filename_part(&value);
+                let mut label = base_label.clone();
+                let mut n = 1usize;
+                while !taken.insert(label.clone()) {
+                    n += 1;
+                    label = format!("{base_label}-{n}");
                 }
                 outputs.push(PlannedOutput {
                     path: derived_path(base, &label),
@@ -537,6 +541,33 @@ mod tests {
         let mut all: Vec<usize> = outputs.iter().flat_map(|o| o.rows.clone()).collect();
         all.sort_unstable();
         assert_eq!(all, (0..7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn group_split_never_reuses_a_suffixed_name() {
+        // `a/b` and `a_b` sanitize to the same label, and a literal `a_b-2`
+        // value matches the suffix the collision handling would generate; all
+        // three must still land in DISTINCT files (an overwrite would silently
+        // drop a group and leave a stale manifest hash).
+        let d = doc_from("region,v\na/b,1\na_b,2\na_b-2,3", true);
+        let resolved = resolve_scope(&d, &ExportScope::All).unwrap();
+        let outputs = plan_outputs(
+            &d,
+            Path::new("out.csv"),
+            &resolved,
+            &SplitOptions::GroupByColumn { column: 0 },
+        )
+        .unwrap();
+        let names: Vec<String> = outputs
+            .iter()
+            .map(|o| o.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["out-a_b.csv", "out-a_b-2.csv", "out-a_b-2-2.csv"]
+        );
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "no duplicate output paths");
     }
 
     #[test]
