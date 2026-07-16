@@ -1572,6 +1572,25 @@ export const useStore = create<Store>((set, get) => {
     // ----- background-job events -------------------------------------------
 
     handleJobProgress: (progress) => {
+      // Archive extraction (F17) runs before any document exists, so its
+      // job carries no docId — route it by job id BEFORE the docId gate.
+      if (
+        progress.kind === "openIndexed" ||
+        progress.kind === "convertEditable" ||
+        progress.kind === "reindex" ||
+        progress.kind === "archiveExtract"
+      ) {
+        if (get().indexing?.jobId !== progress.jobId) return;
+        set((s) => ({
+          indexing: s.indexing && {
+            ...s.indexing,
+            processed: progress.processed,
+            total: progress.total ?? s.indexing.total,
+          },
+        }));
+        return;
+      }
+
       if (progress.docId == null) return;
       const docId = progress.docId;
 
@@ -1613,23 +1632,6 @@ export const useStore = create<Store>((set, get) => {
         if (get().compare.jobId !== progress.jobId) return;
         set((s) => ({
           compare: { ...s.compare, processed: progress.processed, total: progress.total },
-        }));
-        return;
-      }
-
-      if (
-        progress.kind === "openIndexed" ||
-        progress.kind === "convertEditable" ||
-        progress.kind === "reindex" ||
-        progress.kind === "archiveExtract"
-      ) {
-        if (get().indexing?.jobId !== progress.jobId) return;
-        set((s) => ({
-          indexing: s.indexing && {
-            ...s.indexing,
-            processed: progress.processed,
-            total: progress.total,
-          },
         }));
         return;
       }
