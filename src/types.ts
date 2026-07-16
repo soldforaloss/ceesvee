@@ -1191,6 +1191,24 @@ export interface AppSettings {
    * `mod+shift+k` syntax. `null` unbinds; a missing key keeps the default.
    */
   shortcutOverrides?: Record<string, string | null>;
+  /** F16: opt-in crash-recovery journaling (privacy disclosure applies). */
+  recoveryEnabled?: boolean;
+  /** F16: journals older than this many days are swept at startup. */
+  recoveryRetentionDays?: number;
+}
+
+/** One recoverable session found at startup (F16). */
+export interface RecoverableSession {
+  journalPath: string;
+  sourcePath: string;
+  fileName: string;
+  lastEditEpochSecs: number;
+  operationCount: number;
+  /** Source changed since journaling — blind replay blocked. */
+  sourceChanged: boolean;
+  sourceMissing: boolean;
+  /** Journal version mismatch — kept for manual recovery only. */
+  incompatible: boolean;
 }
 
 /** One violated profile rule. */

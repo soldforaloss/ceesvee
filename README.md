@@ -112,6 +112,10 @@ and faithful on large, real-world delimited files.**
 - **Change inspector** — see every unsaved operation with before/after
   values, jump to changes, and selectively revert cells, columns,
   operations, or everything — each revert itself undoable.
+- **Crash recovery** (opt-in) — an append-only local edit journal that
+  replays your unsaved work after a crash, without ever touching the
+  source file. Changed sources recover as copies; journals clean up on
+  save and close.
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 

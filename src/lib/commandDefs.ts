@@ -281,6 +281,14 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("semantic"),
     },
     {
+      id: "file.recovery",
+      title: "Recover unsaved work…",
+      keywords: ["crash", "journal", "restore", "recovery"],
+      category: "File",
+      unavailableReason: () => null,
+      run: () => openModal("recovery"),
+    },
+    {
       id: "view.changes",
       title: "Changes since save",
       keywords: ["inspector", "revert", "history", "dirty", "diff", "unsaved"],

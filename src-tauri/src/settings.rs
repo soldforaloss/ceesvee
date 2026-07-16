@@ -122,6 +122,17 @@ pub struct AppSettings {
     /// end — the backend only persists them.
     #[serde(default)]
     pub shortcut_overrides: std::collections::HashMap<String, Option<String>>,
+    /// F16: OPT-IN crash-recovery journaling (journals may contain edited
+    /// cell values; the UI shows a privacy disclosure).
+    #[serde(default)]
+    pub recovery_enabled: bool,
+    /// F16: journals older than this are swept at startup.
+    #[serde(default = "default_recovery_retention")]
+    pub recovery_retention_days: u32,
+}
+
+fn default_recovery_retention() -> u32 {
+    7
 }
 
 impl Default for AppSettings {
@@ -130,6 +141,8 @@ impl Default for AppSettings {
             version: SETTINGS_VERSION,
             profiles: Vec::new(),
             shortcut_overrides: std::collections::HashMap::new(),
+            recovery_enabled: false,
+            recovery_retention_days: default_recovery_retention(),
         }
     }
 }

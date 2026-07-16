@@ -49,7 +49,7 @@ impl LineEnding {
 }
 
 /// One captured cell change for undo.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CellEdit {
     row: usize,
     col: usize,
@@ -58,7 +58,7 @@ struct CellEdit {
 }
 
 /// A removed column, captured for undo.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RemovedColumn {
     index: usize,
     header: String,
@@ -66,8 +66,9 @@ struct RemovedColumn {
 }
 
 /// A single reversible edit. Structural ops capture exactly what they need to
-/// undo without snapshotting the whole document.
-#[derive(Debug, Clone)]
+/// undo without snapshotting the whole document. Serializable so the F16
+/// crash-recovery journal can persist and replay operations.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum EditOp {
     SetCells(Vec<CellEdit>),
     InsertRows {
@@ -261,6 +262,8 @@ pub struct Document {
     undo_meta: Vec<OpMeta>,
     redo_meta: Vec<OpMeta>,
     next_op_id: u64,
+    /// Append-only crash-recovery journal (F16), when journaling is on.
+    journal: Option<crate::journal::JournalWriter>,
     /// `undo_stack.len()` at the last save; the document is dirty when it differs.
     saved_marker: usize,
     /// Absolute indices of the rows matching the active filter, in order; `None`
@@ -350,6 +353,7 @@ impl Document {
             undo_meta: Vec::new(),
             redo_meta: Vec::new(),
             next_op_id: 0,
+            journal: None,
             saved_marker: 0,
             filter_view: None,
             revision: 1,
@@ -388,6 +392,7 @@ impl Document {
             undo_meta: Vec::new(),
             redo_meta: Vec::new(),
             next_op_id: 0,
+            journal: None,
             saved_marker: 0,
             filter_view: None,
             revision: 1,
@@ -433,6 +438,7 @@ impl Document {
             undo_meta: Vec::new(),
             redo_meta: Vec::new(),
             next_op_id: 0,
+            journal: None,
             saved_marker: 0,
             filter_view: None,
             revision: 1,
@@ -1304,6 +1310,11 @@ impl Document {
         self.redo_stack.clear();
         self.undo_meta.clear();
         self.redo_meta.clear();
+        // A journal against the OLD interpretation must not survive: its
+        // replay would target coordinates that no longer exist.
+        if let Some(journal) = self.journal.take() {
+            journal.delete();
+        }
         self.dirty_cells.clear();
         self.saved_marker = usize::MAX;
         self.revision += 1;
@@ -1533,6 +1544,9 @@ impl Document {
         self.revision += 1;
         self.stamp_touched(&op);
         self.redo_stack.push(op);
+        if let Some(journal) = &mut self.journal {
+            journal.append(&crate::journal::JournalRecord::Undo);
+        }
         Ok(())
     }
 
@@ -1545,7 +1559,167 @@ impl Document {
         self.revision += 1;
         self.stamp_touched(&op);
         self.undo_stack.push(op);
+        if let Some(journal) = &mut self.journal {
+            journal.append(&crate::journal::JournalRecord::Redo);
+        }
         Ok(())
+    }
+
+    // ----- crash-recovery journaling (F16) ----------------------------------
+
+    /// Attach a journal; every subsequent operation is appended to it.
+    pub fn attach_journal(&mut self, journal: crate::journal::JournalWriter) {
+        self.journal = Some(journal);
+    }
+
+    /// Detach the journal (close/reparse paths delete the file afterwards).
+    pub fn take_journal(&mut self) -> Option<crate::journal::JournalWriter> {
+        self.journal.take()
+    }
+
+    /// The header describing this document's CURRENT baseline.
+    pub fn journal_header(&self) -> crate::journal::JournalHeader {
+        crate::journal::JournalHeader {
+            version: crate::journal::JOURNAL_VERSION,
+            path: self
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            fingerprint: self.fingerprint,
+            delimiter: (self.delimiter as char).to_string(),
+            encoding: self.encoding_name.clone(),
+            has_header_row: self.has_header_row,
+            base_revision: self.revision,
+        }
+    }
+
+    /// After a successful save the journal restarts against the new
+    /// baseline (this is also its compaction step).
+    pub fn reset_journal_baseline(&mut self) {
+        let header = self.journal_header();
+        if let Some(journal) = &mut self.journal {
+            let _ = journal.reset(&header);
+        }
+    }
+
+    /// Bounds-check an op against simulated dimensions, advancing them the
+    /// way applying the op would. Keeps a corrupt or mismatched journal
+    /// from panicking the replay.
+    fn op_bounds_ok(op: &EditOp, rows: &mut usize, cols: &mut usize, inverse: bool) -> bool {
+        match op {
+            EditOp::SetCells(edits) => edits.iter().all(|e| e.row < *rows && e.col < *cols),
+            EditOp::InsertRows { at, count } => {
+                if inverse {
+                    if *at + *count > *rows {
+                        return false;
+                    }
+                    *rows -= count;
+                } else {
+                    if *at > *rows {
+                        return false;
+                    }
+                    *rows += count;
+                }
+                true
+            }
+            EditOp::DeleteRows { removed } => {
+                if inverse {
+                    if removed.iter().any(|(i, _)| *i > *rows) {
+                        return false;
+                    }
+                    *rows += removed.len();
+                } else {
+                    if removed.iter().any(|(i, _)| *i >= *rows) {
+                        return false;
+                    }
+                    *rows -= removed.len();
+                }
+                true
+            }
+            EditOp::MoveRow { from, to } => *from < *rows && *to < *rows,
+            EditOp::InsertColumn { at, .. } => {
+                if inverse {
+                    if *at >= *cols {
+                        return false;
+                    }
+                    *cols -= 1;
+                } else {
+                    if *at > *cols {
+                        return false;
+                    }
+                    *cols += 1;
+                }
+                true
+            }
+            EditOp::DeleteColumns { removed } => {
+                if inverse {
+                    if removed
+                        .iter()
+                        .any(|c| c.index > *cols || c.values.len() != *rows)
+                    {
+                        return false;
+                    }
+                    *cols += removed.len();
+                } else {
+                    if removed.iter().any(|c| c.index >= *cols) {
+                        return false;
+                    }
+                    *cols -= removed.len();
+                }
+                true
+            }
+            EditOp::RenameColumn { col, .. } => *col < *cols,
+            EditOp::MoveColumn { from, to } => *from < *cols && *to < *cols,
+            EditOp::SortRows { order } => {
+                order.len() == *rows && order.iter().all(|&i| (i as usize) < *rows)
+            }
+            EditOp::Composite(ops) => {
+                if inverse {
+                    ops.iter()
+                        .rev()
+                        .all(|sub| Self::op_bounds_ok(sub, rows, cols, true))
+                } else {
+                    ops.iter()
+                        .all(|sub| Self::op_bounds_ok(sub, rows, cols, false))
+                }
+            }
+            EditOp::Inverse(inner) => Self::op_bounds_ok(inner, rows, cols, !inverse),
+        }
+    }
+
+    /// Replay journal records (F16 recovery) in their original order,
+    /// registering each as an ordinary operation — so the recovered
+    /// document is dirty, fully undoable, and journals onward if a journal
+    /// is attached. Returns how many operations were applied.
+    pub fn replay_journal_records(
+        &mut self,
+        records: &[crate::journal::JournalRecord],
+    ) -> AppResult<usize> {
+        self.ensure_editable()?;
+        let mut applied = 0usize;
+        for record in records {
+            match record {
+                crate::journal::JournalRecord::Op { op } => {
+                    let op: EditOp = serde_json::from_value(op.clone())
+                        .map_err(|_| AppError::invalid("a journal operation no longer parses"))?;
+                    let mut rows = self.rows.len();
+                    let mut cols = self.headers.len();
+                    if !Self::op_bounds_ok(&op, &mut rows, &mut cols, false) {
+                        return Err(AppError::invalid(
+                            "the journal does not match the file — recover as a \
+                             copy or discard it",
+                        ));
+                    }
+                    self.apply(&op);
+                    self.register(op);
+                    applied += 1;
+                }
+                crate::journal::JournalRecord::Undo => self.undo()?,
+                crate::journal::JournalRecord::Redo => self.redo()?,
+            }
+        }
+        Ok(applied)
     }
 
     // ----- helpers: build + apply a fresh op, returning it (no stack push) --
@@ -1569,6 +1743,11 @@ impl Document {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         });
+        if let Some(journal) = &mut self.journal {
+            if let Ok(value) = serde_json::to_value(&op) {
+                journal.append(&crate::journal::JournalRecord::Op { op: value });
+            }
+        }
         self.undo_stack.push(op);
         self.redo_stack.clear();
         self.redo_meta.clear();
@@ -2794,5 +2973,79 @@ mod f15_tests {
         assert_eq!(d.n_rows(), 1);
         assert_eq!(d.cell(0, 0), "1");
         assert!(d.is_dirty(), "reverting is itself an unsaved change");
+    }
+}
+
+#[cfg(test)]
+mod f16_tests {
+    use super::*;
+    use crate::journal::{read_journal, JournalWriter};
+    use crate::parse::{parse, ParseSettings};
+
+    fn doc(csv: &str) -> Document {
+        let parsed = parse(csv.as_bytes(), &ParseSettings::default()).unwrap();
+        Document::from_parsed(1, None, parsed, true)
+    }
+
+    #[test]
+    fn journaled_edits_replay_in_order_onto_a_fresh_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("t.journal");
+
+        // Session 1: edit with a journal attached, then "crash".
+        let mut live = doc("a,b\n1,2\n3,4\n");
+        let writer = JournalWriter::create(journal_path.clone(), &live.journal_header()).unwrap();
+        live.attach_journal(writer);
+        live.set_cells(vec![(0, 0, "X".into())]).unwrap();
+        live.insert_rows(2, 1).unwrap();
+        live.set_cells(vec![(2, 1, "new".into())]).unwrap();
+        live.undo().unwrap(); // journaled as an Undo marker
+        drop(live); // crash: no clean close, the journal survives
+
+        // Session 2: recover by replaying onto a fresh parse.
+        let (_header, records) = read_journal(&journal_path).unwrap();
+        let mut recovered = doc("a,b\n1,2\n3,4\n");
+        let applied = recovered.replay_journal_records(&records).unwrap();
+        assert_eq!(applied, 3);
+        assert_eq!(recovered.cell(0, 0), "X");
+        assert_eq!(recovered.n_rows(), 3, "inserted row survives");
+        assert_eq!(recovered.cell(2, 1), "", "the undone edit stays undone");
+        assert!(recovered.is_dirty(), "recovery produces a dirty document");
+        assert!(recovered.can_redo(), "even the redo branch is restored");
+    }
+
+    #[test]
+    fn mismatched_journals_error_instead_of_panicking() {
+        // A journal recorded against a WIDER document.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("w.journal");
+        let mut wide = doc("a,b,c\n1,2,3\n");
+        let writer = JournalWriter::create(journal_path.clone(), &wide.journal_header()).unwrap();
+        wide.attach_journal(writer);
+        wide.set_cells(vec![(0, 2, "X".into())]).unwrap();
+        drop(wide);
+
+        let (_h, records) = read_journal(&journal_path).unwrap();
+        let mut narrow = doc("a\n1\n");
+        let err = match narrow.replay_journal_records(&records) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("out-of-bounds replay must fail"),
+        };
+        assert!(err.contains("does not match"));
+        assert_eq!(narrow.cell(0, 0), "1", "nothing was applied");
+    }
+
+    #[test]
+    fn saving_resets_the_journal_and_replaying_it_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("s.journal");
+        let mut live = doc("a\n1\n");
+        let writer = JournalWriter::create(journal_path.clone(), &live.journal_header()).unwrap();
+        live.attach_journal(writer);
+        live.set_cells(vec![(0, 0, "X".into())]).unwrap();
+        live.mark_saved(None);
+        live.reset_journal_baseline();
+        let (_h, records) = read_journal(&journal_path).unwrap();
+        assert!(records.is_empty(), "a clean save leaves an empty journal");
     }
 }
