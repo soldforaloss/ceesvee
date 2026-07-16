@@ -281,6 +281,14 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("semantic"),
     },
     {
+      id: "data.pii",
+      title: "Find personal data…",
+      keywords: ["pii", "redact", "mask", "sensitive", "gdpr", "anonymize", "pseudonymize"],
+      category: "Data",
+      unavailableReason: needsDoc,
+      run: () => openModal("pii"),
+    },
+    {
       id: "data.recipes",
       title: "Batch process files…",
       keywords: ["recipe", "folder", "automation", "pipeline", "bulk", "many files"],

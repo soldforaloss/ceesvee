@@ -105,6 +105,10 @@ and faithful on large, real-world delimited files.**
 - **Batch recipes** — run a saved, declarative pipeline (validate /
   filter / clean / dedup / sort / export) over folders of files with
   dry runs, per-file reports, and no-overwrite defaults. No scripting.
+- **PII detection & redaction** — find emails, phones, IPs, SSN
+  patterns, and Luhn-valid card numbers (masked samples only), then
+  mask, pseudonymize (HMAC, never-stored secret), or remove them —
+  previewed, undoable, audited locally, never leaving your device.
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 

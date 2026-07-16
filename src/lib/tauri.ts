@@ -25,6 +25,10 @@ import type {
   CrossValReport,
   PastePreview,
   PasteSpecialOptions,
+  PiiReport,
+  PiiSpec,
+  RedactionAction,
+  RedactionPreview,
   DedupSpec,
   DiagnosticsReport,
   DiffStatus,
@@ -252,6 +256,50 @@ export const startAppend = (inputs: AppendInput[], options: AppendOptions) =>
 /** The per-input outcome report of a finished append (F20). */
 export const getAppendReport = (docId: number) =>
   invoke<AppendReport | null>("get_append_report", { docId });
+
+/** The last completed PII report + the spec that produced it (F28). */
+export const getPiiReport = (docId: number) =>
+  invoke<[PiiSpec, PiiReport] | null>("get_pii_report", { docId });
+
+/** Run a PII scan as a cancellable job — samples are masked (F28). */
+export const startPiiScan = (docId: number, spec: PiiSpec, expectedRevision: number) =>
+  invoke<number>("start_pii_scan", { docId, spec, expectedRevision });
+
+/** Preview a redaction: counts + MASKED before/after examples (F28). */
+export const previewRedaction = (
+  docId: number,
+  spec: PiiSpec,
+  detector: number,
+  column: number,
+  action: RedactionAction,
+  expectedRevision: number,
+) =>
+  invoke<RedactionPreview>("preview_redaction", {
+    docId,
+    spec,
+    detector,
+    column,
+    action,
+    expectedRevision,
+  });
+
+/** Apply a previewed redaction as ONE undo step (audited locally) (F28). */
+export const applyRedaction = (
+  docId: number,
+  spec: PiiSpec,
+  detector: number,
+  column: number,
+  action: RedactionAction,
+  expectedRevision: number,
+) =>
+  invoke<DocumentMeta>("apply_redaction", {
+    docId,
+    spec,
+    detector,
+    column,
+    action,
+    expectedRevision,
+  });
 
 /** Validate a batch (recipe version, steps, templates) without running (F25). */
 export const validateRecipeBatch = (options: BatchOptions) =>

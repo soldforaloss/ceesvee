@@ -8,6 +8,19 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **PII detection and redaction** (palette → "Find personal data…"):
+  deterministic detectors — emails, phone numbers, IP addresses, US SSN
+  patterns, Luhn-validated payment-card candidates, and custom regexes —
+  with NO claim to find names, addresses, or all PII. Reports show
+  detector, column, count, validation method, and MASKED samples; full
+  card/SSN values never appear anywhere. Redactions (each previewed with
+  masked examples, each one undo step, each targeting one explicitly
+  selected finding): fixed replacement, keep-last-N, full mask,
+  HMAC-SHA-256 pseudonymization (per-run secret that is never stored,
+  CSPRNG salts echoed back for reuse), remove column, remove rows — plus
+  exporting only the non-PII columns through the ordinary export flow. A
+  local-only audit log records counts and kinds, never values; nothing
+  leaves the device.
 - **Batch recipes** (palette → "Batch process files…"): apply a saved,
   VERSIONED, declarative step sequence — parse settings, profile
   validation, filter, transform, deduplicate, select columns, sort,
