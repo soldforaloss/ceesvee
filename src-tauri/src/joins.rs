@@ -192,13 +192,21 @@ fn build_right_table(
             .map(|&c| row.get(c).cloned().unwrap_or_default())
             .collect();
         bytes += cells.iter().map(|c| c.len() as u64 + 32).sum::<u64>();
+        let key = row_key(&spec.normalization, &spec.right_keys, row);
+        if let Some(key) = &key {
+            // The hash table owns the normalized key strings plus map/vec
+            // overhead — for key-only joins (empty rightColumns, e.g. an
+            // anti-join existence check) this IS the memory, so it must
+            // count against the budget too.
+            bytes += key.iter().map(|k| k.len() as u64 + 32).sum::<u64>() + 48;
+        }
         if bytes > index::SIZE_DECISION_THRESHOLD {
             return Err(AppError::invalid(
                 "the right side is too large to hold in memory — swap the sides \
                  or reduce the included right columns",
             ));
         }
-        if let Some(key) = row_key(&spec.normalization, &spec.right_keys, row) {
+        if let Some(key) = key {
             by_key.entry(key).or_default().push(idx);
         }
         rows.push(cells);
