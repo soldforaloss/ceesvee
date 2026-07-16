@@ -55,6 +55,18 @@ let summariesTimer: ReturnType<typeof setTimeout> | null = null;
 /** Find-match cap for indexed read-only documents (F10). */
 export const INDEXED_FIND_LIMIT = 5000;
 
+/** Modal dialogs owned by the store so commands can open them (F11). */
+export type ModalName =
+  | "sort"
+  | "export"
+  | "summaries"
+  | "filter"
+  | "profiles"
+  | "transform"
+  | "dedup"
+  | "compare"
+  | "shortcuts";
+
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
   { name: "All files", extensions: ["*"] },
@@ -393,10 +405,26 @@ interface Store {
   /** Running index build / conversion / re-index job (F10). */
   indexing: IndexingState | null;
 
+  /** The one open modal dialog, if any (F11: commands open dialogs). */
+  activeModal: ModalName | null;
+  /** Whether the command palette is open (F11). */
+  paletteOpen: boolean;
+  /** Command id the palette should open in argument mode for (F11). */
+  paletteArgCommandId: string | null;
+
   // lifecycle / chrome
   init: () => void;
   setTheme: (theme: ThemePref) => void;
   setError: (error: string | null) => void;
+  setModal: (modal: ModalName | null) => void;
+  setPaletteOpen: (open: boolean) => void;
+  /** Open the palette directly in argument mode for one command (F11). */
+  openPaletteForArg: (commandId: string) => void;
+  /**
+   * Persist a shortcut override for a command (F11): a binding string
+   * rebinds, `null` unbinds, `undefined` resets to the default.
+   */
+  setShortcutOverride: (commandId: string, binding: string | null | undefined) => Promise<void>;
   setActive: (id: number) => void;
   setSelection: (rect: CellRect | null, rows: number[], cols: number[]) => void;
   setFrozenCols: (count: number) => void;
@@ -867,6 +895,9 @@ export const useStore = create<Store>((set, get) => {
     dataVersion: 0,
     busy: false,
     error: null,
+    activeModal: null,
+    paletteOpen: false,
+    paletteArgCommandId: null,
     selection: null,
     selectionRect: null,
     selectedRows: [],
@@ -911,6 +942,30 @@ export const useStore = create<Store>((set, get) => {
         .getSettings()
         .then((settings) => set({ settings }))
         .catch(() => set({ settings: { version: 1, profiles: [] } }));
+    },
+
+    setModal: (modal) => set({ activeModal: modal }),
+
+    setPaletteOpen: (open) =>
+      set(open ? { paletteOpen: true } : { paletteOpen: false, paletteArgCommandId: null }),
+
+    openPaletteForArg: (commandId) => set({ paletteOpen: true, paletteArgCommandId: commandId }),
+
+    setShortcutOverride: async (commandId, binding) => {
+      const current = get().settings ?? { version: 1, profiles: [] };
+      const overrides = { ...(current.shortcutOverrides ?? {}) };
+      if (binding === undefined) {
+        delete overrides[commandId];
+      } else {
+        overrides[commandId] = binding;
+      }
+      const next = { ...current, shortcutOverrides: overrides };
+      try {
+        await api.setSettings(next);
+        set({ settings: next });
+      } catch (e) {
+        set({ error: String(e) });
+      }
     },
 
     setTheme: (theme) => {

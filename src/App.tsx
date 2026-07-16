@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useState } from "react";
 
 import { ColumnExplorerPanel } from "./components/ColumnExplorerPanel";
+import { CommandPalette } from "./components/CommandPalette";
 import { CompareDialog } from "./components/CompareDialog";
 import { DedupDialog } from "./components/DedupDialog";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
@@ -20,6 +21,7 @@ import { ProfileSuggestionBar } from "./components/ProfileSuggestionBar";
 import { OpenModeDialog } from "./components/OpenModeDialog";
 import { QuitDialog } from "./components/QuitDialog";
 import { ReopenDialog } from "./components/ReopenDialog";
+import { ShortcutsDialog } from "./components/ShortcutsDialog";
 import { SortDialog } from "./components/SortDialog";
 import { SourceBar } from "./components/SourceBar";
 import { StatusBar } from "./components/StatusBar";
@@ -27,10 +29,15 @@ import { SummaryPanel } from "./components/SummaryPanel";
 import { Tabs } from "./components/Tabs";
 import { Toolbar } from "./components/Toolbar";
 import { TransformDialog } from "./components/TransformDialog";
+import { registry } from "./lib/commands";
+import { registerAppCommands } from "./lib/commandDefs";
 import { onJobFinished, onJobProgress } from "./lib/jobs";
+import { bindingFromEvent, effectiveBindings } from "./lib/shortcuts";
 import * as api from "./lib/tauri";
 import { checkForUpdates } from "./lib/updater";
 import { useActiveMeta, useStore } from "./store/useStore";
+
+registerAppCommands();
 
 export default function App() {
   const meta = useActiveMeta();
@@ -39,14 +46,8 @@ export default function App() {
   const error = useStore((s) => s.error);
   const setError = useStore((s) => s.setError);
 
-  const [sortOpen, setSortOpen] = useState(false);
-  const [exportOpen, setExportOpen] = useState(false);
-  const [summariesOpen, setSummariesOpen] = useState(false);
-  const [filterOpen, setFilterOpen] = useState(false);
-  const [profilesOpen, setProfilesOpen] = useState(false);
-  const [transformOpen, setTransformOpen] = useState(false);
-  const [dedupOpen, setDedupOpen] = useState(false);
-  const [compareOpen, setCompareOpen] = useState(false);
+  const activeModal = useStore((s) => s.activeModal);
+  const setModal = useStore((s) => s.setModal);
   const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const [dragOver, setDragOver] = useState(false);
@@ -172,46 +173,28 @@ export default function App() {
     return () => clearTimeout(handle);
   }, [error, setError]);
 
-  // Global keyboard shortcuts.
+  // Global keyboard shortcuts, resolved through the command registry (F11).
+  // Bindings are recomputed per keypress from live settings, so shortcut
+  // edits take effect immediately without a restart.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey || e.metaKey)) return;
-      const target = e.target as HTMLElement | null;
-      const editable =
-        !!target &&
-        (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
-      const s = useStore.getState();
-
-      switch (e.key.toLowerCase()) {
-        case "o":
-          e.preventDefault();
-          void s.openDialog();
-          break;
-        case "n":
-          e.preventDefault();
-          void s.newDoc();
-          break;
-        case "s":
-          e.preventDefault();
-          void s.saveActive(e.shiftKey);
-          break;
-        case "f":
-          e.preventDefault();
-          s.setFindOpen(true);
-          break;
-        case "z":
-          if (editable) return;
-          e.preventDefault();
-          if (e.shiftKey) void s.redo();
-          else void s.undo();
-          break;
-        case "y":
-          if (editable) return;
-          e.preventDefault();
-          void s.redo();
-          break;
-        default:
-          break;
+      const binding = bindingFromEvent(e);
+      if (!binding) return;
+      const overrides = useStore.getState().settings?.shortcutOverrides;
+      const bindings = effectiveBindings(registry.defaultBindings(), overrides);
+      for (const [commandId, bound] of bindings) {
+        if (bound !== binding) continue;
+        const command = registry.byId(commandId);
+        if (!command) continue;
+        const target = e.target as HTMLElement | null;
+        const editable =
+          !!target &&
+          (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+        if (editable && !command.allowInEditable) return;
+        if (command.unavailableReason?.()) return; // bound but not runnable now
+        e.preventDefault();
+        command.run();
+        return;
       }
     };
     window.addEventListener("keydown", onKey);
@@ -220,16 +203,7 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col bg-white text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
-      <Toolbar
-        onSort={() => setSortOpen(true)}
-        onExport={() => setExportOpen(true)}
-        onSummaries={() => setSummariesOpen(true)}
-        onFilter={() => setFilterOpen(true)}
-        onProfiles={() => setProfilesOpen(true)}
-        onTransform={() => setTransformOpen(true)}
-        onDedup={() => setDedupOpen(true)}
-        onCompare={() => setCompareOpen(true)}
-      />
+      <Toolbar />
       <Tabs />
       <SourceBar />
       <ProfileSuggestionBar />
@@ -252,23 +226,24 @@ export default function App() {
 
       <StatusBar />
 
-      {sortOpen && <SortDialog onClose={() => setSortOpen(false)} />}
-      {exportOpen && <ExportDialog onClose={() => setExportOpen(false)} />}
-      {summariesOpen && <SummaryPanel onClose={() => setSummariesOpen(false)} />}
-      {filterOpen && <FilterDialog onClose={() => setFilterOpen(false)} />}
-      {profilesOpen && <ProfilesDialog onClose={() => setProfilesOpen(false)} />}
-      {transformOpen && <TransformDialog onClose={() => setTransformOpen(false)} />}
-      {dedupOpen && (
+      {activeModal === "sort" && <SortDialog onClose={() => setModal(null)} />}
+      {activeModal === "export" && <ExportDialog onClose={() => setModal(null)} />}
+      {activeModal === "summaries" && <SummaryPanel onClose={() => setModal(null)} />}
+      {activeModal === "filter" && <FilterDialog onClose={() => setModal(null)} />}
+      {activeModal === "profiles" && <ProfilesDialog onClose={() => setModal(null)} />}
+      {activeModal === "transform" && <TransformDialog onClose={() => setModal(null)} />}
+      {activeModal === "dedup" && (
         <DedupDialog
-          onClose={() => setDedupOpen(false)}
+          onClose={() => setModal(null)}
           onExportDuplicates={() => {
             // The duplicate filter has been applied; export the visible rows.
-            setDedupOpen(false);
-            setExportOpen(true);
+            setModal("export");
           }}
         />
       )}
-      {compareOpen && <CompareDialog onClose={() => setCompareOpen(false)} />}
+      {activeModal === "compare" && <CompareDialog onClose={() => setModal(null)} />}
+      {activeModal === "shortcuts" && <ShortcutsDialog onClose={() => setModal(null)} />}
+      <CommandPalette />
       <ReopenDialog />
       <ExternalChangeDialog />
       <OpenModeDialog />

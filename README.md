@@ -59,6 +59,9 @@ and faithful on large, real-world delimited files.**
 
 **Navigate & analyze**
 
+- **Command palette** (`Ctrl/Cmd+K`) — fuzzy-search and run every action from
+  the keyboard: commands, go to row/cell, recent files, tab switching. Every
+  shortcut is customizable via the built-in shortcut editor.
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 

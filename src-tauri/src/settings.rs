@@ -106,6 +106,12 @@ pub struct AppSettings {
     pub version: u32,
     #[serde(default)]
     pub profiles: Vec<FileProfile>,
+    /// F11: user shortcut overrides, keyed by stable command id. A `null`
+    /// value unbinds the command; a missing key keeps its default shortcut.
+    /// Bindings use the normalized `mod+shift+k` syntax owned by the front
+    /// end — the backend only persists them.
+    #[serde(default)]
+    pub shortcut_overrides: std::collections::HashMap<String, Option<String>>,
 }
 
 impl Default for AppSettings {
@@ -113,6 +119,7 @@ impl Default for AppSettings {
         AppSettings {
             version: SETTINGS_VERSION,
             profiles: Vec::new(),
+            shortcut_overrides: std::collections::HashMap::new(),
         }
     }
 }
@@ -444,6 +451,33 @@ mod tests {
         assert!(kind("regexMismatch").is_some(), "bad-email");
         // 2000 exceeds max AND "oops" is non-numeric: both out of range.
         assert_eq!(kind("outOfRange").unwrap().affected_count, 2);
+    }
+
+    #[test]
+    fn shortcut_overrides_round_trip_and_default_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        // A pre-F11 settings file (no shortcutOverrides key) still loads.
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            br#"{"version":1,"profiles":[]}"#,
+        )
+        .unwrap();
+        let loaded = load_settings(dir.path());
+        assert!(loaded.shortcut_overrides.is_empty());
+
+        // Overrides persist, including explicit unbinds (null).
+        let mut settings = AppSettings::default();
+        settings
+            .shortcut_overrides
+            .insert("file.save".into(), Some("mod+shift+s".into()));
+        settings.shortcut_overrides.insert("edit.redo".into(), None);
+        save_settings(dir.path(), &settings).unwrap();
+        let loaded = load_settings(dir.path());
+        assert_eq!(
+            loaded.shortcut_overrides.get("file.save"),
+            Some(&Some("mod+shift+s".to_string()))
+        );
+        assert_eq!(loaded.shortcut_overrides.get("edit.redo"), Some(&None));
     }
 
     #[test]
