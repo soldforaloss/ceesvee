@@ -18,6 +18,7 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
     lineEnding: meta?.lineEnding ?? "lf",
     bom: meta?.hadBom ?? false,
     includeHeaders: meta?.hasHeaderRow ?? true,
+    backup: "none",
   }));
 
   if (!meta) return null;
@@ -136,6 +137,16 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
             Include header row
           </label>
         )}
+
+        <label className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={opts.backup === "single"}
+            onChange={(e) => patch({ backup: e.target.checked ? "single" : "none" })}
+            className="accent-violet-600"
+          />
+          Keep a .bak copy of the previous file
+        </label>
       </div>
     </Modal>
   );

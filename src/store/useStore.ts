@@ -5,11 +5,13 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as api from "../lib/tauri";
 import { applyReplace } from "../lib/replace";
 import { currentOpenOptions, fingerprintKey } from "../lib/reopen";
+import { isLegacyEncoding } from "../lib/save";
 import type {
   CellRect,
   ColumnSummary,
   DiagnosticsReport,
   DocumentMeta,
+  EncodingCompatibility,
   ExportOptions,
   ExternalChange,
   FilterGroup,
@@ -131,6 +133,33 @@ export interface ExternalPrompt {
   change: ExternalChange;
 }
 
+/** A running save/export job, for the status-bar progress line. */
+export interface FileJobState {
+  jobId: number;
+  docId: number;
+  kind: "save" | "export";
+  processed: number;
+  total: number | null;
+  bytesWritten: number | null;
+  part: number | null;
+}
+
+/** A blocked lossy save awaiting the user's encoding decision. */
+export interface EncodingIssuesPrompt {
+  docId: number;
+  path: string;
+  options: ExportOptions;
+  compat: EncodingCompatibility;
+}
+
+// Resolvers for in-flight save/export jobs, keyed by job id. Module-level:
+// promise callbacks don't belong in reactive state.
+const jobWaiters = new Map<number, (finished: JobFinished) => void>();
+
+function awaitJob(jobId: number): Promise<JobFinished> {
+  return new Promise((resolve) => jobWaiters.set(jobId, resolve));
+}
+
 const initialFilter: FilterState = {
   open: false,
   spec: {
@@ -178,6 +207,10 @@ interface Store {
   ignoredFingerprints: Record<number, string>;
   /** Whether the quit confirmation (dirty tabs) is showing. */
   quitPromptOpen: boolean;
+  /** Running save/export jobs, keyed by job id (status-bar progress). */
+  fileJobs: Record<number, FileJobState>;
+  /** A lossy save blocked by the encoding-compatibility scan, if any. */
+  encodingIssues: EncodingIssuesPrompt | null;
 
   // lifecycle / chrome
   init: () => void;
@@ -210,6 +243,11 @@ interface Store {
   // quit flow (F02)
   setQuitPromptOpen: (open: boolean) => void;
   confirmQuit: (mode: "save" | "discard") => Promise<void>;
+
+  // save / export pipeline (F03)
+  /** Resolve a blocked lossy save: retry with another encoding, or cancel. */
+  resolveEncodingIssues: (retryEncoding: string | null) => Promise<void>;
+  cancelFileJob: (jobId: number) => Promise<void>;
 
   // editing
   setCell: (row: number, col: number, value: string) => Promise<void>;
@@ -324,9 +362,36 @@ export const useStore = create<Store>((set, get) => {
   };
 
   /**
+   * Run one atomic streaming save job to completion. Returns whether the file
+   * was written (progress streams over the job events into `fileJobs`).
+   */
+  const runSaveJob = async (id: number, path: string, options: ExportOptions): Promise<boolean> => {
+    const meta = get().tabs.find((t) => t.id === id);
+    if (!meta) return false;
+    try {
+      const jobId = await api.startSave(id, path, options, meta.revision);
+      const finished = await awaitJob(jobId);
+      if (finished.status === "done") {
+        const updated = await api.getMeta(id);
+        refreshMeta(updated);
+        if (updated.path) pushRecent(updated.path);
+        return true;
+      }
+      if (finished.status === "failed") {
+        set({ error: finished.error ?? "save failed" });
+      }
+      return false; // failed or cancelled
+    } catch (e) {
+      set({ error: String(e) });
+      return false;
+    }
+  };
+
+  /**
    * Save one document (any tab, not just the active one). Returns whether the
    * file was actually written — false when the user cancels the Save As
-   * dialog or the write fails, so callers (reopen, quit) can abort safely.
+   * dialog, the encoding scan blocks the write, or the write fails, so
+   * callers (reopen, quit) can abort safely.
    */
   const saveDocById = async (
     id: number,
@@ -351,17 +416,26 @@ export const useStore = create<Store>((set, get) => {
       lineEnding: meta.lineEnding,
       bom: meta.hadBom,
       includeHeaders: true,
+      backup: "none",
       ...exportOptions,
     };
-    try {
-      const updated = await api.save(id, path, options);
-      refreshMeta(updated);
-      if (updated.path) pushRecent(updated.path);
-      return true;
-    } catch (e) {
-      set({ error: String(e) });
-      return false;
+
+    // Block lossy legacy-encoding writes up front (F03): the user decides
+    // between UTF-8, another encoding, or cancelling — never silent loss.
+    if (isLegacyEncoding(options.encoding)) {
+      try {
+        const compat = await api.checkEncodingCompatibility(id, options.encoding);
+        if (!compat.compatible) {
+          set({ encodingIssues: { docId: id, path, options, compat } });
+          return false;
+        }
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
     }
+
+    return runSaveJob(id, path, options);
   };
 
   return {
@@ -388,6 +462,8 @@ export const useStore = create<Store>((set, get) => {
     externalPrompt: null,
     ignoredFingerprints: {},
     quitPromptOpen: false,
+    fileJobs: {},
+    encodingIssues: null,
 
     init: () => {
       const theme = loadTheme();
@@ -752,8 +828,28 @@ export const useStore = create<Store>((set, get) => {
     // ----- background-job events -------------------------------------------
 
     handleJobProgress: (progress) => {
-      if (progress.kind !== "diagnostics" || progress.docId == null) return;
+      if (progress.docId == null) return;
       const docId = progress.docId;
+
+      if (progress.kind === "save" || progress.kind === "export") {
+        set((s) => ({
+          fileJobs: {
+            ...s.fileJobs,
+            [progress.jobId]: {
+              jobId: progress.jobId,
+              docId,
+              kind: progress.kind as "save" | "export",
+              processed: progress.processed,
+              total: progress.total,
+              bytesWritten: progress.bytesWritten,
+              part: progress.part,
+            },
+          },
+        }));
+        return;
+      }
+
+      if (progress.kind !== "diagnostics") return;
       // Only track the scan we started (guards against reused ids after e.g.
       // an app-side restart of the job system).
       if (get().diagnostics[docId]?.jobId !== progress.jobId) return;
@@ -761,6 +857,21 @@ export const useStore = create<Store>((set, get) => {
     },
 
     handleJobFinished: async (finished) => {
+      // Resolve any promise waiting on this job (save/export flows).
+      const waiter = jobWaiters.get(finished.jobId);
+      if (waiter) {
+        jobWaiters.delete(finished.jobId);
+        waiter(finished);
+      }
+      if (finished.kind === "save" || finished.kind === "export") {
+        set((s) => {
+          const fileJobs = { ...s.fileJobs };
+          delete fileJobs[finished.jobId];
+          return { fileJobs };
+        });
+        return;
+      }
+
       if (finished.kind !== "diagnostics" || finished.docId == null) return;
       const docId = finished.docId;
       if (get().diagnostics[docId]?.jobId !== finished.jobId) return;
@@ -949,6 +1060,33 @@ export const useStore = create<Store>((set, get) => {
       }
       set({ quitPromptOpen: false });
       await getCurrentWindow().destroy();
+    },
+
+    // ----- save / export pipeline (F03) ---------------------------------------
+
+    resolveEncodingIssues: async (retryEncoding) => {
+      const prompt = get().encodingIssues;
+      set({ encodingIssues: null });
+      if (!prompt || retryEncoding === null) return;
+      const options: ExportOptions = { ...prompt.options, encoding: retryEncoding };
+      // Re-run the gate for the new encoding (a no-op for Unicode targets).
+      if (isLegacyEncoding(retryEncoding)) {
+        try {
+          const compat = await api.checkEncodingCompatibility(prompt.docId, retryEncoding);
+          if (!compat.compatible) {
+            set({ encodingIssues: { ...prompt, options, compat } });
+            return;
+          }
+        } catch (e) {
+          set({ error: String(e) });
+          return;
+        }
+      }
+      await runSaveJob(prompt.docId, prompt.path, options);
+    },
+
+    cancelFileJob: async (jobId) => {
+      await api.cancelJob(jobId).catch(() => undefined);
     },
   };
 });

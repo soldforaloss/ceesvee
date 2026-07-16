@@ -1,15 +1,34 @@
-//! Serialize a [`Document`] back to delimited bytes with explicit control over
+//! Serialize a [`Document`] to delimited output with explicit control over
 //! delimiter, quoting, line endings, target encoding and BOM.
+//!
+//! Serialization STREAMS (F03): rows pass through the CSV writer into a small
+//! buffer that is transcoded and drained to the sink at record boundaries, so
+//! saving a 100 MB document never materialises a second 100 MB buffer.
+//! Characters the target encoding cannot represent fail the export instead of
+//! being silently substituted.
+
+use std::io::Write;
 
 use csv::{QuoteStyle, Terminator, WriterBuilder};
+use encoding_rs::{Encoding, UTF_8};
 
 use crate::document::{Document, LineEnding};
 use crate::dto::ExportOptions;
 use crate::error::{AppError, AppResult};
+use crate::job::JobCtx;
 use crate::{encoding, util};
 
-/// Serialize `doc` using `opts`, returning the exact bytes to write to disk.
-pub fn serialize(doc: &Document, opts: &ExportOptions) -> AppResult<Vec<u8>> {
+/// Drain the staging buffer to the sink once it grows past this.
+const FLUSH_THRESHOLD: usize = 64 * 1024;
+
+/// Stream `doc` into `out` using `opts`. Returns the total bytes written.
+/// Progress (rows + bytes) and cancellation flow through `ctx` when given.
+pub fn write_document<W: Write>(
+    doc: &Document,
+    opts: &ExportOptions,
+    out: &mut W,
+    ctx: Option<&JobCtx>,
+) -> AppResult<u64> {
     let delimiter = util::delimiter_to_byte(&opts.delimiter);
     let quote_style = match opts.quote_style.as_str() {
         "always" => QuoteStyle::Always,
@@ -21,34 +40,115 @@ pub fn serialize(doc: &Document, opts: &ExportOptions) -> AppResult<Vec<u8>> {
         LineEnding::Crlf => Terminator::CRLF,
         LineEnding::Lf => Terminator::Any(b'\n'),
     };
+    let target = encoding::from_name(&opts.encoding);
 
-    let mut writer = WriterBuilder::new()
-        .delimiter(delimiter)
-        .quote_style(quote_style)
-        .terminator(terminator)
-        .from_writer(Vec::<u8>::new());
+    let make_writer = |buf: Vec<u8>| {
+        WriterBuilder::new()
+            .delimiter(delimiter)
+            .quote_style(quote_style)
+            .terminator(terminator)
+            .from_writer(buf)
+    };
+    let drain = |writer: csv::Writer<Vec<u8>>| -> AppResult<Vec<u8>> {
+        writer
+            .into_inner()
+            .map_err(|e| AppError::Other(e.to_string()))
+    };
 
+    let mut total: u64 = 0;
+
+    if opts.bom {
+        let bom = encoding::bom_for(target);
+        out.write_all(bom)?;
+        total += bom.len() as u64;
+        if let Some(ctx) = ctx {
+            ctx.add_bytes(bom.len() as u64);
+        }
+    }
+
+    let mut writer = make_writer(Vec::with_capacity(FLUSH_THRESHOLD + 8 * 1024));
     if doc.has_header_row() && opts.include_headers {
         writer.write_record(doc.headers())?;
     }
+
+    // Rough size of what's been fed to the writer since the last drain; used
+    // to decide when to rotate (the csv writer hides its inner buffer).
+    let mut estimated = 0usize;
+    let mut pending_rows = 0u64;
+
     for row in doc.rows() {
         writer.write_record(row)?;
+        pending_rows += 1;
+        estimated += row.iter().map(String::len).sum::<usize>() + row.len() + 2;
+
+        if estimated >= FLUSH_THRESHOLD {
+            writer.flush()?;
+            let mut buf = drain(writer)?;
+            total += transcode_chunk(&mut buf, target, out, ctx)?;
+            writer = make_writer(buf); // reuse the (now cleared) allocation
+            estimated = 0;
+            if let Some(ctx) = ctx {
+                ctx.advance(pending_rows)?;
+            }
+            pending_rows = 0;
+        }
     }
+
     writer.flush()?;
-
-    let utf8 = writer
-        .into_inner()
-        .map_err(|e| AppError::Other(e.to_string()))?;
-    // The CSV writer only emits ASCII structure plus the (UTF-8) field bytes, so
-    // the buffer is always valid UTF-8.
-    let text = String::from_utf8(utf8).map_err(|e| AppError::Other(e.to_string()))?;
-
-    let target = encoding::from_name(&opts.encoding);
-    let mut out = Vec::with_capacity(text.len() + 3);
-    if opts.bom {
-        out.extend_from_slice(encoding::bom_for(target));
+    let mut buf = drain(writer)?;
+    total += transcode_chunk(&mut buf, target, out, ctx)?;
+    if let Some(ctx) = ctx {
+        ctx.advance(pending_rows)?;
+        ctx.flush_progress();
     }
-    out.extend_from_slice(&encoding::encode(&text, target));
+
+    Ok(total)
+}
+
+/// Transcode one UTF-8 chunk to the target encoding and write it out,
+/// clearing the buffer. Record-aligned chunks keep multi-byte characters
+/// intact. Fails on unmappable characters instead of substituting.
+fn transcode_chunk<W: Write>(
+    buf: &mut Vec<u8>,
+    target: &'static Encoding,
+    out: &mut W,
+    ctx: Option<&JobCtx>,
+) -> AppResult<u64> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let written: u64 = if target == UTF_8 {
+        out.write_all(buf)?;
+        buf.len() as u64
+    } else {
+        // The CSV writer only emits ASCII structure plus the (UTF-8) field
+        // bytes, so the chunk is always valid UTF-8.
+        let text = std::str::from_utf8(buf).map_err(|e| AppError::Other(e.to_string()))?;
+        let (encoded, lossy) = encoding::encode_checked(text, target);
+        if lossy {
+            return Err(AppError::invalid(format!(
+                "some characters cannot be represented in {} — export with UTF-8 instead, \
+                 or fix the affected cells",
+                target.name()
+            )));
+        }
+        out.write_all(&encoded)?;
+        encoded.len() as u64
+    };
+    if let Some(ctx) = ctx {
+        ctx.add_bytes(written);
+    }
+    buf.clear();
+    Ok(written)
+}
+
+/// Serialize `doc` into one in-memory buffer. Test helper: production writes
+/// stream through [`write_document`] into a file sink instead of building the
+/// whole output in memory.
+#[cfg(test)]
+pub fn serialize(doc: &Document, opts: &ExportOptions) -> AppResult<Vec<u8>> {
+    let mut out = Vec::new();
+    write_document(doc, opts, &mut out, None)?;
     Ok(out)
 }
 
@@ -65,6 +165,7 @@ mod tests {
             line_ending: "lf".into(),
             bom: false,
             include_headers: true,
+            backup: Default::default(),
         }
     }
 
@@ -122,5 +223,63 @@ mod tests {
         let bytes = serialize(&d, &opts).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(text, "1;2\n3;4\n");
+    }
+
+    #[test]
+    fn windows_1252_round_trips_when_representable() {
+        let d = doc("name\ncafé", true);
+        let mut opts = export_options();
+        opts.encoding = "windows-1252".into();
+        let bytes = serialize(&d, &opts).unwrap();
+        let settings = ParseSettings {
+            delimiter: Some(b','),
+            encoding: Some(encoding_rs::WINDOWS_1252),
+        };
+        let reparsed = parse(&bytes, &settings).unwrap();
+        assert_eq!(reparsed.records[1], vec!["café"]);
+    }
+
+    #[test]
+    fn unmappable_characters_fail_instead_of_substituting() {
+        let d = doc("name\na → b", true);
+        let mut opts = export_options();
+        opts.encoding = "windows-1252".into();
+        let err = serialize(&d, &opts).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be represented"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn streaming_crosses_chunk_boundaries_losslessly() {
+        // Enough multi-byte content to force several 64 KiB chunk rotations;
+        // record-aligned draining must never split a UTF-8 sequence.
+        let mut src = String::from("col\n");
+        for i in 0..20_000 {
+            src.push_str(&format!("värde-⚡-{i}\n"));
+        }
+        let d = doc(&src, true);
+        let bytes = serialize(&d, &export_options()).unwrap();
+        let reparsed = parse(&bytes, &ParseSettings::default()).unwrap();
+        assert_eq!(reparsed.records.len(), 20_001);
+        assert_eq!(reparsed.records[1][0], "värde-⚡-0");
+        assert_eq!(reparsed.records[20_000][0], "värde-⚡-19999");
+    }
+
+    #[test]
+    fn utf16_output_streams_correctly() {
+        let d = doc("a,b\nx,ü", true);
+        let mut opts = export_options();
+        opts.encoding = "UTF-16LE".into();
+        opts.bom = true;
+        let bytes = serialize(&d, &opts).unwrap();
+        assert_eq!(&bytes[0..2], &[0xFF, 0xFE]);
+        let settings = ParseSettings {
+            delimiter: Some(b','),
+            encoding: Some(encoding_rs::UTF_16LE),
+        };
+        let reparsed = parse(&bytes, &settings).unwrap();
+        assert_eq!(reparsed.records[1], vec!["x", "ü"]);
     }
 }

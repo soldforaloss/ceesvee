@@ -275,6 +275,17 @@ pub struct ExternalChange {
     pub stored: Option<FileFingerprint>,
 }
 
+/// What to do with the previous destination file when saving over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupPolicy {
+    /// Atomically replace the destination; keep nothing else.
+    #[default]
+    None,
+    /// Keep one `.bak` copy of the prior destination.
+    Single,
+}
+
 /// Options controlling how a document is serialized on save.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -292,8 +303,34 @@ pub struct ExportOptions {
     /// Whether to write the header row (only meaningful when one exists).
     #[serde(default = "default_true")]
     pub include_headers: bool,
+    /// Backup policy for the previous destination file.
+    #[serde(default)]
+    pub backup: BackupPolicy,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// One cell (or header) whose text cannot be represented in a target encoding.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncodingIncompatibility {
+    /// Data-row index; `None` for a header cell.
+    pub row: Option<usize>,
+    pub col: usize,
+    /// Truncated cell text for display.
+    pub value: String,
+}
+
+/// Result of scanning the document for characters a target encoding cannot
+/// represent (nothing is ever substituted silently).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncodingCompatibility {
+    pub encoding: String,
+    pub compatible: bool,
+    pub affected_cells: usize,
+    /// First affected locations (capped).
+    pub samples: Vec<EncodingIncompatibility>,
 }

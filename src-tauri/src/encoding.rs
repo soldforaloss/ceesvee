@@ -37,28 +37,41 @@ pub fn decode(bytes: &[u8], encoding: &'static Encoding) -> (String, bool) {
     (cow.into_owned(), had_errors)
 }
 
-/// Encode a UTF-8 string into the target encoding's bytes.
+/// Encode a UTF-8 string into the target encoding's bytes, also reporting
+/// whether any character was unmappable (in which case `encoding_rs`
+/// substituted an HTML numeric reference). Callers that must not lose data
+/// check the flag and fail instead of writing the substituted bytes.
 ///
 /// `encoding_rs` does not implement a UTF-16 *encoder* (the WHATWG standard
 /// only defines UTF-16 decoders), so we serialize UTF-16 by hand from the
 /// string's UTF-16 code units.
-pub fn encode(text: &str, encoding: &'static Encoding) -> Vec<u8> {
+pub fn encode_checked(text: &str, encoding: &'static Encoding) -> (Vec<u8>, bool) {
     if encoding == UTF_16LE {
         let mut out = Vec::with_capacity(text.len() * 2);
         for unit in text.encode_utf16() {
             out.extend_from_slice(&unit.to_le_bytes());
         }
-        out
+        (out, false)
     } else if encoding == UTF_16BE {
         let mut out = Vec::with_capacity(text.len() * 2);
         for unit in text.encode_utf16() {
             out.extend_from_slice(&unit.to_be_bytes());
         }
-        out
+        (out, false)
     } else {
-        let (cow, _used, _had_unmappable) = encoding.encode(text);
-        cow.into_owned()
+        let (cow, _used, had_unmappable) = encoding.encode(text);
+        (cow.into_owned(), had_unmappable)
     }
+}
+
+/// Whether `text` contains characters the target encoding cannot represent.
+/// Unicode encodings can represent everything; only legacy single-byte
+/// encodings (Windows-1252 here) can lose characters.
+pub fn has_unmappable(text: &str, encoding: &'static Encoding) -> bool {
+    if encoding == UTF_8 || encoding == UTF_16LE || encoding == UTF_16BE {
+        return false;
+    }
+    encoding.encode(text).2
 }
 
 /// The byte-order mark for an encoding, or an empty slice if it has none.
@@ -106,7 +119,7 @@ mod tests {
     #[test]
     fn round_trips_utf16le() {
         let original = "café — ☕";
-        let bytes = encode(original, UTF_16LE);
+        let bytes = encode_checked(original, UTF_16LE).0;
         let (decoded, errors) = decode(&bytes, UTF_16LE);
         assert_eq!(decoded, original);
         assert!(!errors);
@@ -115,7 +128,7 @@ mod tests {
     #[test]
     fn windows_1252_round_trip() {
         let original = "naïve café";
-        let bytes = encode(original, WINDOWS_1252);
+        let bytes = encode_checked(original, WINDOWS_1252).0;
         let (decoded, _) = decode(&bytes, WINDOWS_1252);
         assert_eq!(decoded, original);
     }
@@ -132,5 +145,20 @@ mod tests {
     fn latin1_label_maps_to_windows_1252() {
         assert_eq!(from_name("latin1"), WINDOWS_1252);
         assert_eq!(from_name("iso-8859-1"), WINDOWS_1252);
+    }
+
+    #[test]
+    fn unmappable_detection_is_encoding_aware() {
+        // "→" has no Windows-1252 representation; "café €" does (€ is 0x80).
+        assert!(has_unmappable("a → b", WINDOWS_1252));
+        assert!(!has_unmappable("café €", WINDOWS_1252));
+        // Unicode encodings can represent everything.
+        assert!(!has_unmappable("a → b", UTF_8));
+        assert!(!has_unmappable("a → b", UTF_16LE));
+
+        let (_, lossy) = encode_checked("a → b", WINDOWS_1252);
+        assert!(lossy);
+        let (_, clean) = encode_checked("plain", WINDOWS_1252);
+        assert!(!clean);
     }
 }

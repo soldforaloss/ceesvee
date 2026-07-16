@@ -1,5 +1,6 @@
 import { formatNumber } from "../lib/format";
 import { delimiterLabel, encodingLabel } from "../lib/labels";
+import { formatBytes } from "../lib/save";
 import { useActiveMeta, useStore } from "../store/useStore";
 
 export function StatusBar() {
@@ -7,6 +8,16 @@ export function StatusBar() {
   const selection = useStore((s) => s.selection);
   const busy = useStore((s) => s.busy);
   const clearFilter = useStore((s) => s.clearFilter);
+  const fileJobs = useStore((s) => s.fileJobs);
+  const tabs = useStore((s) => s.tabs);
+  const cancelFileJob = useStore((s) => s.cancelFileJob);
+
+  const fileJob = Object.values(fileJobs)[0] ?? null;
+  const fileJobDoc = fileJob ? tabs.find((t) => t.id === fileJob.docId) : null;
+  const fileJobPct =
+    fileJob && fileJob.total
+      ? Math.min(100, Math.round((fileJob.processed / fileJob.total) * 100))
+      : null;
 
   return (
     <div className="flex h-7 shrink-0 items-center gap-3 border-t border-zinc-200 bg-zinc-50 px-3 text-xs text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
@@ -80,7 +91,23 @@ export function StatusBar() {
         </span>
       )}
 
-      {busy && <span className="text-violet-600 dark:text-violet-400">working…</span>}
+      {fileJob && (
+        <span className="flex items-center gap-1.5 tabular-nums text-violet-600 dark:text-violet-400">
+          {fileJob.kind === "save" ? "Saving" : "Exporting"}
+          {fileJobDoc ? ` ${fileJobDoc.fileName}` : ""}…{fileJobPct !== null && ` ${fileJobPct}%`}
+          {fileJob.bytesWritten !== null && ` · ${formatBytes(fileJob.bytesWritten)}`}
+          {fileJob.part !== null && ` · part ${fileJob.part}`}
+          <button
+            onClick={() => void cancelFileJob(fileJob.jobId)}
+            title="Cancel"
+            className="rounded px-1 text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-500/10"
+          >
+            ✕
+          </button>
+        </span>
+      )}
+
+      {busy && !fileJob && <span className="text-violet-600 dark:text-violet-400">working…</span>}
     </div>
   );
 }
