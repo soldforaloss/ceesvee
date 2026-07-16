@@ -42,6 +42,8 @@ export function SemanticDialog({ onClose }: { onClose: () => void }) {
     semantic: SemanticType;
     action: SemanticAction;
     data: SemanticActionPreview;
+    /** Revision the preview was computed against; the apply echoes THIS. */
+    revision: number;
   } | null>(null);
   const [working, setWorking] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
@@ -73,8 +75,9 @@ export function SemanticDialog({ onClose }: { onClose: () => void }) {
   const runPreview = async (column: number, sem: SemanticType, action: SemanticAction) => {
     setPreviewError(null);
     try {
-      const data = await api.previewSemanticAction(meta.id, column, sem, action, meta.revision);
-      setPreview({ column, semantic: sem, action, data });
+      const revision = meta.revision;
+      const data = await api.previewSemanticAction(meta.id, column, sem, action, revision);
+      setPreview({ column, semantic: sem, action, data, revision });
     } catch (e) {
       setPreviewError(String(e));
     }
@@ -83,7 +86,15 @@ export function SemanticDialog({ onClose }: { onClose: () => void }) {
   const confirmPreview = async () => {
     if (!preview) return;
     setWorking(true);
-    const ok = await applyAction(preview.column, preview.semantic, preview.action, meta.revision);
+    // Echo the revision the PREVIEW saw — if the document changed while the
+    // dialog stayed open (e.g. a global Undo), the backend rejects the apply
+    // instead of recomputing it against unpreviewed data.
+    const ok = await applyAction(
+      preview.column,
+      preview.semantic,
+      preview.action,
+      preview.revision,
+    );
     setWorking(false);
     if (ok) setPreview(null);
   };
