@@ -13,6 +13,7 @@ import type {
   BatchOptions,
   BatchReport,
   CellRect,
+  ChangeSummary,
   ClusterReport,
   ClusterSpec,
   ColumnProfile,
@@ -256,6 +257,30 @@ export const startAppend = (inputs: AppendInput[], options: AppendOptions) =>
 /** The per-input outcome report of a finished append (F20). */
 export const getAppendReport = (docId: number) =>
   invoke<AppendReport | null>("get_append_report", { docId });
+
+/** Every unsaved operation, oldest first, with cell samples (F15). */
+export const getChanges = (docId: number) =>
+  invoke<{ savedInRedo: boolean; changes: ChangeSummary[] }>("get_changes", { docId });
+
+/** Revert one whole operation (a NEW, undoable operation) (F15). */
+export const revertChange = (docId: number, opId: number, expectedRevision: number) =>
+  invoke<DocumentMeta>("revert_change", { docId, opId, expectedRevision });
+
+/** Revert specific cells of one cell-edit operation (F15). */
+export const revertChangeCells = (
+  docId: number,
+  opId: number,
+  cells: [number, number][],
+  expectedRevision: number,
+) => invoke<DocumentMeta>("revert_change_cells", { docId, opId, cells, expectedRevision });
+
+/** Revert every unsaved edit in one column (F15). */
+export const revertColumnChanges = (docId: number, col: number, expectedRevision: number) =>
+  invoke<DocumentMeta>("revert_column_changes", { docId, col, expectedRevision });
+
+/** Revert everything since the last save as one undoable operation (F15). */
+export const revertAllChanges = (docId: number, expectedRevision: number) =>
+  invoke<DocumentMeta>("revert_all_changes", { docId, expectedRevision });
 
 /** The last completed PII report + the spec that produced it (F28). */
 export const getPiiReport = (docId: number) =>

@@ -8,6 +8,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Change inspector with selective revert** (palette → "Changes since
+  save"): a side panel listing every unsaved operation — kind, time,
+  affected cells with before/after values — exactly mirroring the dirty
+  state (saving clears it). Revert one cell, a whole operation, all edits
+  in a column, or everything since the last save; every revert is a NEW
+  operation on the ordinary undo stack, so reverting is itself undoable.
+  Structural operations can only be reverted whole, and earlier selective
+  reverts are blocked (with the reason) once a later structural change
+  depends on them — Revert all stays available and is one undo step.
+  Before/after values copy to the clipboard, samples jump to their cell,
+  and the whole list exports as a JSON change report.
 - **PII detection and redaction** (palette → "Find personal data…"):
   deterministic detectors — emails, phone numbers, IP addresses, US SSN
   patterns, Luhn-validated payment-card candidates, and custom regexes —

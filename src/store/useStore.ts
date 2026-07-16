@@ -534,6 +534,9 @@ interface Store {
   summariesDocId: number | null;
   /** Whether the diagnostics side panel is shown. */
   diagnosticsOpen: boolean;
+  /** Whether the Changes panel is open (F15). */
+  changesOpen: boolean;
+  setChangesOpen: (open: boolean) => void;
   /** Diagnostics reports and scan state, keyed by document id. */
   diagnostics: Record<number, DiagnosticsDocState>;
   /** One-shot cell-jump request consumed by the grid. */
@@ -1196,6 +1199,7 @@ export const useStore = create<Store>((set, get) => {
     summaries: null,
     summariesDocId: null,
     diagnosticsOpen: false,
+    changesOpen: false,
     diagnostics: {},
     jumpTarget: null,
     reopen: initialReopen,
@@ -2061,6 +2065,14 @@ export const useStore = create<Store>((set, get) => {
       set((s) => ({
         diagnosticsOpen: open,
         // The side area shows one panel at a time.
+        changesOpen: open ? false : s.changesOpen,
+        explorer: open ? { ...s.explorer, open: false } : s.explorer,
+      })),
+
+    setChangesOpen: (open) =>
+      set((s) => ({
+        changesOpen: open,
+        diagnosticsOpen: open ? false : s.diagnosticsOpen,
         explorer: open ? { ...s.explorer, open: false } : s.explorer,
       })),
 

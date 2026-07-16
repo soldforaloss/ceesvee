@@ -323,6 +323,27 @@ export interface AppendReport {
   inputs: InputOutcome[];
 }
 
+/** One cell's before/after in a change summary (F15). */
+export interface CellChange {
+  row: number;
+  col: number;
+  old: string;
+  new: string;
+}
+
+/** One unsaved operation, summarised for the Changes panel (F15). */
+export interface ChangeSummary {
+  /** Stable id, valid while the operation stays on the undo stack. */
+  id: number;
+  epochSecs: number;
+  kind: string;
+  cellsAffected: number;
+  sample: CellChange[];
+  structural: boolean;
+  revertible: boolean;
+  blockedReason: string | null;
+}
+
 /** Deterministic PII detector (F28) — a closed set plus user regexes. */
 export type PiiDetector =
   | { type: "email" }

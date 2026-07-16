@@ -298,6 +298,17 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("semantic"),
     },
     {
+      id: "view.changes",
+      title: "Changes since save",
+      keywords: ["inspector", "revert", "history", "dirty", "diff", "unsaved"],
+      category: "View",
+      unavailableReason: needsDoc,
+      run: () => {
+        const s = state();
+        s.setChangesOpen(!s.changesOpen);
+      },
+    },
+    {
       id: "data.pii",
       title: "Find personal data…",
       keywords: ["pii", "redact", "mask", "sensitive", "gdpr", "anonymize", "pseudonymize"],
