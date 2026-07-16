@@ -307,6 +307,9 @@ export interface ClusterState {
   processed: number;
   total: number | null;
   report: ClusterReport | null;
+  /** The scope the CURRENT report was scanned with — applies use this, not
+   * whatever the dialog's scope controls say now. */
+  scanScope: ExportScope | null;
   error: string | null;
 }
 
@@ -315,6 +318,7 @@ const initialCluster: ClusterState = {
   processed: 0,
   total: null,
   report: null,
+  scanScope: null,
   error: null,
 };
 
@@ -748,6 +752,8 @@ export const useStore = create<Store>((set, get) => {
         error: null,
       },
       dedup: initialDedup,
+      // Cluster reports are per-document; never let one leak across tabs.
+      cluster: initialCluster,
     };
   };
 
@@ -1291,7 +1297,14 @@ export const useStore = create<Store>((set, get) => {
       try {
         const jobId = await api.startClusterScan(meta.id, spec, meta.revision);
         set((s) => ({
-          cluster: { ...s.cluster, scanJobId: jobId, processed: 0, total: null, error: null },
+          cluster: {
+            ...s.cluster,
+            scanJobId: jobId,
+            processed: 0,
+            total: null,
+            scanScope: spec.scope,
+            error: null,
+          },
         }));
         consumeEarlyFinish(jobId);
       } catch (e) {
@@ -1845,6 +1858,13 @@ export const useStore = create<Store>((set, get) => {
       if (finished.kind === "cluster") {
         if (get().cluster.scanJobId !== finished.jobId) return;
         if (finished.status === "done") {
+          // A report belongs to the document it was scanned on; if the user
+          // switched tabs meanwhile, drop it rather than install it against
+          // a different document (values could coincidentally match).
+          if (finished.docId !== get().activeId) {
+            set((s) => ({ cluster: { ...s.cluster, scanJobId: null } }));
+            return;
+          }
           const report = finished.docId
             ? await api.getClusterReport(finished.docId).catch(() => null)
             : null;
