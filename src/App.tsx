@@ -3,6 +3,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useState } from "react";
 
+import { CellEditorDialog } from "./components/CellEditorDialog";
 import { ColumnExplorerPanel } from "./components/ColumnExplorerPanel";
 import { CommandPalette } from "./components/CommandPalette";
 import { CompareDialog } from "./components/CompareDialog";
@@ -175,30 +176,43 @@ export default function App() {
 
   // Global keyboard shortcuts, resolved through the command registry (F11).
   // Bindings are recomputed per keypress from live settings, so shortcut
-  // edits take effect immediately without a restart.
+  // edits take effect immediately without a restart. Capture phase so chords
+  // the grid would otherwise swallow (F2) reach the registry first; the
+  // editable-target guard keeps typing in inputs unaffected.
   useEffect(() => {
+    const isEditableTarget = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      return (
+        !!target &&
+        (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
+      );
+    };
+    const runCommand = (e: KeyboardEvent, commandId: string): boolean => {
+      const command = registry.byId(commandId);
+      if (!command) return false;
+      if (isEditableTarget(e) && !command.allowInEditable) return true; // handled: ignore
+      if (command.unavailableReason?.()) return true; // bound but not runnable now
+      e.preventDefault();
+      e.stopPropagation();
+      command.run();
+      return true;
+    };
     const onKey = (e: KeyboardEvent) => {
       const binding = bindingFromEvent(e);
       if (!binding) return;
       const overrides = useStore.getState().settings?.shortcutOverrides;
       const bindings = effectiveBindings(registry.defaultBindings(), overrides);
+      // Primary (rebindable) chords first…
       for (const [commandId, bound] of bindings) {
-        if (bound !== binding) continue;
-        const command = registry.byId(commandId);
-        if (!command) continue;
-        const target = e.target as HTMLElement | null;
-        const editable =
-          !!target &&
-          (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
-        if (editable && !command.allowInEditable) return;
-        if (command.unavailableReason?.()) return; // bound but not runnable now
-        e.preventDefault();
-        command.run();
-        return;
+        if (bound === binding && runCommand(e, commandId)) return;
+      }
+      // …then fixed aliases (e.g. mod+enter for the cell editor).
+      for (const command of registry.staticCommands()) {
+        if (command.extraShortcuts?.includes(binding) && runCommand(e, command.id)) return;
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, []);
 
   return (
@@ -244,6 +258,7 @@ export default function App() {
       {activeModal === "compare" && <CompareDialog onClose={() => setModal(null)} />}
       {activeModal === "shortcuts" && <ShortcutsDialog onClose={() => setModal(null)} />}
       <CommandPalette />
+      <CellEditorDialog />
       <ReopenDialog />
       <ExternalChangeDialog />
       <OpenModeDialog />

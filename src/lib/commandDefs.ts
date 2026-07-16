@@ -151,6 +151,23 @@ function staticCommands(): AppCommand[] {
       run: () => void state().redo(),
     },
     {
+      id: "edit.editCell",
+      title: "Edit cell (multiline)…",
+      keywords: ["multiline", "raw", "inspect", "newline", "escaped", "invisible"],
+      category: "Edit",
+      defaultShortcut: "f2",
+      extraShortcuts: ["mod+enter"],
+      unavailableReason: () => {
+        const reason = needsDoc();
+        if (reason) return reason;
+        return state().selectionRect ? null : "No cell is selected";
+      },
+      run: () => {
+        const rect = state().selectionRect;
+        if (rect) state().openCellEditor(rect.y, rect.x);
+      },
+    },
+    {
       id: "edit.find",
       title: "Find & replace",
       keywords: ["search", "regex", "replace"],

@@ -270,6 +270,18 @@ mod tests {
     }
 
     #[test]
+    fn single_cell_fetch_respects_filter_and_full_content() {
+        // The F13 cell editor reads one cell through display->abs + fetch:
+        // the COMPLETE value (embedded newline included) must come back for
+        // the row the filter actually shows.
+        let mut d = doc("name,note\na,\"line1\nline2\"\nb,short");
+        d.set_filter(vec![0]);
+        let abs = d.display_to_abs(0).unwrap();
+        let rows = d.fetch_rows(&[abs]).unwrap();
+        assert_eq!(rows[0][1], "line1\nline2");
+    }
+
+    #[test]
     fn find_under_filter_is_display_coords_and_panic_free() {
         let mut d = doc("name,qty\nx,1\ny,2\nx,3");
         d.set_filter(vec![2]); // only the third data row (x,3) visible -> display row 0

@@ -17,6 +17,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "Keyboard shortcuts…") records new bindings per command, warns before
   reassigning a chord that another command already uses, and persists
   overrides in the settings file. Changes apply immediately.
+- **Multiline / raw cell editor** (`F2`, `Ctrl/Cmd+Enter`, or right-click →
+  Edit cell): a resizable editor over the COMPLETE cell content with line,
+  character, and UTF-8 byte counts, plus an **Escaped** view that makes
+  newlines, tabs, non-breaking spaces, zero-width and control characters, and
+  U+FFFD visible — copyable without altering the stored value. Applying is
+  one undo step; NUL characters are blocked with a warning; indexed
+  (read-only) documents allow inspection and copying only. The right-click
+  menu also copies a cell's full value straight from the backend.
 
 ## [0.3.0]
 

@@ -2,6 +2,7 @@ import {
   CompactSelection,
   DataEditor,
   GridCellKind,
+  type CellClickedEventArgs,
   type DataEditorRef,
   type EditableGridCell,
   type GridCell,
@@ -75,6 +76,13 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     rows: CompactSelection.empty(),
   });
   const [menu, setMenu] = useState<ColumnMenuState | null>(null);
+  // F13: right-click cell menu (edit in the multiline editor / copy full value).
+  const [cellMenu, setCellMenu] = useState<{
+    row: number;
+    col: number;
+    x: number;
+    y: number;
+  } | null>(null);
 
   const findMatches = useStore((s) => s.find.matches);
   const findIndex = useStore((s) => s.find.index);
@@ -336,6 +344,18 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     setMenu({ col, x: bounds.x, y: bounds.y + bounds.height });
   }, []);
 
+  const onCellContextMenu = useCallback((cell: Item, event: CellClickedEventArgs) => {
+    const [col, row] = cell;
+    if (row < 0 || col < 0) return;
+    event.preventDefault();
+    setCellMenu({
+      row,
+      col,
+      x: event.bounds.x + event.localEventX,
+      y: event.bounds.y + event.localEventY,
+    });
+  }, []);
+
   // ----- scroll to the active find match ---------------------------------
 
   useEffect(() => {
@@ -355,6 +375,9 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         rangeStack: [],
       },
     });
+    // Mirror into the store so selection-driven commands (F13 cell editor)
+    // target the cell that is actually highlighted.
+    useStore.getState().setSelection({ x: match.col, y: match.row, width: 1, height: 1 }, [], []);
   }, [findMatches, findIndex]);
 
   // ----- jump requests (e.g. a diagnostics sample) ------------------------
@@ -376,6 +399,9 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         rangeStack: [],
       },
     });
+    // Mirror into the store so selection-driven commands (F13 cell editor)
+    // target the cell that is actually highlighted.
+    useStore.getState().setSelection({ x: col, y: row, width: 1, height: 1 }, [], []);
     // Depend on the nonce so repeated jumps to the same cell still scroll.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jumpTarget?.nonce]);
@@ -395,6 +421,7 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         onColumnResize={onColumnResize}
         onVisibleRegionChanged={onVisibleRegionChanged}
         onHeaderMenuClick={onHeaderMenuClick}
+        onCellContextMenu={onCellContextMenu}
         gridSelection={selection}
         onGridSelectionChange={onGridSelectionChange}
         getCellsForSelection={getCellsForSelection}
@@ -417,10 +444,84 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
           onClose={() => setMenu(null)}
         />
       )}
+      {cellMenu && (
+        <CellContextMenu
+          state={cellMenu}
+          docId={meta.id}
+          readOnly={readOnly}
+          onClose={() => setCellMenu(null)}
+        />
+      )}
     </div>
   );
 }
 
 function rectOf(range: Rectangle) {
   return { x: range.x, y: range.y, width: range.width, height: range.height };
+}
+
+/** Right-click cell menu (F13): open the multiline editor or copy the FULL
+ * value (fetched from Rust — the grid cache may hold only visible rows). */
+function CellContextMenu({
+  state,
+  docId,
+  readOnly,
+  onClose,
+}: {
+  state: { row: number; col: number; x: number; y: number };
+  docId: number;
+  readOnly: boolean;
+  onClose: () => void;
+}) {
+  const openCellEditor = useStore((s) => s.openCellEditor);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [onClose]);
+
+  const copyFull = async () => {
+    try {
+      const value = await api.getCell(docId, state.row, state.col);
+      await navigator.clipboard.writeText(value);
+    } catch {
+      // Clipboard/read failures surface elsewhere; the menu just closes.
+    }
+    onClose();
+  };
+
+  const item =
+    "block w-full px-3 py-1.5 text-left text-sm text-zinc-700 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-700";
+
+  return (
+    <div
+      ref={ref}
+      className="fixed z-50 w-44 overflow-hidden rounded-lg border border-zinc-200 bg-white py-1 shadow-xl dark:border-zinc-700 dark:bg-zinc-800"
+      style={{ left: state.x, top: state.y }}
+    >
+      <button
+        className={item}
+        onClick={() => {
+          openCellEditor(state.row, state.col);
+          onClose();
+        }}
+      >
+        {readOnly ? "Inspect cell…" : "Edit cell…"}
+      </button>
+      <button className={item} onClick={() => void copyFull()}>
+        Copy full value
+      </button>
+    </div>
+  );
 }

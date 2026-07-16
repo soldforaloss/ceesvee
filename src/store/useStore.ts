@@ -411,6 +411,8 @@ interface Store {
   paletteOpen: boolean;
   /** Command id the palette should open in argument mode for (F11). */
   paletteArgCommandId: string | null;
+  /** Target of the multiline cell editor, in display coordinates (F13). */
+  cellEditor: { row: number; col: number } | null;
 
   // lifecycle / chrome
   init: () => void;
@@ -420,6 +422,9 @@ interface Store {
   setPaletteOpen: (open: boolean) => void;
   /** Open the palette directly in argument mode for one command (F11). */
   openPaletteForArg: (commandId: string) => void;
+  /** Open/close the multiline cell editor (F13). */
+  openCellEditor: (row: number, col: number) => void;
+  closeCellEditor: () => void;
   /**
    * Persist a shortcut override for a command (F11): a binding string
    * rebinds, `null` unbinds, `undefined` resets to the default.
@@ -432,6 +437,8 @@ interface Store {
   resetColumnWidths: () => void;
   setScrollPosition: (row: number, column: number) => void;
   loadSummaries: () => void;
+  /** Invalidate the grid's row cache (e.g. after an out-of-grid cell save). */
+  invalidateGrid: () => void;
 
   // documents
   openDialog: () => Promise<void>;
@@ -898,6 +905,7 @@ export const useStore = create<Store>((set, get) => {
     activeModal: null,
     paletteOpen: false,
     paletteArgCommandId: null,
+    cellEditor: null,
     selection: null,
     selectionRect: null,
     selectedRows: [],
@@ -950,6 +958,10 @@ export const useStore = create<Store>((set, get) => {
       set(open ? { paletteOpen: true } : { paletteOpen: false, paletteArgCommandId: null }),
 
     openPaletteForArg: (commandId) => set({ paletteOpen: true, paletteArgCommandId: commandId }),
+
+    openCellEditor: (row, col) => set({ cellEditor: { row, col } }),
+
+    closeCellEditor: () => set({ cellEditor: null }),
 
     setShortcutOverride: async (commandId, binding) => {
       const current = get().settings ?? { version: 1, profiles: [] };
@@ -1009,6 +1021,8 @@ export const useStore = create<Store>((set, get) => {
       set((s) => ({ columnWidths: { ...s.columnWidths, [col]: width } })),
 
     resetColumnWidths: () => set({ columnWidths: {} }),
+
+    invalidateGrid: () => set((s) => ({ dataVersion: s.dataVersion + 1 })),
 
     setScrollPosition: (row, column) => {
       // Trailing debounce: visible-region events fire on every scroll frame.
