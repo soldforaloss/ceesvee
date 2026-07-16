@@ -207,7 +207,13 @@ export function OutlierDialog({ onClose }: { onClose: () => void }) {
             <select
               value={column}
               onChange={(e) => {
-                setColumn(Number(e.target.value));
+                const next = Number(e.target.value);
+                setColumn(next);
+                // The analyzed column can't also group the analysis: its
+                // checkbox becomes disabled, so an already-checked entry
+                // must be pruned or every value silently compares only to
+                // its own group.
+                setGroupColumns((g) => g.filter((c) => c !== next));
                 clearReport();
               }}
               className={selectCls}
