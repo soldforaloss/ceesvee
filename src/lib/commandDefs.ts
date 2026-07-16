@@ -342,6 +342,14 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("compare"),
     },
     {
+      id: "data.groupBy",
+      title: "Group by…",
+      keywords: ["aggregate", "summarize", "sum", "count", "pivot table", "rollup"],
+      category: "Data",
+      unavailableReason: needsDoc,
+      run: () => openModal("groupBy"),
+    },
+    {
       id: "data.join",
       title: "Join…",
       keywords: ["lookup", "merge", "vlookup", "relational", "inner", "outer"],

@@ -38,6 +38,8 @@ import type {
   FilterGroup,
   FindMatch,
   FindOptions,
+  GroupByPreview,
+  GroupBySpec,
   IndexedOpenStart,
   JoinPreview,
   JoinSpec,
@@ -246,6 +248,14 @@ export const startAppend = (inputs: AppendInput[], options: AppendOptions) =>
 /** The per-input outcome report of a finished append (F20). */
 export const getAppendReport = (docId: number) =>
   invoke<AppendReport | null>("get_append_report", { docId });
+
+/** Preview a group-by — creates nothing (F22). */
+export const previewGroupBy = (docId: number, spec: GroupBySpec, expectedRevision: number) =>
+  invoke<GroupByPreview>("preview_group_by", { docId, spec, expectedRevision });
+
+/** Run a group-by as a cancellable "derive" job into a NEW document (F22). */
+export const startGroupBy = (docId: number, spec: GroupBySpec, expectedRevision: number) =>
+  invoke<IndexedOpenStart>("start_group_by", { docId, spec, expectedRevision });
 
 /** Cardinality preview of a join — creates nothing (F21). */
 export const previewJoin = (

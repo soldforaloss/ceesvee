@@ -8,6 +8,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Group-by aggregations** (palette → "Group by…"): summarise the active
+  document into a NEW grouped document. Aggregates: row count, non-blank
+  count, distinct count, sum, mean, min, max, median, first, last,
+  concatenate, and concatenate-distinct — with custom output names,
+  case-insensitive grouping (first-seen display value), keep-or-exclude
+  blank-key handling, deterministic key / largest-first / first-seen
+  ordering, configurable concatenation separator with a length cap, and
+  all/visible-rows scope. Invalid numeric cells are ignored by the math
+  but counted; group and distinct-tracking counts are bounded with clear
+  errors. The preview shows the schema, group count, and sample rows.
 - **Relational joins** (palette → "Join…"): join the active document with
   another open tab on ordered composite keys — inner, left/right/full
   outer, and left/right anti — into a NEW document; both sources stay
