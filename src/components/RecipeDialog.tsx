@@ -138,13 +138,14 @@ export function RecipeDialog({ onClose }: { onClose: () => void }) {
         break;
       case "deduplicate": {
         // The dedupe engine rejects empty key lists — a step without keys
-        // would fail on every input at run time.
+        // would fail on every input at run time. Keys are 1-based column
+        // NUMBERS (recipes apply positionally across many files).
         const keyColumns = dedupeKeys
           .split(",")
-          .map((c) => c.trim())
-          .filter((c) => c !== "");
+          .map((c) => Number(c.trim()) - 1)
+          .filter((n) => Number.isInteger(n) && n >= 0);
         if (keyColumns.length === 0) {
-          setError("list the dedupe key columns (comma-separated)");
+          setError("list the dedupe key column numbers (1-based, comma-separated)");
           return;
         }
         step = {
@@ -379,7 +380,7 @@ export function RecipeDialog({ onClose }: { onClose: () => void }) {
               <input
                 value={dedupeKeys}
                 onChange={(e) => setDedupeKeys(e.target.value)}
-                placeholder="dedupe key columns, comma-separated"
+                placeholder="dedupe key column numbers (1-based), e.g. 1,3"
                 className={inputCls}
               />
             )}
