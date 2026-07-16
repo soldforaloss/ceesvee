@@ -7,6 +7,8 @@ import type {
   AppSettings,
   ArchiveExtractStart,
   CellRect,
+  ClusterReport,
+  ClusterSpec,
   ColumnProfile,
   ColumnSummary,
   CompareInfo,
@@ -133,6 +135,30 @@ export const openArchiveDocument = (
 
 /** Drop a parked extraction and delete its cache (F17). */
 export const discardArchive = (token: number) => invoke<void>("discard_archive", { token });
+
+/** The last completed cluster report for a document (F24). */
+export const getClusterReport = (docId: number) =>
+  invoke<ClusterReport | null>("get_cluster_report", { docId });
+
+/** Start a fuzzy clustering scan as a cancellable job (F24). */
+export const startClusterScan = (docId: number, spec: ClusterSpec, expectedRevision: number) =>
+  invoke<number>("start_cluster_scan", { docId, spec, expectedRevision });
+
+/** Apply accepted cluster mappings as one undo step (F24). */
+export const applyValueClusters = (
+  docId: number,
+  column: number,
+  mapping: [string, string][],
+  scope: ExportScope,
+  expectedRevision: number,
+) =>
+  invoke<DocumentMeta>("apply_value_clusters", {
+    docId,
+    column,
+    mapping,
+    scope,
+    expectedRevision,
+  });
 
 /**
  * Open a file in indexed read-only mode (F10). The document registers under

@@ -17,6 +17,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "Keyboard shortcuts…") records new bindings per command, warns before
   reassigning a chord that another command already uses, and persists
   overrides in the settings file. Changes apply immediately.
+- **Fuzzy value clustering** (palette → "Cluster values…"): find likely
+  spelling, punctuation, spacing, and capitalization variants in a column
+  using deterministic methods — key-collision fingerprint, n-gram
+  fingerprint, Levenshtein distance, or Jaro-Winkler similarity — with
+  case/whitespace/punctuation/accents/word-order normalization options.
+  Review each cluster (members with frequencies, the shared key or score,
+  rows affected), pick or type the canonical value, and apply all accepted
+  clusters as ONE undo step. Nothing is ever merged automatically; stale
+  results can't be applied after edits; the accepted mapping can be exported
+  as JSON.
 - **Compressed CSV support**: open `.csv.gz` / `.tsv.gz` files and `.zip`
   archives directly. ZIPs with several files show an entry chooser (sizes,
   compression ratio, sniffed delimiter and encoding); extraction streams with

@@ -25,6 +25,8 @@ import type {
   FindOptions,
   JobFinished,
   JobProgress,
+  ClusterReport,
+  ClusterSpec,
   CompareInfo,
   CompareSpec,
   DedupSpec,
@@ -68,7 +70,8 @@ export type ModalName =
   | "compare"
   | "shortcuts"
   | "copyAs"
-  | "pasteSpecial";
+  | "pasteSpecial"
+  | "cluster";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
@@ -298,6 +301,23 @@ export interface IndexingState {
   archiveEntry?: string | null;
 }
 
+/** Fuzzy clustering state (F24), for the ACTIVE document. */
+export interface ClusterState {
+  scanJobId: number | null;
+  processed: number;
+  total: number | null;
+  report: ClusterReport | null;
+  error: string | null;
+}
+
+const initialCluster: ClusterState = {
+  scanJobId: null,
+  processed: 0,
+  total: null,
+  report: null,
+  error: null,
+};
+
 /** ZIP entry chooser state (F17). */
 export interface ArchivePickState {
   path: string;
@@ -425,6 +445,8 @@ interface Store {
   openDecision: OpenDecisionState | null;
   /** Running index build / conversion / re-index / extraction job. */
   indexing: IndexingState | null;
+  /** Fuzzy clustering state (F24). */
+  cluster: ClusterState;
   /** ZIP entry chooser (F17). */
   archivePick: ArchivePickState | null;
   /** Suspicious-ratio extraction awaiting confirmation (F17). */
@@ -481,6 +503,18 @@ interface Store {
   /** Materialise the active indexed document into an editable one. */
   convertActiveToEditable: (force: boolean) => Promise<void>;
   cancelIndexing: () => Promise<void>;
+
+  // fuzzy clustering (F24)
+  startClusterScan: (spec: ClusterSpec) => Promise<void>;
+  cancelClusterScan: () => Promise<void>;
+  clearClusterReport: () => void;
+  /** Apply accepted mappings as one undo step; true on success. */
+  applyClusters: (
+    column: number,
+    mapping: [string, string][],
+    scope: ExportScope,
+    expectedRevision: number,
+  ) => Promise<boolean>;
 
   // compressed files (F17)
   /** Start extracting an archive (gzip member or chosen ZIP entry). */
@@ -959,6 +993,7 @@ export const useStore = create<Store>((set, get) => {
     reopen: initialReopen,
     openDecision: null,
     indexing: null,
+    cluster: initialCluster,
     archivePick: null,
     archiveLargeConfirm: null,
     externalPrompt: null,
@@ -1246,6 +1281,50 @@ export const useStore = create<Store>((set, get) => {
     cancelIndexing: async () => {
       const indexing = get().indexing;
       if (indexing) await api.cancelJob(indexing.jobId).catch(() => undefined);
+    },
+
+    // ----- fuzzy clustering (F24) ---------------------------------------------
+
+    startClusterScan: async (spec) => {
+      const meta = activeMeta();
+      if (!meta || get().cluster.scanJobId != null) return;
+      try {
+        const jobId = await api.startClusterScan(meta.id, spec, meta.revision);
+        set((s) => ({
+          cluster: { ...s.cluster, scanJobId: jobId, processed: 0, total: null, error: null },
+        }));
+        consumeEarlyFinish(jobId);
+      } catch (e) {
+        set((s) => ({ cluster: { ...s.cluster, error: String(e) } }));
+      }
+    },
+
+    cancelClusterScan: async () => {
+      const jobId = get().cluster.scanJobId;
+      if (jobId != null) await api.cancelJob(jobId).catch(() => undefined);
+    },
+
+    clearClusterReport: () => set({ cluster: initialCluster }),
+
+    applyClusters: async (column, mapping, scope, expectedRevision) => {
+      const meta = activeMeta();
+      if (!meta) return false;
+      try {
+        const updated = await api.applyValueClusters(
+          meta.id,
+          column,
+          mapping,
+          scope,
+          expectedRevision,
+        );
+        reloadDoc(updated);
+        // The document changed; the report is stale by definition.
+        set({ cluster: initialCluster });
+        return true;
+      } catch (e) {
+        set((s) => ({ cluster: { ...s.cluster, error: String(e) } }));
+        return false;
+      }
     },
 
     // ----- compressed files (F17) --------------------------------------------
@@ -1617,6 +1696,14 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
+      if (progress.kind === "cluster") {
+        if (get().cluster.scanJobId !== progress.jobId) return;
+        set((s) => ({
+          cluster: { ...s.cluster, processed: progress.processed, total: progress.total },
+        }));
+        return;
+      }
+
       if (
         progress.kind === "openIndexed" ||
         progress.kind === "convertEditable" ||
@@ -1749,6 +1836,25 @@ export const useStore = create<Store>((set, get) => {
               ...s.compare,
               jobId: null,
               error: finished.status === "failed" ? (finished.error ?? "comparison failed") : null,
+            },
+          }));
+        }
+        return;
+      }
+
+      if (finished.kind === "cluster") {
+        if (get().cluster.scanJobId !== finished.jobId) return;
+        if (finished.status === "done") {
+          const report = finished.docId
+            ? await api.getClusterReport(finished.docId).catch(() => null)
+            : null;
+          set((s) => ({ cluster: { ...s.cluster, scanJobId: null, report, error: null } }));
+        } else {
+          set((s) => ({
+            cluster: {
+              ...s.cluster,
+              scanJobId: null,
+              error: finished.status === "failed" ? (finished.error ?? "scan failed") : null,
             },
           }));
         }

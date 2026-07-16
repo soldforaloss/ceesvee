@@ -14,6 +14,7 @@ use tauri::State;
 
 use crate::archive::{self, ArchiveCache, ZipEntryInfo};
 use crate::clipboard::{self, CopyFormat};
+use crate::cluster::{self, ClusterCache, ClusterReport, ClusterSpec};
 use crate::compare::{self, CompareCache, CompareInfo, ComparePage, CompareSpec, DiffStatus};
 use crate::dedup::{self, DedupCache, DedupSpec, DuplicateKeepStrategy, DuplicateReport};
 use crate::diagnostics::{self, DiagnosticsCache, DiagnosticsReport};
@@ -651,6 +652,7 @@ pub fn new_document(
     Ok(meta)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn close_document(
     doc_id: u64,
@@ -659,13 +661,82 @@ pub fn close_document(
     profile_cache: State<'_, ProfileCache>,
     dedup_cache: State<'_, DedupCache>,
     compare_cache: State<'_, CompareCache>,
+    cluster_cache: State<'_, ClusterCache>,
 ) -> AppResult<()> {
     lock(&state)?.remove(doc_id);
     diagnostics_cache.remove(doc_id);
     profile_cache.remove_doc(doc_id);
     dedup_cache.remove(doc_id);
     compare_cache.remove_doc(doc_id);
+    cluster_cache.remove(doc_id);
     Ok(())
+}
+
+// ----- fuzzy value clustering (F24) ------------------------------------------
+
+/// The last completed cluster report for a document, if any. Carries the
+/// revision it was computed against; the UI offers a rescan when stale.
+#[tauri::command]
+pub fn get_cluster_report(
+    doc_id: u64,
+    cluster_cache: State<'_, ClusterCache>,
+) -> Option<ClusterReport> {
+    cluster_cache.get(doc_id)
+}
+
+/// Start a clustering scan as a cancellable job (F24). The report lands in
+/// the cluster cache; nothing is ever applied automatically.
+#[tauri::command]
+pub async fn start_cluster_scan(
+    doc_id: u64,
+    spec: ClusterSpec,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    cluster_cache: State<'_, ClusterCache>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+    }
+    let sink = cluster_cache.share();
+    let ctx = jobs.begin_for_app(&app, "cluster", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            let report = cluster::scan(&doc, &spec, ctx)?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, report);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// Apply the ACCEPTED cluster mappings as ONE undoable operation (F24),
+/// guarded by the revision the report was computed against.
+#[tauri::command]
+pub fn apply_value_clusters(
+    doc_id: u64,
+    column: usize,
+    mapping: Vec<(String, String)>,
+    scope: ExportScope,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    write_doc(&state, doc_id, |doc| {
+        doc.ensure_editable()?;
+        doc.check_revision(expected_revision)?;
+        let changes = cluster::mapping_changes(doc, column, &mapping, &scope)?;
+        doc.set_cells(changes)?;
+        Ok(doc.meta())
+    })
 }
 
 #[tauri::command]

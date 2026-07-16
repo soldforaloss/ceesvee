@@ -4,6 +4,7 @@
 mod analyze;
 mod archive;
 mod clipboard;
+mod cluster;
 mod commands;
 mod compare;
 mod dedup;
@@ -92,6 +93,7 @@ pub fn run() {
         .manage(DedupCache::default())
         .manage(CompareCache::default())
         .manage(crate::archive::ArchiveCache::default())
+        .manage(crate::cluster::ClusterCache::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -166,6 +168,9 @@ pub fn run() {
             commands::start_duplicate_scan,
             commands::apply_duplicate_filter,
             commands::apply_deduplicate,
+            commands::get_cluster_report,
+            commands::start_cluster_scan,
+            commands::apply_value_clusters,
             commands::start_compare,
             commands::get_compare_info,
             commands::get_compare_results,

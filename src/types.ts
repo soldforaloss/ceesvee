@@ -171,6 +171,50 @@ export interface ExternalChange {
   stored: FileFingerprint | null;
 }
 
+/** Fuzzy clustering method (F24). */
+export type ClusterMethod =
+  | { type: "fingerprint" }
+  | { type: "ngramFingerprint"; n: number }
+  | { type: "levenshtein"; maxDistance: number }
+  | { type: "jaroWinkler"; minSimilarity: number };
+
+/** Normalizations applied before cluster matching (F24). */
+export interface ClusterNormalization {
+  caseFold?: boolean;
+  trimCollapse?: boolean;
+  stripPunctuation?: boolean;
+  stripDiacritics?: boolean;
+  sortWords?: boolean;
+}
+
+export interface ClusterSpec {
+  column: number;
+  method: ClusterMethod;
+  normalization?: ClusterNormalization;
+  scope: ExportScope;
+}
+
+export interface ClusterMember {
+  value: string;
+  count: number;
+}
+
+export interface ValueCluster {
+  members: ClusterMember[];
+  suggested: string;
+  matchKey: string;
+  rowsAffected: number;
+}
+
+export interface ClusterReport {
+  revision: number;
+  column: number;
+  scannedRows: number;
+  distinctValues: number;
+  totalClusters: number;
+  clusters: ValueCluster[];
+}
+
 /** Copy As output format (F14). */
 export type CopyFormat =
   | { type: "tsv" }
