@@ -30,6 +30,7 @@ import { ProfileSuggestionBar } from "./components/ProfileSuggestionBar";
 import { OpenModeDialog } from "./components/OpenModeDialog";
 import { OutlierDialog } from "./components/OutlierDialog";
 import { QuitDialog } from "./components/QuitDialog";
+import { RecipeDialog } from "./components/RecipeDialog";
 import { ReopenDialog } from "./components/ReopenDialog";
 import { RepairDialog } from "./components/RepairDialog";
 import { ReshapeDialog } from "./components/ReshapeDialog";
@@ -279,6 +280,7 @@ export default function App() {
       {activeModal === "join" && <JoinDialog onClose={() => setModal(null)} />}
       {activeModal === "groupBy" && <GroupByDialog onClose={() => setModal(null)} />}
       {activeModal === "reshape" && <ReshapeDialog onClose={() => setModal(null)} />}
+      {activeModal === "recipes" && <RecipeDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       <CommandPalette />
       <CellEditorDialog />

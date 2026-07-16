@@ -36,6 +36,7 @@ import type {
   OpenOptions,
   ProfileScope,
   ProfileValidation,
+  BatchReport,
   CrossRule,
   CrossValReport,
   OutlierReport,
@@ -86,7 +87,8 @@ export type ModalName =
   | "append"
   | "join"
   | "groupBy"
-  | "reshape";
+  | "reshape"
+  | "recipes";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
@@ -374,6 +376,16 @@ const initialCrossVal: CrossValState = {
   error: null,
 };
 
+/** A running batch-recipe job (F25). */
+export interface BatchState {
+  jobId: number;
+  processed: number;
+  total: number | null;
+  message: string | null;
+  report: BatchReport | null;
+  error: string | null;
+}
+
 /** A running derived-document job (F20–F23: append/join/group/pivot). */
 export interface DeriveState {
   jobId: number;
@@ -544,6 +556,8 @@ interface Store {
   derive: DeriveState | null;
   /** Error from the last derive job, for the dialog that started it. */
   deriveError: string | null;
+  /** Running (or just finished) batch-recipe job (F25), if any. */
+  batch: BatchState | null;
   /** ZIP entry chooser (F17). */
   archivePick: ArchivePickState | null;
   /** Suspicious-ratio extraction awaiting confirmation (F17). */
@@ -649,6 +663,12 @@ interface Store {
   /** Track a started derive job so completion adds the new tab. */
   trackDerive: (jobId: number, docId: number, kind: DeriveState["kind"]) => void;
   cancelDerive: () => Promise<void>;
+
+  // batch recipes (F25)
+  /** Track a started batch job; the report lands on completion. */
+  trackBatch: (jobId: number) => void;
+  cancelBatch: () => Promise<void>;
+  clearBatch: () => void;
 
   // outlier finder (F30)
   startOutlierScan: (spec: OutlierSpec) => Promise<void>;
@@ -1148,6 +1168,7 @@ export const useStore = create<Store>((set, get) => {
     outlier: initialOutlier,
     derive: null,
     deriveError: null,
+    batch: null,
     archivePick: null,
     archiveLargeConfirm: null,
     externalPrompt: null,
@@ -1628,6 +1649,22 @@ export const useStore = create<Store>((set, get) => {
       const derive = get().derive;
       if (derive) await api.cancelJob(derive.jobId).catch(() => undefined);
     },
+
+    // ----- batch recipes (F25) ---------------------------------------------------
+
+    trackBatch: (jobId) => {
+      set({
+        batch: { jobId, processed: 0, total: null, message: null, report: null, error: null },
+      });
+      consumeEarlyFinish(jobId);
+    },
+
+    cancelBatch: async () => {
+      const batch = get().batch;
+      if (batch) await api.cancelJob(batch.jobId).catch(() => undefined);
+    },
+
+    clearBatch: () => set({ batch: null }),
 
     // ----- outlier finder (F30) --------------------------------------------------
 
@@ -2113,6 +2150,20 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
+      if (progress.kind === "batch") {
+        const batch = get().batch;
+        if (batch?.jobId !== progress.jobId) return;
+        set({
+          batch: {
+            ...batch,
+            processed: progress.processed,
+            total: progress.total,
+            message: progress.message ?? batch.message,
+          },
+        });
+        return;
+      }
+
       if (progress.kind === "cluster") {
         if (get().cluster.scanJobId !== progress.jobId) return;
         set((s) => ({
@@ -2287,6 +2338,24 @@ export const useStore = create<Store>((set, get) => {
               error: finished.status === "failed" ? (finished.error ?? "scan failed") : null,
             },
           }));
+        }
+        return;
+      }
+
+      if (finished.kind === "batch") {
+        const batch = get().batch;
+        if (batch?.jobId !== finished.jobId) return;
+        if (finished.status === "done") {
+          const report = await api.getBatchReport(batch.jobId).catch(() => null);
+          set({ batch: { ...batch, report, error: null } });
+        } else {
+          set({
+            batch: {
+              ...batch,
+              error:
+                finished.status === "failed" ? (finished.error ?? "the batch failed") : "cancelled",
+            },
+          });
         }
         return;
       }

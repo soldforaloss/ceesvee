@@ -31,6 +31,7 @@ mod outlier;
 mod parse;
 mod paste;
 mod profile;
+mod recipe;
 mod reopen;
 mod repair;
 mod reshape;
@@ -107,6 +108,7 @@ pub fn run() {
         .manage(crate::crossval::CrossValCache::default())
         .manage(crate::outlier::OutlierCache::default())
         .manage(crate::append::AppendCache::default())
+        .manage(crate::recipe::RecipeCache::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -208,6 +210,9 @@ pub fn run() {
             commands::start_group_by,
             commands::preview_reshape,
             commands::start_reshape,
+            commands::validate_recipe_batch,
+            commands::start_recipe_batch,
+            commands::get_batch_report,
             commands::start_compare,
             commands::get_compare_info,
             commands::get_compare_results,

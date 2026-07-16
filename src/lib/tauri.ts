@@ -10,6 +10,8 @@ import type {
   AppendReport,
   AppSettings,
   ArchiveExtractStart,
+  BatchOptions,
+  BatchReport,
   CellRect,
   ClusterReport,
   ClusterSpec,
@@ -250,6 +252,18 @@ export const startAppend = (inputs: AppendInput[], options: AppendOptions) =>
 /** The per-input outcome report of a finished append (F20). */
 export const getAppendReport = (docId: number) =>
   invoke<AppendReport | null>("get_append_report", { docId });
+
+/** Validate a batch (recipe version, steps, templates) without running (F25). */
+export const validateRecipeBatch = (options: BatchOptions) =>
+  invoke<void>("validate_recipe_batch", { options });
+
+/** Run a batch recipe as a cancellable job; report lands under the job id (F25). */
+export const startRecipeBatch = (options: BatchOptions) =>
+  invoke<number>("start_recipe_batch", { options });
+
+/** The structured report of a finished batch (F25). */
+export const getBatchReport = (jobId: number) =>
+  invoke<BatchReport | null>("get_batch_report", { jobId });
 
 /** Preview a reshape — creates nothing (F23). */
 export const previewReshape = (docId: number, spec: ReshapeSpec, expectedRevision: number) =>

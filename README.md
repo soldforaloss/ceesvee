@@ -102,6 +102,9 @@ and faithful on large, real-world delimited files.**
   with normalized grouping, blank-key policies, and ordering options.
 - **Pivot / unpivot / transpose** — reshape wide↔long with aggregation
   choices, duplicate-coordinate detection, provenance, and size guards.
+- **Batch recipes** — run a saved, declarative pipeline (validate /
+  filter / clean / dedup / sort / export) over folders of files with
+  dry runs, per-file reports, and no-overwrite defaults. No scripting.
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 
