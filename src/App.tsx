@@ -13,6 +13,7 @@ import { CompareDialog } from "./components/CompareDialog";
 import { CopyAsDialog } from "./components/CopyAsDialog";
 import { CrossValDialog } from "./components/CrossValDialog";
 import { PasteSpecialDialog } from "./components/PasteSpecialDialog";
+import { PiiDialog } from "./components/PiiDialog";
 import { DedupDialog } from "./components/DedupDialog";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { EmptyState } from "./components/EmptyState";
@@ -281,6 +282,7 @@ export default function App() {
       {activeModal === "groupBy" && <GroupByDialog onClose={() => setModal(null)} />}
       {activeModal === "reshape" && <ReshapeDialog onClose={() => setModal(null)} />}
       {activeModal === "recipes" && <RecipeDialog onClose={() => setModal(null)} />}
+      {activeModal === "pii" && <PiiDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       <CommandPalette />
       <CellEditorDialog />

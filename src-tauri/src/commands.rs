@@ -36,6 +36,7 @@ use crate::outlier::{
 };
 use crate::parse::{parse, ParseSettings, ParsedFile};
 use crate::paste::{self, PasteOptions, PastePreview};
+use crate::pii::{self, CachedPii, PiiCache, PiiSpec, RedactionAction, RedactionPreview};
 use crate::profile::{self, ColumnProfile, ProfileCache, ProfileOptions, ProfileScope};
 use crate::recipe::{self, BatchOptions, BatchReport, RecipeCache};
 use crate::reopen::{self, CurrentInterpretation};
@@ -679,6 +680,7 @@ pub fn close_document(
     crossval_cache: State<'_, CrossValCache>,
     outlier_cache: State<'_, OutlierCache>,
     append_cache: State<'_, AppendCache>,
+    pii_cache: State<'_, PiiCache>,
 ) -> AppResult<()> {
     lock(&state)?.remove(doc_id);
     diagnostics_cache.remove(doc_id);
@@ -690,6 +692,7 @@ pub fn close_document(
     crossval_cache.remove(doc_id);
     outlier_cache.remove(doc_id);
     append_cache.remove(doc_id);
+    pii_cache.remove(doc_id);
     Ok(())
 }
 
@@ -1291,6 +1294,154 @@ pub async fn start_group_by(
         job_id,
         doc_id: new_doc_id,
     })
+}
+
+// ----- PII detection and redaction (F28) -----------------------------------------
+
+/// Append one line to the LOCAL-ONLY audit log: counts and kinds, never
+/// values. Best-effort — a failing audit write never blocks a redaction.
+fn append_pii_audit(app: &tauri::AppHandle, line: &str) {
+    use tauri::Manager;
+    let Ok(dir) = app.path().app_data_dir() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("pii-audit.log");
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{epoch} {line}");
+    }
+}
+
+/// The last completed PII report + the spec that produced it.
+#[tauri::command]
+pub fn get_pii_report(doc_id: u64, pii_cache: State<'_, PiiCache>) -> Option<CachedPii> {
+    pii_cache.get(doc_id)
+}
+
+/// Run a PII scan as a cancellable job (F28). Read-only; report samples
+/// are masked — raw values never leave the scan.
+#[tauri::command]
+pub async fn start_pii_scan(
+    doc_id: u64,
+    spec: PiiSpec,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    pii_cache: State<'_, PiiCache>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+    }
+    let sink = pii_cache.share();
+    let ctx = jobs.begin_for_app(&app, "pii", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            let report = pii::scan(&doc, &spec, ctx)?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, (spec, report));
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// Preview a redaction: affected counts and MASKED before/after examples.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn preview_redaction(
+    doc_id: u64,
+    spec: PiiSpec,
+    detector: usize,
+    column: usize,
+    action: RedactionAction,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<RedactionPreview> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.ensure_editable()?;
+        doc.check_revision(expected_revision)?;
+        Ok(pii::redaction_changes(&doc, &spec, detector, column, &action)?.preview)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Apply a previewed redaction as ONE undoable operation, and append a
+/// value-free line to the local audit log.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn apply_redaction(
+    doc_id: u64,
+    spec: PiiSpec,
+    detector: usize,
+    column: usize,
+    action: RedactionAction,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    let handle = doc_handle(&state, doc_id)?;
+    let result =
+        tauri::async_runtime::spawn_blocking(move || -> AppResult<(DocumentMeta, String)> {
+            let mut doc = handle.write().map_err(poisoned)?;
+            doc.ensure_editable()?;
+            doc.check_revision(expected_revision)?;
+            let computed = pii::redaction_changes(&doc, &spec, detector, column, &action)?;
+            let affected;
+            if let Some(col) = computed.remove_column {
+                affected = 1;
+                doc.delete_columns(vec![col])?;
+            } else if !computed.remove_rows.is_empty() {
+                affected = computed.remove_rows.len();
+                doc.delete_rows(computed.remove_rows)?;
+            } else {
+                affected = computed.changes.len();
+                doc.set_cells(computed.changes)?;
+            }
+            let detector_label = spec
+                .detectors
+                .get(detector)
+                .map(|d| d.label())
+                .unwrap_or_default();
+            let action_kind = match action {
+                RedactionAction::FixedReplacement { .. } => "fixedReplacement",
+                RedactionAction::KeepLast { .. } => "keepLast",
+                RedactionAction::FullMask => "fullMask",
+                RedactionAction::Pseudonymize { .. } => "pseudonymize",
+                RedactionAction::RemoveColumn => "removeColumn",
+                RedactionAction::RemoveRows => "removeRows",
+            };
+            let audit = format!(
+                "doc=\"{}\" detector=\"{detector_label}\" column={column} \
+             action={action_kind} affected={affected}",
+                doc.meta().file_name
+            );
+            Ok((doc.meta(), audit))
+        })
+        .await
+        .map_err(|e| AppError::Other(format!("background task failed: {e}")))??;
+    let (meta, audit) = result;
+    append_pii_audit(&app, &audit);
+    Ok(meta)
 }
 
 // ----- batch recipes (F25) ------------------------------------------------------

@@ -323,6 +323,57 @@ export interface AppendReport {
   inputs: InputOutcome[];
 }
 
+/** Deterministic PII detector (F28) — a closed set plus user regexes. */
+export type PiiDetector =
+  | { type: "email" }
+  | { type: "phoneNumber" }
+  | { type: "ipAddress" }
+  | { type: "ssn" }
+  | { type: "paymentCard" }
+  | { type: "custom"; name: string; pattern: string };
+
+export interface PiiSpec {
+  detectors: PiiDetector[];
+  scope: ExportScope;
+}
+
+/** One (detector, column) finding with MASKED samples only (F28). */
+export interface PiiFinding {
+  detector: number;
+  detectorLabel: string;
+  validation: string;
+  column: number;
+  count: number;
+  samples: string[];
+}
+
+export interface PiiReport {
+  revision: number;
+  scannedRows: number;
+  totalMatches: number;
+  findings: PiiFinding[];
+}
+
+/** Redaction actions (F28) — previewed, one undo step each. */
+export type RedactionAction =
+  | { type: "fixedReplacement"; replacement: string }
+  | { type: "keepLast"; n: number }
+  | { type: "fullMask" }
+  | { type: "pseudonymize"; secret: string; salt?: string | null }
+  | { type: "removeColumn" }
+  | { type: "removeRows" };
+
+export interface RedactionPreview {
+  revision: number;
+  cellsAffected: number;
+  rowsRemoved: number;
+  columnRemoved: boolean;
+  /** [masked before, after] pairs. */
+  examples: [string, string][];
+  /** The salt used for pseudonymization — reuse it for stable pseudonyms. */
+  salt: string | null;
+}
+
 /** A sort key referencing its column by NAME (F25 recipes). */
 export interface NamedSortKey {
   column: string;

@@ -30,6 +30,7 @@ mod joins;
 mod outlier;
 mod parse;
 mod paste;
+mod pii;
 mod profile;
 mod recipe;
 mod reopen;
@@ -109,6 +110,7 @@ pub fn run() {
         .manage(crate::outlier::OutlierCache::default())
         .manage(crate::append::AppendCache::default())
         .manage(crate::recipe::RecipeCache::default())
+        .manage(crate::pii::PiiCache::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -213,6 +215,10 @@ pub fn run() {
             commands::validate_recipe_batch,
             commands::start_recipe_batch,
             commands::get_batch_report,
+            commands::get_pii_report,
+            commands::start_pii_scan,
+            commands::preview_redaction,
+            commands::apply_redaction,
             commands::start_compare,
             commands::get_compare_info,
             commands::get_compare_results,

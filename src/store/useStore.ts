@@ -40,6 +40,8 @@ import type {
   CrossRule,
   CrossValReport,
   OutlierReport,
+  PiiReport,
+  PiiSpec,
   OutlierSpec,
   ReparsePreview,
   SemanticAction,
@@ -88,7 +90,8 @@ export type ModalName =
   | "join"
   | "groupBy"
   | "reshape"
-  | "recipes";
+  | "recipes"
+  | "pii";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
@@ -376,6 +379,25 @@ const initialCrossVal: CrossValState = {
   error: null,
 };
 
+/** PII scan state (F28), for the ACTIVE document. */
+export interface PiiState {
+  scanJobId: number | null;
+  processed: number;
+  total: number | null;
+  spec: PiiSpec | null;
+  report: PiiReport | null;
+  error: string | null;
+}
+
+const initialPii: PiiState = {
+  scanJobId: null,
+  processed: 0,
+  total: null,
+  spec: null,
+  report: null,
+  error: null,
+};
+
 /** A running batch-recipe job (F25). */
 export interface BatchState {
   jobId: number;
@@ -524,6 +546,13 @@ interface Store {
   ignoredFingerprints: Record<number, string>;
   /** Whether the quit confirmation (dirty tabs) is showing. */
   quitPromptOpen: boolean;
+  /**
+   * One-shot scope preselection for the next export-dialog open (F28's
+   * "Export non-PII columns" must not default to all columns). Consumed and
+   * cleared by the dialog.
+   */
+  exportPreferredScope: "selectedColumns" | null;
+  setExportPreferredScope: (scope: "selectedColumns" | null) => void;
   /** Running save/export jobs, keyed by job id (status-bar progress). */
   fileJobs: Record<number, FileJobState>;
   /** A lossy save blocked by the encoding-compatibility scan, if any. */
@@ -558,6 +587,8 @@ interface Store {
   deriveError: string | null;
   /** Running (or just finished) batch-recipe job (F25), if any. */
   batch: BatchState | null;
+  /** PII scan state (F28). */
+  pii: PiiState;
   /** ZIP entry chooser (F17). */
   archivePick: ArchivePickState | null;
   /** Suspicious-ratio extraction awaiting confirmation (F17). */
@@ -669,6 +700,13 @@ interface Store {
   trackBatch: (jobId: number) => void;
   cancelBatch: () => Promise<void>;
   clearBatch: () => void;
+
+  // PII (F28)
+  startPiiScan: (spec: PiiSpec) => Promise<void>;
+  cancelPiiScan: () => Promise<void>;
+  clearPiiReport: () => void;
+  /** Re-adopt the backend-cached report (used when the dialog opens). */
+  loadCachedPiiReport: () => Promise<void>;
 
   // outlier finder (F30)
   startOutlierScan: (spec: OutlierSpec) => Promise<void>;
@@ -917,6 +955,7 @@ export const useStore = create<Store>((set, get) => {
       semantic: initialSemantic,
       crossval: initialCrossVal,
       outlier: initialOutlier,
+      pii: initialPii,
     };
   };
 
@@ -1169,11 +1208,13 @@ export const useStore = create<Store>((set, get) => {
     derive: null,
     deriveError: null,
     batch: null,
+    pii: initialPii,
     archivePick: null,
     archiveLargeConfirm: null,
     externalPrompt: null,
     ignoredFingerprints: {},
     quitPromptOpen: false,
+    exportPreferredScope: null,
     fileJobs: {},
     encodingIssues: null,
     settings: null,
@@ -1236,6 +1277,8 @@ export const useStore = create<Store>((set, get) => {
     },
 
     setError: (error) => set({ error }),
+
+    setExportPreferredScope: (scope) => set({ exportPreferredScope: scope }),
 
     setActive: (id) => set((s) => switchPatch(s, id)),
 
@@ -1665,6 +1708,39 @@ export const useStore = create<Store>((set, get) => {
     },
 
     clearBatch: () => set({ batch: null }),
+
+    // ----- PII (F28) -------------------------------------------------------------
+
+    startPiiScan: async (spec) => {
+      const meta = activeMeta();
+      if (!meta || get().pii.scanJobId != null) return;
+      try {
+        const jobId = await api.startPiiScan(meta.id, spec, meta.revision);
+        set((s) => ({
+          pii: { ...s.pii, scanJobId: jobId, processed: 0, total: null, spec, error: null },
+        }));
+        consumeEarlyFinish(jobId);
+      } catch (e) {
+        set((s) => ({ pii: { ...s.pii, error: String(e) } }));
+      }
+    },
+
+    cancelPiiScan: async () => {
+      const jobId = get().pii.scanJobId;
+      if (jobId != null) await api.cancelJob(jobId).catch(() => undefined);
+    },
+
+    clearPiiReport: () => set({ pii: initialPii }),
+
+    loadCachedPiiReport: async () => {
+      const meta = activeMeta();
+      if (!meta || get().pii.report !== null || get().pii.scanJobId != null) return;
+      const cached = await api.getPiiReport(meta.id).catch(() => null);
+      if (cached) {
+        const [spec, report] = cached;
+        set((s) => ({ pii: { ...s.pii, spec, report } }));
+      }
+    },
 
     // ----- outlier finder (F30) --------------------------------------------------
 
@@ -2150,6 +2226,14 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
+      if (progress.kind === "pii") {
+        if (get().pii.scanJobId !== progress.jobId) return;
+        set((s) => ({
+          pii: { ...s.pii, processed: progress.processed, total: progress.total },
+        }));
+        return;
+      }
+
       if (progress.kind === "batch") {
         const batch = get().batch;
         if (batch?.jobId !== progress.jobId) return;
@@ -2334,6 +2418,33 @@ export const useStore = create<Store>((set, get) => {
           set((s) => ({
             crossval: {
               ...s.crossval,
+              scanJobId: null,
+              error: finished.status === "failed" ? (finished.error ?? "scan failed") : null,
+            },
+          }));
+        }
+        return;
+      }
+
+      if (finished.kind === "pii") {
+        if (get().pii.scanJobId !== finished.jobId) return;
+        if (finished.status === "done") {
+          const cached = finished.docId
+            ? await api.getPiiReport(finished.docId).catch(() => null)
+            : null;
+          set((s) => ({
+            pii: {
+              ...s.pii,
+              scanJobId: null,
+              spec: cached ? cached[0] : s.pii.spec,
+              report: cached ? cached[1] : null,
+              error: null,
+            },
+          }));
+        } else {
+          set((s) => ({
+            pii: {
+              ...s.pii,
               scanJobId: null,
               error: finished.status === "failed" ? (finished.error ?? "scan failed") : null,
             },
