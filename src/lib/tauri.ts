@@ -4,6 +4,10 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AppendInput,
+  AppendOptions,
+  AppendPreview,
+  AppendReport,
   AppSettings,
   ArchiveExtractStart,
   CellRect,
@@ -227,6 +231,19 @@ export const applySemanticAction = (
     action,
     expectedRevision,
   });
+
+/** Preview an append: schema, mappings, projections. Creates nothing (F20). */
+export const previewAppend = (inputs: AppendInput[], options: AppendOptions) =>
+  invoke<AppendPreview>("preview_append", { inputs, options });
+
+/** Run an append as a cancellable "derive" job; a NEW document registers
+ *  under the returned docId when it finishes (F20). */
+export const startAppend = (inputs: AppendInput[], options: AppendOptions) =>
+  invoke<IndexedOpenStart>("start_append", { inputs, options });
+
+/** The per-input outcome report of a finished append (F20). */
+export const getAppendReport = (docId: number) =>
+  invoke<AppendReport | null>("get_append_report", { docId });
 
 /** The last completed outlier report + the spec that produced it (F30). */
 export const getOutlierReport = (docId: number) =>

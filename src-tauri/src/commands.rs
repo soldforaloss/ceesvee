@@ -12,6 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use tauri::State;
 
+use crate::append::{self, AppendCache, AppendInput, AppendOptions, AppendPreview, AppendReport};
 use crate::archive::{self, ArchiveCache, ZipEntryInfo};
 use crate::clipboard::{self, CopyFormat};
 use crate::cluster::{self, ClusterCache, ClusterReport, ClusterSpec};
@@ -673,6 +674,7 @@ pub fn close_document(
     semantic_cache: State<'_, SemanticCache>,
     crossval_cache: State<'_, CrossValCache>,
     outlier_cache: State<'_, OutlierCache>,
+    append_cache: State<'_, AppendCache>,
 ) -> AppResult<()> {
     lock(&state)?.remove(doc_id);
     diagnostics_cache.remove(doc_id);
@@ -683,6 +685,7 @@ pub fn close_document(
     semantic_cache.remove(doc_id);
     crossval_cache.remove(doc_id);
     outlier_cache.remove(doc_id);
+    append_cache.remove(doc_id);
     Ok(())
 }
 
@@ -1121,6 +1124,106 @@ pub async fn apply_outlier_action(
     })
     .await
     .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+// ----- multi-file append (F20) ------------------------------------------------
+
+/// Resolve front-end append inputs: open documents to their shared handles
+/// (with their display names), files to validated paths.
+fn resolve_append_inputs(
+    state: &Db<'_>,
+    inputs: Vec<AppendInput>,
+) -> AppResult<Vec<append::ResolvedInput>> {
+    if inputs.is_empty() {
+        return Err(AppError::invalid("pick at least one input"));
+    }
+    let mut resolved = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        match input {
+            AppendInput::OpenDoc { doc_id } => {
+                let handle = doc_handle(state, doc_id)?;
+                let name = {
+                    let doc = handle.read().map_err(poisoned)?;
+                    doc.meta().file_name
+                };
+                resolved.push(append::ResolvedInput::Doc { name, doc: handle });
+            }
+            AppendInput::File { path } => {
+                let path = PathBuf::from(path);
+                if !path.is_file() {
+                    return Err(AppError::invalid(format!("not a file: {}", path.display())));
+                }
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                resolved.push(append::ResolvedInput::File { name, path });
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Preview an append: output schema, per-input mappings and warnings,
+/// projected rows and backing. Nothing is created.
+#[tauri::command]
+pub async fn preview_append(
+    inputs: Vec<AppendInput>,
+    options: AppendOptions,
+    state: Db<'_>,
+) -> AppResult<AppendPreview> {
+    let resolved = resolve_append_inputs(&state, inputs)?;
+    tauri::async_runtime::spawn_blocking(move || append::preview(&resolved, &options))
+        .await
+        .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Run the append as a cancellable job (kind "derive"). The NEW document
+/// registers under the returned doc id when the job finishes; input tabs
+/// and files are never modified.
+#[tauri::command]
+pub async fn start_append(
+    inputs: Vec<AppendInput>,
+    options: AppendOptions,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    append_cache: State<'_, AppendCache>,
+) -> AppResult<IndexedOpenStart> {
+    let resolved = resolve_append_inputs(&state, inputs)?;
+    let doc_id = lock(&state)?.alloc_id();
+    let cache_root = index_cache_root(&app)?;
+    let sink = append_cache.share();
+
+    let ctx = jobs.begin_for_app(&app, "derive", Some(doc_id));
+    let job_id = ctx.id;
+    let app_for_job = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            use tauri::Manager;
+            let (doc, report) = append::run(&resolved, &options, doc_id, cache_root, ctx)?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, report);
+            }
+            let registry = app_for_job.state::<Mutex<AppState>>();
+            registry
+                .lock()
+                .map_err(|_| AppError::Other("internal state lock error".into()))?
+                .insert(doc);
+            Ok(())
+        })
+        .await;
+    });
+    Ok(IndexedOpenStart { job_id, doc_id })
+}
+
+/// The per-input outcome report of a finished append.
+#[tauri::command]
+pub fn get_append_report(
+    doc_id: u64,
+    append_cache: State<'_, AppendCache>,
+) -> Option<AppendReport> {
+    append_cache.get(doc_id)
 }
 
 #[tauri::command]
