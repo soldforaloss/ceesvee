@@ -323,6 +323,38 @@ export interface AppendReport {
   inputs: InputOutcome[];
 }
 
+/** The full CSV dialect (F18) — a closed set of validated options. */
+export interface CsvDialectOptions {
+  delimiter: string;
+  /** null disables quoting entirely. */
+  quoteCharacter: string | null;
+  doubleQuote?: boolean;
+  escapeCharacter?: string | null;
+  commentPrefix?: string | null;
+  skipLeadingRecords?: number;
+  skipTrailingRecords?: number;
+  /** Which post-skip record holds the headers (null = no header row). */
+  headerRowIndex?: number | null;
+  headerRowCount?: number;
+  headerJoiner?: string;
+  nullTokens?: string[];
+  encoding?: string | null;
+}
+
+/** Bounded dialect preview (F18). */
+export interface DialectPreview {
+  sample: string[][];
+  /** 1-based ORIGINAL record numbers for the sampled rows. */
+  originalNumbers: number[];
+  headers: string[] | null;
+  duplicateHeaders: string[];
+  totalRows: number;
+  nCols: number;
+  nullTokenCells: number;
+  encoding: string;
+  effective: CsvDialectOptions;
+}
+
 /** One cell's before/after in a change summary (F15). */
 export interface CellChange {
   row: number;

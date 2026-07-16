@@ -16,6 +16,7 @@ import { CrossValDialog } from "./components/CrossValDialog";
 import { PasteSpecialDialog } from "./components/PasteSpecialDialog";
 import { PiiDialog } from "./components/PiiDialog";
 import { DedupDialog } from "./components/DedupDialog";
+import { DialectDialog } from "./components/DialectDialog";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { EmptyState } from "./components/EmptyState";
 import { EncodingIssuesDialog } from "./components/EncodingIssuesDialog";
@@ -288,6 +289,7 @@ export default function App() {
       {activeModal === "recipes" && <RecipeDialog onClose={() => setModal(null)} />}
       {activeModal === "pii" && <PiiDialog onClose={() => setModal(null)} />}
       {activeModal === "recovery" && <RecoveryDialog onClose={() => setModal(null)} />}
+      {activeModal === "dialect" && <DialectDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       <CommandPalette />
       <CellEditorDialog />

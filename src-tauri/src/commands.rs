@@ -20,6 +20,7 @@ use crate::compare::{self, CompareCache, CompareInfo, ComparePage, CompareSpec, 
 use crate::crossval::{self, CrossRule, CrossValCache, CrossValReport};
 use crate::dedup::{self, DedupCache, DedupSpec, DuplicateKeepStrategy, DuplicateReport};
 use crate::diagnostics::{self, DiagnosticsCache, DiagnosticsReport};
+use crate::dialect::{self, CsvDialectOptions, DialectPreview};
 use crate::document::{ChangeSummary, Document};
 use crate::dto::{
     CellRect, ColumnSummary, DocumentMeta, EncodingCompatibility, EncodingIncompatibility,
@@ -643,6 +644,73 @@ pub async fn apply_reparse(
         let mut fresh = Document::from_parsed(doc_id, Some(path), parsed, has_header);
         // Continue the revision sequence so anything captured against the old
         // incarnation can never accidentally match the new one.
+        fresh.set_revision(doc.revision() + 1);
+        fresh.set_fingerprint(fingerprint);
+        let meta = fresh.meta();
+        *doc = fresh;
+        Ok(meta)
+    })
+}
+
+// ----- advanced dialect / preamble import (F18) -----------------------------------
+
+/// Parse the document's file under a full dialect (preamble skips, comment
+/// prefix, custom quoting/escaping, multi-row headers, null tokens) and
+/// describe the outcome WITHOUT touching the open document.
+#[tauri::command]
+pub async fn preview_dialect(
+    doc_id: u64,
+    dialect: CsvDialectOptions,
+    state: Db<'_>,
+) -> AppResult<DialectPreview> {
+    let path = read_doc(&state, doc_id, |doc| {
+        doc.path
+            .clone()
+            .ok_or_else(|| AppError::invalid("document has no file to reinterpret"))
+    })?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = std::fs::read(&path)?;
+        dialect::preview(&bytes, &dialect)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Re-read the document's file under the previewed dialect, replacing the
+/// open document — the same guarded reparse workflow as F02: rejected when
+/// the document moved past `expected_revision`, so unsaved edits are never
+/// silently discarded, and a parse failure leaves everything untouched.
+/// Saving afterwards writes only the current grid — skipped preamble and
+/// comment records are never re-added.
+#[tauri::command]
+pub async fn apply_dialect(
+    doc_id: u64,
+    dialect: CsvDialectOptions,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    let path = read_doc(&state, doc_id, |doc| {
+        doc.ensure_editable()?;
+        doc.check_revision(expected_revision)?;
+        doc.path
+            .clone()
+            .ok_or_else(|| AppError::invalid("document has no file to reinterpret"))
+    })?;
+
+    let path_for_parse = path.clone();
+    let (parsed_file, has_headers) =
+        tauri::async_runtime::spawn_blocking(move || -> AppResult<_> {
+            let bytes = std::fs::read(&path_for_parse)?;
+            let parsed = dialect::parse_with_dialect(&bytes, &dialect)?;
+            Ok(dialect::into_parsed_file(parsed, &dialect))
+        })
+        .await
+        .map_err(|e| AppError::Other(format!("background task failed: {e}")))??;
+    let fingerprint = util::stat_fingerprint(&path);
+
+    write_doc(&state, doc_id, |doc| {
+        doc.check_revision(expected_revision)?;
+        let mut fresh = Document::from_parsed(doc_id, Some(path), parsed_file, has_headers);
         fresh.set_revision(doc.revision() + 1);
         fresh.set_fingerprint(fingerprint);
         let meta = fresh.meta();

@@ -281,6 +281,14 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("semantic"),
     },
     {
+      id: "file.dialect",
+      title: "Advanced import…",
+      keywords: ["dialect", "preamble", "comment", "quote", "escape", "header rows", "skip"],
+      category: "File",
+      unavailableReason: needsEditable,
+      run: () => openModal("dialect"),
+    },
+    {
       id: "file.recovery",
       title: "Recover unsaved work…",
       keywords: ["crash", "journal", "restore", "recovery"],
