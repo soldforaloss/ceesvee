@@ -12,6 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use tauri::State;
 
+use crate::compare::{self, CompareCache, CompareInfo, ComparePage, CompareSpec, DiffStatus};
 use crate::dedup::{self, DedupCache, DedupSpec, DuplicateKeepStrategy, DuplicateReport};
 use crate::diagnostics::{self, DiagnosticsCache, DiagnosticsReport};
 use crate::document::Document;
@@ -268,11 +269,13 @@ pub fn close_document(
     diagnostics_cache: State<'_, DiagnosticsCache>,
     profile_cache: State<'_, ProfileCache>,
     dedup_cache: State<'_, DedupCache>,
+    compare_cache: State<'_, CompareCache>,
 ) -> AppResult<()> {
     lock(&state)?.remove(doc_id);
     diagnostics_cache.remove(doc_id);
     profile_cache.remove_doc(doc_id);
     dedup_cache.remove(doc_id);
+    compare_cache.remove_doc(doc_id);
     Ok(())
 }
 
@@ -410,6 +413,215 @@ pub fn validate_profile(
     read_doc(&state, doc_id, |doc| {
         settings::validate_profile(doc, &profile)
     })
+}
+
+// ----- CSV compare (F09) --------------------------------------------------------
+
+/// Start a comparison of two open documents; returns the job id, which also
+/// identifies the stored result. Strictly read-only for both documents.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn start_compare(
+    left_doc_id: u64,
+    right_doc_id: u64,
+    spec: CompareSpec,
+    expected_left_revision: u64,
+    expected_right_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    compare_cache: State<'_, CompareCache>,
+) -> AppResult<u64> {
+    if left_doc_id == right_doc_id {
+        return Err(AppError::invalid("pick two different documents to compare"));
+    }
+    let left_handle = doc_handle(&state, left_doc_id)?;
+    let right_handle = doc_handle(&state, right_doc_id)?;
+    {
+        let (left, right) =
+            compare::read_both(&left_handle, &right_handle, left_doc_id, right_doc_id)?;
+        left.check_revision(expected_left_revision)?;
+        right.check_revision(expected_right_revision)?;
+    }
+
+    let ctx = jobs.begin_for_app(&app, "compare", Some(left_doc_id));
+    let job_id = ctx.id;
+    let sink = compare_cache.share();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let result = {
+                let (left, right) =
+                    compare::read_both(&left_handle, &right_handle, left_doc_id, right_doc_id)?;
+                left.check_revision(expected_left_revision)?;
+                right.check_revision(expected_right_revision)?;
+                compare::compare(&left, &right, &spec, ctx)?
+                // Both read guards drop here, BEFORE the cache lock (keeps
+                // the cache -> documents lock order globally consistent).
+            };
+            if let Ok(mut map) = sink.lock() {
+                map.insert(job_id, result);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// Summary + identity of a stored comparison.
+#[tauri::command]
+pub fn get_compare_info(
+    compare_id: u64,
+    compare_cache: State<'_, CompareCache>,
+) -> Option<CompareInfo> {
+    compare_cache.with(compare_id, |result| result.info(compare_id))
+}
+
+/// One page of hydrated results (keys + cell differences), optionally
+/// filtered by status. Rejected once either document moved past the compared
+/// revision — stale results are never served.
+#[tauri::command]
+pub fn get_compare_results(
+    compare_id: u64,
+    offset: usize,
+    count: usize,
+    statuses: Option<Vec<String>>,
+    state: Db<'_>,
+    compare_cache: State<'_, CompareCache>,
+) -> AppResult<ComparePage> {
+    let filter: Option<Vec<DiffStatus>> = statuses
+        .map(|names| {
+            names
+                .iter()
+                .map(|n| {
+                    DiffStatus::parse(n)
+                        .ok_or_else(|| AppError::invalid(format!("unknown status: {n}")))
+                })
+                .collect::<AppResult<Vec<_>>>()
+        })
+        .transpose()?;
+
+    compare_cache
+        .with(compare_id, |result| -> AppResult<ComparePage> {
+            let left_handle = doc_handle(&state, result.left_doc)?;
+            let right_handle = doc_handle(&state, result.right_doc)?;
+            let (left, right) = compare::read_both(
+                &left_handle,
+                &right_handle,
+                result.left_doc,
+                result.right_doc,
+            )?;
+            let (records, total_filtered) =
+                compare::results_page(result, &left, &right, offset, count, filter.as_deref())?;
+            Ok(ComparePage {
+                records,
+                total_filtered,
+            })
+        })
+        .ok_or_else(|| AppError::invalid("comparison no longer exists"))?
+}
+
+/// Export the added / removed / changed rows of a comparison to a file using
+/// the atomic streaming pipeline, or a structured JSON change report.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn start_compare_export(
+    compare_id: u64,
+    which: String,
+    path: String,
+    options: ExportOptions,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    compare_cache: State<'_, CompareCache>,
+) -> AppResult<u64> {
+    let ctx = jobs.begin_for_app(&app, "export", None);
+    let job_id = ctx.id;
+    let sink = compare_cache.share();
+    let state_docs = lock(&state)?;
+    // Resolve document handles up front (the job outlives this command).
+    let (left_doc, right_doc) = compare_cache
+        .with(compare_id, |r| (r.left_doc, r.right_doc))
+        .ok_or_else(|| AppError::invalid("comparison no longer exists"))?;
+    let left_handle = state_docs.doc(left_doc)?;
+    let right_handle = state_docs.doc(right_doc)?;
+    drop(state_docs);
+
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let map = sink
+                .lock()
+                .map_err(|_| AppError::Other("internal compare lock error".into()))?;
+            let result = map
+                .get(&compare_id)
+                .ok_or_else(|| AppError::invalid("comparison no longer exists"))?;
+            let (left, right) =
+                compare::read_both(&left_handle, &right_handle, left_doc, right_doc)?;
+            left.check_revision(result.left_revision)?;
+            right.check_revision(result.right_revision)?;
+
+            let dest = std::path::PathBuf::from(&path);
+            match which.as_str() {
+                "report" => {
+                    // Stream the full hydrated record list as a JSON array.
+                    save_mod::atomic_write(&dest, options.backup, |file| {
+                        use std::io::Write;
+                        let mut written: u64 = 0;
+                        let mut w = |bytes: &[u8], file: &mut std::fs::File| -> AppResult<()> {
+                            file.write_all(bytes)?;
+                            written += bytes.len() as u64;
+                            Ok(())
+                        };
+                        w(b"[", file)?;
+                        const PAGE: usize = 2048;
+                        let mut offset = 0;
+                        let mut first = true;
+                        loop {
+                            ctx.check()?;
+                            let (records, _) =
+                                compare::results_page(result, &left, &right, offset, PAGE, None)?;
+                            if records.is_empty() {
+                                break;
+                            }
+                            for record in &records {
+                                if !first {
+                                    w(b",\n", file)?;
+                                }
+                                first = false;
+                                let json = serde_json::to_vec(record).map_err(|e| {
+                                    AppError::Other(format!("report serialization failed: {e}"))
+                                })?;
+                                w(&json, file)?;
+                            }
+                            offset += PAGE;
+                        }
+                        w(b"]\n", file)?;
+                        Ok(written)
+                    })?;
+                }
+                _ => {
+                    let status = DiffStatus::parse(&which)
+                        .ok_or_else(|| AppError::invalid("unknown export selection"))?;
+                    let rows = compare::rows_for_status(result, status);
+                    ctx.set_total(rows.len() as u64);
+                    // Added rows live in the RIGHT document; everything else
+                    // exports from the left.
+                    let doc: &Document = if status == DiffStatus::Added {
+                        &right
+                    } else {
+                        &left
+                    };
+                    let cols: Vec<usize> = (0..doc.n_cols()).collect();
+                    save_mod::atomic_write(&dest, options.backup, |file| {
+                        export::write_view(doc, &rows, &cols, &options, file, Some(ctx))
+                    })?;
+                }
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
 }
 
 // ----- duplicate finder (F07) --------------------------------------------------

@@ -8,8 +8,12 @@ import type {
   CellRect,
   ColumnProfile,
   ColumnSummary,
+  CompareInfo,
+  ComparePage,
+  CompareSpec,
   DedupSpec,
   DiagnosticsReport,
+  DiffStatus,
   DocumentMeta,
   DuplicateKeepStrategy,
   DuplicateReport,
@@ -174,6 +178,42 @@ export const startSave = (
   options: ExportOptions,
   expectedRevision: number,
 ) => invoke<number>("start_save", { docId, path, options, expectedRevision });
+
+/** Start a read-only comparison of two open documents (F09). */
+export const startCompare = (
+  leftDocId: number,
+  rightDocId: number,
+  spec: CompareSpec,
+  expectedLeftRevision: number,
+  expectedRightRevision: number,
+) =>
+  invoke<number>("start_compare", {
+    leftDocId,
+    rightDocId,
+    spec,
+    expectedLeftRevision,
+    expectedRightRevision,
+  });
+
+/** Summary + identity of a stored comparison (F09). */
+export const getCompareInfo = (compareId: number) =>
+  invoke<CompareInfo | null>("get_compare_info", { compareId });
+
+/** One page of hydrated compare results, optionally status-filtered (F09). */
+export const getCompareResults = (
+  compareId: number,
+  offset: number,
+  count: number,
+  statuses?: DiffStatus[],
+) => invoke<ComparePage>("get_compare_results", { compareId, offset, count, statuses });
+
+/** Export added/removed/changed rows or the JSON change report (F09). */
+export const startCompareExport = (
+  compareId: number,
+  which: DiffStatus | "report",
+  path: string,
+  options: ExportOptions,
+) => invoke<number>("start_compare_export", { compareId, which, path, options });
 
 /** The last completed duplicate report, if any (F07). */
 export const getDuplicateReport = (docId: number) =>

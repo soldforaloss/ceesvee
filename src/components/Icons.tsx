@@ -168,6 +168,15 @@ export const Bookmark = ({ className }: IconProps) => (
   </svg>
 );
 
+export const Diff = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <circle cx="6" cy="6" r="3" />
+    <circle cx="18" cy="18" r="3" />
+    <path d="M6 9v3a3 3 0 0 0 3 3h6" />
+    <path d="M18 15V9" />
+  </svg>
+);
+
 export const Layers = ({ className }: IconProps) => (
   <svg {...base} className={className}>
     <polygon points="12 2 2 7 12 12 22 7 12 2" />
