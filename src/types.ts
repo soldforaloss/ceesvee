@@ -323,6 +323,51 @@ export interface AppendReport {
   inputs: InputOutcome[];
 }
 
+/** The closed aggregate set (F22). */
+export type Aggregate =
+  | "count"
+  | "countNonBlank"
+  | "countDistinct"
+  | "sum"
+  | "mean"
+  | "min"
+  | "max"
+  | "median"
+  | "first"
+  | "last"
+  | "concat"
+  | "concatDistinct";
+
+export interface AggregateSpec {
+  aggregate: Aggregate;
+  /** The aggregated column (ignored for "count"). */
+  column?: number | null;
+  /** Custom output column name (defaults to "agg(column)"). */
+  outputName?: string | null;
+}
+
+export interface GroupBySpec {
+  groupColumns: number[];
+  aggregates: AggregateSpec[];
+  scope: ExportScope;
+  /** Case-insensitive, trimmed grouping (first-seen raw value displays). */
+  normalizedGrouping?: boolean;
+  blankKeys: "keep" | "exclude";
+  ordering: "byKey" | "byCountDesc" | "firstSeen";
+  concatSeparator?: string;
+  concatMaxLen?: number;
+}
+
+/** Preview of a group-by (F22). */
+export interface GroupByPreview {
+  outputColumns: string[];
+  groupCount: number;
+  scannedRows: number;
+  invalidNumeric: number;
+  blankKeyRows: number;
+  sample: string[][];
+}
+
 /** The classic six join types (F21). */
 export type JoinType = "inner" | "left" | "right" | "full" | "leftAnti" | "rightAnti";
 

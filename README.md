@@ -97,6 +97,9 @@ and faithful on large, real-world delimited files.**
   two open documents on composite keys with trim / case / blank /
   numeric / date normalization, cardinality previews, expansion
   confirmation, and a unique-key lookup mode. Sources are preserved.
+- **Group by** — count / distinct / sum / mean / min / max / median /
+  first / last / concatenate aggregations into a new grouped document,
+  with normalized grouping, blank-key policies, and ordering options.
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 

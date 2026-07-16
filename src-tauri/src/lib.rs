@@ -21,6 +21,7 @@ mod export;
 mod export_scope;
 mod filter;
 mod find;
+mod groupby;
 mod index;
 /// Public so downstream features (and the test harness) can treat the job
 /// registry, progress plumbing and cancellation as a stable internal API.
@@ -202,6 +203,8 @@ pub fn run() {
             commands::get_append_report,
             commands::preview_join,
             commands::start_join,
+            commands::preview_group_by,
+            commands::start_group_by,
             commands::start_compare,
             commands::get_compare_info,
             commands::get_compare_results,

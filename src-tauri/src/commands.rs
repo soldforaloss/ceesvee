@@ -28,6 +28,7 @@ use crate::dto::{
     ScopeCounts, SelectionStats, SortKey, SplitOptions,
 };
 use crate::error::{AppError, AppResult};
+use crate::groupby::{self, GroupByPreview, GroupBySpec};
 use crate::job::JobRegistry;
 use crate::joins::{self, JoinPreview, JoinSpec};
 use crate::outlier::{
@@ -1225,6 +1226,66 @@ pub fn get_append_report(
     append_cache: State<'_, AppendCache>,
 ) -> Option<AppendReport> {
     append_cache.get(doc_id)
+}
+
+// ----- group-by aggregations (F22) ---------------------------------------------
+
+/// Preview a group-by: schema, group count, ignored-invalid counts, and
+/// sample output rows. Nothing is created.
+#[tauri::command]
+pub async fn preview_group_by(
+    doc_id: u64,
+    spec: GroupBySpec,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<GroupByPreview> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+        groupby::preview(&doc, &spec)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Run a group-by as a cancellable "derive" job into a NEW document (F22).
+#[tauri::command]
+pub async fn start_group_by(
+    doc_id: u64,
+    spec: GroupBySpec,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<IndexedOpenStart> {
+    let handle = doc_handle(&state, doc_id)?;
+    let new_doc_id = lock(&state)?.alloc_id();
+    let cache_root = index_cache_root(&app)?;
+
+    let ctx = jobs.begin_for_app(&app, "derive", Some(new_doc_id));
+    let job_id = ctx.id;
+    let app_for_job = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            use tauri::Manager;
+            let source = handle.read().map_err(poisoned)?;
+            source.check_revision(expected_revision)?;
+            let doc = groupby::run(&source, &spec, new_doc_id, cache_root, ctx)?;
+            drop(source);
+            let registry = app_for_job.state::<Mutex<AppState>>();
+            registry
+                .lock()
+                .map_err(|_| AppError::Other("internal state lock error".into()))?
+                .insert(doc);
+            Ok(())
+        })
+        .await;
+    });
+    Ok(IndexedOpenStart {
+        job_id,
+        doc_id: new_doc_id,
+    })
 }
 
 // ----- relational joins (F21) --------------------------------------------------
