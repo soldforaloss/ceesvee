@@ -1640,7 +1640,7 @@ pub fn set_cells(
 #[tauri::command]
 pub async fn copy_as(
     doc_id: u64,
-    rows: Vec<usize>,
+    rows: Option<Vec<usize>>,
     cols: Vec<usize>,
     include_headers: bool,
     format: CopyFormat,
@@ -1649,11 +1649,19 @@ pub async fn copy_as(
     let handle = doc_handle(&state, doc_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let doc = handle.read().map_err(poisoned)?;
-        // Display rows -> absolute rows (honours an active filter).
-        let abs: Vec<usize> = rows
-            .iter()
-            .map(|&d| abs_row(&doc, d))
-            .collect::<AppResult<_>>()?;
+        // Display rows -> absolute rows (honours an active filter). `None`
+        // means every visible row — kept off the IPC wire so a million-row
+        // copy doesn't ship a million-entry array.
+        let abs: Vec<usize> = match rows {
+            Some(rows) => rows
+                .iter()
+                .map(|&d| abs_row(&doc, d))
+                .collect::<AppResult<_>>()?,
+            None => match doc.filter_view() {
+                Some(view) => view.to_vec(),
+                None => (0..doc.n_rows()).collect(),
+            },
+        };
         clipboard::serialize_selection(&doc, &abs, &cols, include_headers, &format)
     })
     .await
