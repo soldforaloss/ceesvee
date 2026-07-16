@@ -617,6 +617,7 @@ pub async fn apply_reparse(
     doc_id: u64,
     options: OpenOptions,
     expected_revision: u64,
+    app: tauri::AppHandle,
     state: Db<'_>,
 ) -> AppResult<DocumentMeta> {
     let (path, current_header) = read_doc(&state, doc_id, |doc| {
@@ -640,11 +641,20 @@ pub async fn apply_reparse(
         // Re-check under the write lock: an edit may have landed while the
         // file was being parsed.
         doc.check_revision(expected_revision)?;
+        // A journal against the OLD interpretation must not survive (its
+        // replay would target coordinates that no longer exist), and merely
+        // dropping the writer would leave the file to be offered as a
+        // recovery on the next startup.
+        if let Some(journal) = doc.take_journal() {
+            journal.delete();
+        }
         let mut fresh = Document::from_parsed(doc_id, Some(path), parsed, has_header);
         // Continue the revision sequence so anything captured against the old
         // incarnation can never accidentally match the new one.
         fresh.set_revision(doc.revision() + 1);
         fresh.set_fingerprint(fingerprint);
+        // Journaling continues against the NEW interpretation.
+        attach_journal_if_enabled(&app, &mut fresh);
         let meta = fresh.meta();
         *doc = fresh;
         Ok(meta)

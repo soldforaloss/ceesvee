@@ -1624,6 +1624,14 @@ impl Document {
                 true
             }
             EditOp::DeleteRows { removed } => {
+                // The captured rows must still FIT the document: replaying
+                // (or undoing) a delete whose rows have a different width
+                // would re-insert ragged rows and break the rectangular
+                // invariant — e.g. a journal recovered against a source
+                // whose column count changed.
+                if removed.iter().any(|(_, row)| row.len() != *cols) {
+                    return false;
+                }
                 if inverse {
                     if removed.iter().any(|(i, _)| *i > *rows) {
                         return false;
@@ -2985,6 +2993,35 @@ mod f16_tests {
     fn doc(csv: &str) -> Document {
         let parsed = parse(csv.as_bytes(), &ParseSettings::default()).unwrap();
         Document::from_parsed(1, None, parsed, true)
+    }
+
+    #[test]
+    fn replay_rejects_delete_rows_with_a_different_width() {
+        // A journal recovered against a source whose COLUMN COUNT changed:
+        // the captured DeleteRows rows are 3 wide, the document is 2 wide.
+        // Accepting it would let a later Undo re-insert ragged rows.
+        let mut d = doc("a,b\n1,2\n3,4\n");
+        let op = EditOp::DeleteRows {
+            removed: vec![(0, vec!["x".into(), "y".into(), "z".into()])],
+        };
+        let record = crate::journal::JournalRecord::Op {
+            op: serde_json::to_value(&op).unwrap(),
+        };
+        let err = d.replay_journal_records(&[record]);
+        assert!(err.is_err(), "width mismatch must fail replay");
+        assert_eq!(d.n_rows(), 2, "nothing was applied");
+
+        // The same shape with the CORRECT width replays fine.
+        let ok_op = EditOp::DeleteRows {
+            removed: vec![(0, vec!["1".into(), "2".into()])],
+        };
+        let record = crate::journal::JournalRecord::Op {
+            op: serde_json::to_value(&ok_op).unwrap(),
+        };
+        assert_eq!(d.replay_journal_records(&[record]).unwrap(), 1);
+        assert_eq!(d.n_rows(), 1);
+        d.undo().unwrap();
+        assert_eq!(d.n_rows(), 2, "undo re-inserts a rectangular row");
     }
 
     #[test]
