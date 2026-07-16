@@ -13,6 +13,7 @@ mod dedup;
 mod delimiter;
 mod derived;
 mod diagnostics;
+mod dialect;
 mod document;
 mod dto;
 mod encoding;
@@ -135,6 +136,8 @@ pub fn run() {
             commands::start_reindex,
             commands::preview_reparse,
             commands::apply_reparse,
+            commands::preview_dialect,
+            commands::apply_dialect,
             commands::get_file_fingerprint,
             commands::check_external_change,
             commands::new_document,

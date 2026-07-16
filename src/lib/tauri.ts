@@ -24,6 +24,8 @@ import type {
   CopyFormat,
   CrossRule,
   CrossValReport,
+  CsvDialectOptions,
+  DialectPreview,
   PastePreview,
   PasteSpecialOptions,
   PiiReport,
@@ -258,6 +260,14 @@ export const startAppend = (inputs: AppendInput[], options: AppendOptions) =>
 /** The per-input outcome report of a finished append (F20). */
 export const getAppendReport = (docId: number) =>
   invoke<AppendReport | null>("get_append_report", { docId });
+
+/** Parse the document's file under a full dialect, without applying (F18). */
+export const previewDialect = (docId: number, dialect: CsvDialectOptions) =>
+  invoke<DialectPreview>("preview_dialect", { docId, dialect });
+
+/** Reinterpret the document under the previewed dialect (guarded) (F18). */
+export const applyDialect = (docId: number, dialect: CsvDialectOptions, expectedRevision: number) =>
+  invoke<DocumentMeta>("apply_dialect", { docId, dialect, expectedRevision });
 
 /** Recoverable sessions found at startup (expired journals swept) (F16). */
 export const listRecoverySessions = () => invoke<RecoverableSession[]>("list_recovery_sessions");

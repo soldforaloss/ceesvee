@@ -42,7 +42,8 @@ and faithful on large, real-world delimited files.**
 - Open **compressed files** — `.csv.gz` and `.zip` archives (with an entry
   chooser) — and export back to gzip. Decompression-bomb guards included.
 - Auto-detect the **delimiter** (comma, tab, semicolon, pipe) with a manual /
-  custom override.
+  custom override — plus an **advanced import** for preambles, comment
+  lines, custom quoting/escaping, multi-row headers, and footers.
 - Auto-detect the **encoding** (UTF-8, UTF-16 LE/BE, Windows-1252 / Latin-1) with
   an override, plus correct **BOM** handling.
 - "First row is header" toggle with a frozen header row.

@@ -93,7 +93,8 @@ export type ModalName =
   | "reshape"
   | "recipes"
   | "pii"
-  | "recovery";
+  | "recovery"
+  | "dialect";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },

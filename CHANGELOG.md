@@ -8,6 +8,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Advanced dialect import** (palette → "Advanced import…"): open
+  real-world "CSV" files with metadata preambles, comment lines, custom
+  quote/escape characters (or quoting disabled entirely), multi-row
+  headers combined with a configurable joiner, skipped trailing footers,
+  and analysis-level null tokens (raw text always retained). The preview
+  shows ORIGINAL record numbers so excluded preambles stay visible,
+  flags duplicate combined headers (made unique deterministically on
+  apply), and echoes the effective dialect. Applying reinterprets the
+  file through the guarded reparse path — dirty documents require
+  explicit confirmation — and saving afterwards writes only the current
+  grid, never re-adding skipped preamble or comment records.
 - **Crash recovery** (opt-in, palette → "Recover unsaved work…"): an
   append-only local journal records every edit operation (including
   undo/redo) the moment it happens. After a crash, power failure, or
