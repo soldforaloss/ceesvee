@@ -156,8 +156,11 @@ export function PiiDialog({ onClose }: { onClose: () => void }) {
       setActionError("every column has findings — nothing safe to export");
       return;
     }
-    // Hand the safe column selection to the ordinary export dialog.
+    // Hand the safe column selection to the ordinary export dialog AND
+    // preselect the selected-columns scope — the dialog's default is "all
+    // rows/columns", which would export the PII columns just identified.
     setSelection(null, [], safe);
+    useStore.getState().setExportPreferredScope("selectedColumns");
     setModal("export");
   };
 

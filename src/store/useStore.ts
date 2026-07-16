@@ -542,6 +542,13 @@ interface Store {
   ignoredFingerprints: Record<number, string>;
   /** Whether the quit confirmation (dirty tabs) is showing. */
   quitPromptOpen: boolean;
+  /**
+   * One-shot scope preselection for the next export-dialog open (F28's
+   * "Export non-PII columns" must not default to all columns). Consumed and
+   * cleared by the dialog.
+   */
+  exportPreferredScope: "selectedColumns" | null;
+  setExportPreferredScope: (scope: "selectedColumns" | null) => void;
   /** Running save/export jobs, keyed by job id (status-bar progress). */
   fileJobs: Record<number, FileJobState>;
   /** A lossy save blocked by the encoding-compatibility scan, if any. */
@@ -1199,6 +1206,7 @@ export const useStore = create<Store>((set, get) => {
     externalPrompt: null,
     ignoredFingerprints: {},
     quitPromptOpen: false,
+    exportPreferredScope: null,
     fileJobs: {},
     encodingIssues: null,
     settings: null,
@@ -1261,6 +1269,8 @@ export const useStore = create<Store>((set, get) => {
     },
 
     setError: (error) => set({ error }),
+
+    setExportPreferredScope: (scope) => set({ exportPreferredScope: scope }),
 
     setActive: (id) => set((s) => switchPatch(s, id)),
 
