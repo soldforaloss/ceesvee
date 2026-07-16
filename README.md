@@ -71,6 +71,11 @@ and faithful on large, real-world delimited files.**
 - **Fuzzy value clustering** — group spelling/punctuation/case variants
   (fingerprint, n-gram, Levenshtein, Jaro-Winkler) and normalize them in one
   reviewed, undoable step.
+- **Semantic type detection** — recognize email / URL / UUID / IP / JSON /
+  percentage / currency / phone / postal-code columns with confidence
+  counts, filter to valid or invalid rows, and run previewed, undoable
+  quick actions (normalize, percent→decimal, extract URL host / email
+  domain). Overrides persist in file profiles.
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 

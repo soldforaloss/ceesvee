@@ -42,6 +42,10 @@ import type {
   RowsResponse,
   ScopeCounts,
   SelectionStats,
+  SemanticAction,
+  SemanticActionPreview,
+  SemanticReport,
+  SemanticType,
   SortKey,
   SplitOptions,
   TransformErrorPolicy,
@@ -157,6 +161,62 @@ export const applyValueClusters = (
     column,
     mapping,
     scope,
+    expectedRevision,
+  });
+
+/** The last completed semantic-type report for a document (F26). */
+export const getSemanticReport = (docId: number) =>
+  invoke<SemanticReport | null>("get_semantic_report", { docId });
+
+/** Start a semantic-type scan over every column as a cancellable job (F26). */
+export const startSemanticScan = (docId: number, expectedRevision: number) =>
+  invoke<number>("start_semantic_scan", { docId, expectedRevision });
+
+/** Filter to rows (in)valid for a semantic type; blanks match neither (F26). */
+export const applySemanticFilter = (
+  docId: number,
+  column: number,
+  semantic: SemanticType,
+  keepValid: boolean,
+  expectedRevision: number,
+) =>
+  invoke<DocumentMeta>("apply_semantic_filter", {
+    docId,
+    column,
+    semantic,
+    keepValid,
+    expectedRevision,
+  });
+
+/** Preview exactly what a semantic quick action would change (F26). */
+export const previewSemanticAction = (
+  docId: number,
+  column: number,
+  semantic: SemanticType,
+  action: SemanticAction,
+  expectedRevision: number,
+) =>
+  invoke<SemanticActionPreview>("preview_semantic_action", {
+    docId,
+    column,
+    semantic,
+    action,
+    expectedRevision,
+  });
+
+/** Apply a previewed semantic action as ONE undo step (F26). */
+export const applySemanticAction = (
+  docId: number,
+  column: number,
+  semantic: SemanticType,
+  action: SemanticAction,
+  expectedRevision: number,
+) =>
+  invoke<DocumentMeta>("apply_semantic_action", {
+    docId,
+    column,
+    semantic,
+    action,
     expectedRevision,
   });
 

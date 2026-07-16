@@ -29,6 +29,8 @@ export function CellEditorDialog() {
   // Counts are debounced: recomputing byte counts per keystroke on a
   // megabyte-sized cell would stall typing.
   const [counts, setCounts] = useState({ lines: 1, chars: 0, bytes: 0 });
+  // Whether the current value parses as JSON (F26: pretty-print action).
+  const [isJson, setIsJson] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const readOnly = meta?.backing === "indexedReadOnly";
@@ -60,6 +62,17 @@ export function CellEditorDialog() {
     if (value === null) return;
     const handle = setTimeout(() => {
       setCounts({ lines: countLines(value), chars: value.length, bytes: utf8ByteLength(value) });
+      const lead = value.trimStart();
+      let json = false;
+      if (lead.startsWith("{") || lead.startsWith("[")) {
+        try {
+          JSON.parse(value);
+          json = true;
+        } catch {
+          json = false;
+        }
+      }
+      setIsJson(json);
     }, 120);
     return () => clearTimeout(handle);
   }, [value]);
@@ -182,6 +195,22 @@ export function CellEditorDialog() {
             <span className="text-red-600 dark:text-red-400">contains NUL — cannot save</span>
           )}
           <span className="flex-1" />
+          {isJson && mode === "rendered" && !readOnly && (
+            <button
+              onClick={() => {
+                // Reformat in the editor only — the user reviews the result
+                // and commits it with Save (one undo step), or cancels.
+                try {
+                  setValue(JSON.stringify(JSON.parse(value ?? ""), null, 2));
+                } catch (e) {
+                  setError(String(e));
+                }
+              }}
+              className="rounded border border-zinc-200 px-2 py-1 hover:border-violet-400 dark:border-zinc-700"
+            >
+              Pretty-print JSON
+            </button>
+          )}
           <button
             onClick={() => void copyEscaped()}
             className="rounded border border-zinc-200 px-2 py-1 hover:border-violet-400 dark:border-zinc-700"

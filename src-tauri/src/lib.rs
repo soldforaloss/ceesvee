@@ -27,6 +27,7 @@ mod paste;
 mod profile;
 mod reopen;
 mod save;
+mod semantic;
 mod settings;
 mod sort;
 mod state;
@@ -94,6 +95,7 @@ pub fn run() {
         .manage(CompareCache::default())
         .manage(crate::archive::ArchiveCache::default())
         .manage(crate::cluster::ClusterCache::default())
+        .manage(crate::semantic::SemanticCache::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -171,6 +173,11 @@ pub fn run() {
             commands::get_cluster_report,
             commands::start_cluster_scan,
             commands::apply_value_clusters,
+            commands::get_semantic_report,
+            commands::start_semantic_scan,
+            commands::apply_semantic_filter,
+            commands::preview_semantic_action,
+            commands::apply_semantic_action,
             commands::start_compare,
             commands::get_compare_info,
             commands::get_compare_results,
