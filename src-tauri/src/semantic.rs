@@ -315,9 +315,9 @@ fn url_host(value: &str) -> Option<String> {
     let rest = value.trim().split("://").nth(1)?;
     let host = rest.split(['/', '?', '#']).next()?;
     let host = host.split('@').next_back()?; // strip userinfo
-    // Bracketed IPv6 literals ("[2001:db8::1]:8080") contain colons inside
-    // the address, so the bracket pair is the host — only strip a port
-    // AFTER the closing bracket.
+                                             // Bracketed IPv6 literals ("[2001:db8::1]:8080") contain colons inside
+                                             // the address, so the bracket pair is the host — only strip a port
+                                             // AFTER the closing bracket.
     let host = if let Some(v6) = host.strip_prefix('[') {
         let end = v6.find(']')?;
         &v6[..end]
