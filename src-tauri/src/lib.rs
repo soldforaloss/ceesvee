@@ -27,6 +27,7 @@ mod parse;
 mod paste;
 mod profile;
 mod reopen;
+mod repair;
 mod save;
 mod semantic;
 mod settings;
@@ -183,6 +184,8 @@ pub fn run() {
             commands::get_crossval_report,
             commands::start_crossval_scan,
             commands::apply_crossval_filter,
+            commands::preview_repair,
+            commands::apply_repair,
             commands::start_compare,
             commands::get_compare_info,
             commands::get_compare_results,

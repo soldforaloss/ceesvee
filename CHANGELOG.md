@@ -8,6 +8,18 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Missing-value repair** (palette → "Repair missing values…"): controlled
+  fills and removals from a closed set — normalize null tokens (NA, N/A,
+  null, …) to true blanks, constant fill, forward/backward fill with
+  optional grouping columns (a fill never crosses a group boundary),
+  mean/median/mode fill (ties → lexicographically smallest, invalid
+  numerics ignored but counted), linear interpolation that never
+  extrapolates unless enabled, and row/column removal above a
+  missing-value threshold with explicit confirmation. Scopes to all,
+  visible, or selected rows and chosen columns — hidden rows are never
+  modified. Every operation previews affected counts, computed fill
+  values, and before/after examples first, applies as ONE undo step, and
+  undo restores the exact original representations, null tokens included.
 - **Cross-column validation** (palette → "Validate across columns…"):
   relational rules BETWEEN columns from a closed, validated set — equals /
   differs, typed numeric comparison, typed date order, conditional required

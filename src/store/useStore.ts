@@ -78,7 +78,8 @@ export type ModalName =
   | "pasteSpecial"
   | "cluster"
   | "semantic"
-  | "crossval";
+  | "crossval"
+  | "repair";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },

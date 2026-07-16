@@ -32,6 +32,7 @@ use crate::parse::{parse, ParseSettings, ParsedFile};
 use crate::paste::{self, PasteOptions, PastePreview};
 use crate::profile::{self, ColumnProfile, ProfileCache, ProfileOptions, ProfileScope};
 use crate::reopen::{self, CurrentInterpretation};
+use crate::repair::{self, RepairPreview, RepairSpec};
 use crate::semantic::{
     self, SemanticAction, SemanticActionPreview, SemanticCache, SemanticReport, SemanticType,
 };
@@ -943,6 +944,57 @@ pub async fn apply_crossval_filter(
         let mut doc = handle.write().map_err(poisoned)?;
         doc.check_revision(expected_revision)?;
         doc.set_filter(rows);
+        Ok(doc.meta())
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+// ----- missing-value repair (F29) --------------------------------------------
+
+/// Preview exactly what a repair would do — affected cells, removals, the
+/// computed fill values, and leading before/after examples. Never mutates.
+#[tauri::command]
+pub async fn preview_repair(
+    doc_id: u64,
+    spec: RepairSpec,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<RepairPreview> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.ensure_editable()?;
+        doc.check_revision(expected_revision)?;
+        Ok(repair::compute(&doc, &spec)?.preview)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Apply a previewed repair as ONE undoable operation, guarded by the
+/// preview's revision. Cell fills commit via `set_cells`; the removal
+/// operations delete whole rows/columns (explicitly confirmed in the UI).
+#[tauri::command]
+pub async fn apply_repair(
+    doc_id: u64,
+    spec: RepairSpec,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut doc = handle.write().map_err(poisoned)?;
+        doc.ensure_editable()?;
+        doc.check_revision(expected_revision)?;
+        let computed = repair::compute(&doc, &spec)?;
+        if !computed.remove_rows.is_empty() {
+            doc.delete_rows(computed.remove_rows)?;
+        } else if !computed.remove_columns.is_empty() {
+            doc.delete_columns(computed.remove_columns)?;
+        } else {
+            doc.set_cells(computed.changes)?;
+        }
         Ok(doc.meta())
     })
     .await

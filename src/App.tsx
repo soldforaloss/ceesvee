@@ -27,6 +27,7 @@ import { ProfileSuggestionBar } from "./components/ProfileSuggestionBar";
 import { OpenModeDialog } from "./components/OpenModeDialog";
 import { QuitDialog } from "./components/QuitDialog";
 import { ReopenDialog } from "./components/ReopenDialog";
+import { RepairDialog } from "./components/RepairDialog";
 import { SemanticDialog } from "./components/SemanticDialog";
 import { ShortcutsDialog } from "./components/ShortcutsDialog";
 import { SortDialog } from "./components/SortDialog";
@@ -267,6 +268,7 @@ export default function App() {
       {activeModal === "cluster" && <ClusterDialog onClose={() => setModal(null)} />}
       {activeModal === "semantic" && <SemanticDialog onClose={() => setModal(null)} />}
       {activeModal === "crossval" && <CrossValDialog onClose={() => setModal(null)} />}
+      {activeModal === "repair" && <RepairDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       <CommandPalette />
       <CellEditorDialog />
