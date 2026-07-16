@@ -1,13 +1,23 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
+import { buildSplit, scopeChoices, scopeKey } from "../lib/export";
 import { DELIMITER_OPTIONS, ENCODING_OPTIONS } from "../lib/labels";
+import * as api from "../lib/tauri";
 import { useActiveMeta, useStore } from "../store/useStore";
-import type { ExportOptions } from "../types";
+import type { ExportOptions, ScopeCounts, SplitOptions } from "../types";
 import { Modal } from "./Modal";
 
+/**
+ * Scoped/split export (F04). Exports never touch the document's save point —
+ * Ctrl+S / Save As always write the complete document through the save path.
+ */
 export function ExportDialog({ onClose }: { onClose: () => void }) {
   const meta = useActiveMeta();
-  const saveActive = useStore((s) => s.saveActive);
+  const exportScoped = useStore((s) => s.exportScoped);
+  const filtered = useStore((s) => s.tabs.find((t) => t.id === s.activeId)?.filtered ?? false);
+  const selectionRect = useStore((s) => s.selectionRect);
+  const selectedRows = useStore((s) => s.selectedRows);
+  const selectedCols = useStore((s) => s.selectedCols);
 
   const [opts, setOpts] = useState<ExportOptions>(() => ({
     delimiter: meta?.delimiter ?? ",",
@@ -21,18 +31,55 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
     backup: "none",
   }));
 
+  const choices = useMemo(
+    () => scopeChoices(filtered, selectionRect, selectedRows, selectedCols),
+    [filtered, selectionRect, selectedRows, selectedCols],
+  );
+  const [scopeIdx, setScopeIdx] = useState(0);
+  const scope = (choices[scopeIdx] ?? choices[0]).scope;
+
+  const [splitKind, setSplitKind] = useState<SplitOptions["type"]>("none");
+  const [rowsPerFile, setRowsPerFile] = useState(100_000);
+  const [maxMegabytes, setMaxMegabytes] = useState(50);
+  const [groupColumn, setGroupColumn] = useState(0);
+  const [writeManifest, setWriteManifest] = useState(false);
+
+  const [counts, setCounts] = useState<ScopeCounts | null>(null);
+
+  // Show the expected shape for the chosen scope before anything is written.
+  useEffect(() => {
+    if (!meta) return;
+    let stale = false;
+    setCounts(null);
+    api
+      .exportScopeCounts(meta.id, scope)
+      .then((c) => {
+        if (!stale) setCounts(c);
+      })
+      .catch(() => undefined);
+    return () => {
+      stale = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meta?.id, meta?.revision, scopeKey(scope), scopeIdx]);
+
   if (!meta) return null;
   const patch = (p: Partial<ExportOptions>) => setOpts((o) => ({ ...o, ...p }));
 
-  const save = () => {
-    void saveActive(true, opts);
+  const split = buildSplit(splitKind, rowsPerFile, maxMegabytes, groupColumn);
+  const splitError = "error" in split ? split.error : null;
+
+  const doExport = () => {
+    if ("error" in split) return;
+    void exportScoped(opts, scope, split, writeManifest);
     onClose();
   };
 
   return (
     <Modal
-      title="Export / Save As"
+      title="Export"
       onClose={onClose}
+      size="lg"
       footer={
         <>
           <button
@@ -42,21 +89,98 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
             Cancel
           </button>
           <button
-            onClick={save}
-            className="rounded bg-violet-600 px-3 py-1.5 text-sm text-white hover:bg-violet-500"
+            onClick={doExport}
+            disabled={splitError !== null}
+            className="rounded bg-violet-600 px-3 py-1.5 text-sm text-white hover:bg-violet-500 disabled:opacity-40"
           >
-            Choose file & save
+            Choose file & export
           </button>
         </>
       }
     >
       <div className="space-y-3 text-sm">
-        {meta.filtered && (
-          <p className="rounded bg-violet-50 px-2 py-1.5 text-xs text-violet-700 dark:bg-violet-500/10 dark:text-violet-300">
-            A filter is active — all {meta.totalRowCount.toLocaleString()} rows will be written. The
-            filter only changes the on-screen view, not what is saved.
-          </p>
+        <Row label="Rows to export">
+          <select
+            value={scopeIdx}
+            onChange={(e) => setScopeIdx(Number(e.target.value))}
+            className={selectCls}
+          >
+            {choices.map((c, i) => (
+              <option key={c.label} value={i} className="dark:bg-zinc-800">
+                {c.label}
+              </option>
+            ))}
+          </select>
+        </Row>
+
+        <p className="rounded bg-zinc-50 px-2 py-1.5 text-xs tabular-nums text-zinc-600 dark:bg-zinc-900 dark:text-zinc-300">
+          {counts
+            ? `Will write ${counts.rows.toLocaleString()} data row${counts.rows === 1 ? "" : "s"} × ${counts.cols} column${counts.cols === 1 ? "" : "s"}`
+            : "Counting…"}
+        </p>
+
+        <Row label="Split output">
+          <select
+            value={splitKind}
+            onChange={(e) => setSplitKind(e.target.value as SplitOptions["type"])}
+            className={selectCls}
+          >
+            <option value="none" className="dark:bg-zinc-800">
+              Single file
+            </option>
+            <option value="maxRows" className="dark:bg-zinc-800">
+              Max rows per file
+            </option>
+            <option value="approximateBytes" className="dark:bg-zinc-800">
+              Approximate size per file
+            </option>
+            <option value="groupByColumn" className="dark:bg-zinc-800">
+              One file per value of…
+            </option>
+          </select>
+        </Row>
+
+        {splitKind === "maxRows" && (
+          <Row label="Rows per file">
+            <input
+              type="number"
+              min={1}
+              value={rowsPerFile}
+              onChange={(e) => setRowsPerFile(Number(e.target.value))}
+              className={inputCls}
+            />
+          </Row>
         )}
+        {splitKind === "approximateBytes" && (
+          <Row label="MB per file">
+            <input
+              type="number"
+              min={1}
+              value={maxMegabytes}
+              onChange={(e) => setMaxMegabytes(Number(e.target.value))}
+              className={inputCls}
+            />
+          </Row>
+        )}
+        {splitKind === "groupByColumn" && (
+          <Row label="Group column">
+            <select
+              value={groupColumn}
+              onChange={(e) => setGroupColumn(Number(e.target.value))}
+              className={selectCls}
+            >
+              {meta.headers.map((h, i) => (
+                <option key={i} value={i} className="dark:bg-zinc-800">
+                  {h.trim() || `Column ${i + 1}`}
+                </option>
+              ))}
+            </select>
+          </Row>
+        )}
+        {splitError && <p className="text-xs text-red-600 dark:text-red-400">{splitError}</p>}
+
+        <hr className="border-zinc-100 dark:border-zinc-800" />
+
         <Row label="Delimiter">
           <select
             value={
@@ -116,37 +240,49 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
           />
         </Row>
 
-        <label className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            checked={opts.bom}
-            onChange={(e) => patch({ bom: e.target.checked })}
-            className="accent-violet-600"
-          />
-          Write byte-order mark (BOM)
-        </label>
-
-        {meta.hasHeaderRow && (
+        <div className="flex flex-wrap gap-x-5 gap-y-2">
           <label className="flex items-center gap-2">
             <input
               type="checkbox"
-              checked={opts.includeHeaders}
-              onChange={(e) => patch({ includeHeaders: e.target.checked })}
+              checked={opts.bom}
+              onChange={(e) => patch({ bom: e.target.checked })}
               className="accent-violet-600"
             />
-            Include header row
+            Write BOM
           </label>
-        )}
 
-        <label className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            checked={opts.backup === "single"}
-            onChange={(e) => patch({ backup: e.target.checked ? "single" : "none" })}
-            className="accent-violet-600"
-          />
-          Keep a .bak copy of the previous file
-        </label>
+          {meta.hasHeaderRow && (
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={opts.includeHeaders}
+                onChange={(e) => patch({ includeHeaders: e.target.checked })}
+                className="accent-violet-600"
+              />
+              Include header row
+            </label>
+          )}
+
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={opts.backup === "single"}
+              onChange={(e) => patch({ backup: e.target.checked ? "single" : "none" })}
+              className="accent-violet-600"
+            />
+            Keep .bak of replaced files
+          </label>
+
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={writeManifest}
+              onChange={(e) => setWriteManifest(e.target.checked)}
+              className="accent-violet-600"
+            />
+            Write JSON manifest (row counts + SHA-256)
+          </label>
+        </div>
       </div>
     </Modal>
   );
@@ -154,6 +290,8 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
 
 const selectCls =
   "rounded border border-zinc-300 bg-transparent px-2 py-1 text-sm outline-none focus:border-violet-500 dark:border-zinc-700";
+const inputCls =
+  "w-32 rounded border border-zinc-300 bg-transparent px-2 py-1 text-right text-sm tabular-nums outline-none focus:border-violet-500 dark:border-zinc-700";
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (

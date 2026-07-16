@@ -69,7 +69,7 @@ pub struct SortKey {
 }
 
 /// A rectangular cell region (used to scope find/replace to a selection).
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CellRect {
     pub x: usize,
@@ -310,6 +310,91 @@ pub struct ExportOptions {
 
 fn default_true() -> bool {
     true
+}
+
+/// Which slice of the document an export writes (F04). Row/column/rect
+/// coordinates arrive in DISPLAY space (what the user sees under the active
+/// filter) and are resolved to absolute indices at export time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ExportScope {
+    All,
+    VisibleRows,
+    SelectedRows { rows: Vec<usize> },
+    SelectedColumns { columns: Vec<usize> },
+    SelectedRange { rect: CellRect },
+}
+
+/// How to split an export across multiple output files (F04).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SplitOptions {
+    None,
+    MaxRows { rows_per_file: usize },
+    ApproximateBytes { max_bytes: u64 },
+    GroupByColumn { column: usize },
+}
+
+/// Expected shape of a scoped export, shown before writing anything.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopeCounts {
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// One output file recorded in an export manifest.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestOutput {
+    pub file_name: String,
+    pub rows: usize,
+    pub sha256: String,
+}
+
+/// Optional JSON manifest written next to a scoped export (F04).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportManifest {
+    pub source_file_name: Option<String>,
+    pub source_fingerprint: Option<FileFingerprint>,
+    pub scope: ExportScope,
+    pub split: SplitOptions,
+    pub options: ExportOptionsEcho,
+    pub outputs: Vec<ManifestOutput>,
+}
+
+/// Serialization settings echoed into the manifest.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportOptionsEcho {
+    pub delimiter: String,
+    pub encoding: String,
+    pub quote_style: String,
+    pub line_ending: String,
+    pub bom: bool,
+    pub include_headers: bool,
+}
+
+impl From<&ExportOptions> for ExportOptionsEcho {
+    fn from(o: &ExportOptions) -> Self {
+        ExportOptionsEcho {
+            delimiter: o.delimiter.clone(),
+            encoding: o.encoding.clone(),
+            quote_style: o.quote_style.clone(),
+            line_ending: o.line_ending.clone(),
+            bom: o.bom,
+            include_headers: o.include_headers,
+        }
+    }
 }
 
 /// One cell (or header) whose text cannot be represented in a target encoding.

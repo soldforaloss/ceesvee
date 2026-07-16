@@ -260,6 +260,30 @@ export interface ExportOptions {
   backup?: BackupPolicy;
 }
 
+/**
+ * Which slice of the document an export writes (F04). Row/rect coordinates
+ * are display-space (what the user sees under the active filter).
+ */
+export type ExportScope =
+  | { type: "all" }
+  | { type: "visibleRows" }
+  | { type: "selectedRows"; rows: number[] }
+  | { type: "selectedColumns"; columns: number[] }
+  | { type: "selectedRange"; rect: CellRect };
+
+/** How to split an export across multiple output files (F04). */
+export type SplitOptions =
+  | { type: "none" }
+  | { type: "maxRows"; rowsPerFile: number }
+  | { type: "approximateBytes"; maxBytes: number }
+  | { type: "groupByColumn"; column: number };
+
+/** Expected shape of a scoped export, shown before writing anything. */
+export interface ScopeCounts {
+  rows: number;
+  cols: number;
+}
+
 /** One cell (or header) that a target encoding cannot represent. */
 export interface EncodingIncompatibility {
   /** Data-row index; null for a header cell. */

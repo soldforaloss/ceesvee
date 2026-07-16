@@ -21,10 +21,36 @@ use crate::{encoding, util};
 /// Drain the staging buffer to the sink once it grows past this.
 const FLUSH_THRESHOLD: usize = 64 * 1024;
 
-/// Stream `doc` into `out` using `opts`. Returns the total bytes written.
-/// Progress (rows + bytes) and cancellation flow through `ctx` when given.
+/// Stream the whole of `doc` into `out` using `opts`. Returns the total bytes
+/// written. Progress (rows + bytes) and cancellation flow through `ctx`.
 pub fn write_document<W: Write>(
     doc: &Document,
+    opts: &ExportOptions,
+    out: &mut W,
+    ctx: Option<&JobCtx>,
+) -> AppResult<u64> {
+    let cols: Vec<usize> = (0..doc.n_cols()).collect();
+    write_rows(doc, 0..doc.n_rows(), &cols, opts, out, ctx)
+}
+
+/// Stream a row/column subset of `doc` (F04 scoped exports). `rows` are
+/// absolute row indices and `cols` column indices, both in output order;
+/// callers are responsible for range-validating them.
+pub fn write_view<W: Write>(
+    doc: &Document,
+    rows: &[usize],
+    cols: &[usize],
+    opts: &ExportOptions,
+    out: &mut W,
+    ctx: Option<&JobCtx>,
+) -> AppResult<u64> {
+    write_rows(doc, rows.iter().copied(), cols, opts, out, ctx)
+}
+
+fn write_rows<W: Write>(
+    doc: &Document,
+    row_indices: impl Iterator<Item = usize>,
+    cols: &[usize],
     opts: &ExportOptions,
     out: &mut W,
     ctx: Option<&JobCtx>,
@@ -68,18 +94,21 @@ pub fn write_document<W: Write>(
 
     let mut writer = make_writer(Vec::with_capacity(FLUSH_THRESHOLD + 8 * 1024));
     if doc.has_header_row() && opts.include_headers {
-        writer.write_record(doc.headers())?;
+        let headers = doc.headers();
+        writer.write_record(cols.iter().map(|&c| headers[c].as_bytes()))?;
     }
 
     // Rough size of what's been fed to the writer since the last drain; used
     // to decide when to rotate (the csv writer hides its inner buffer).
     let mut estimated = 0usize;
     let mut pending_rows = 0u64;
+    let all_rows = doc.rows();
 
-    for row in doc.rows() {
-        writer.write_record(row)?;
+    for r in row_indices {
+        let row = &all_rows[r];
+        writer.write_record(cols.iter().map(|&c| row[c].as_bytes()))?;
         pending_rows += 1;
-        estimated += row.iter().map(String::len).sum::<usize>() + row.len() + 2;
+        estimated += cols.iter().map(|&c| row[c].len()).sum::<usize>() + cols.len() + 2;
 
         if estimated >= FLUSH_THRESHOLD {
             writer.flush()?;

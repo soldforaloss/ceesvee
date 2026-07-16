@@ -7,7 +7,7 @@
 //! others. Long scans/exports go through [`crate::job`] for progress and
 //! cancellation instead of holding any lock across the whole operation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use tauri::State;
@@ -16,15 +16,18 @@ use crate::diagnostics::{self, DiagnosticsCache, DiagnosticsReport};
 use crate::document::Document;
 use crate::dto::{
     CellRect, ColumnSummary, DocumentMeta, EncodingCompatibility, EncodingIncompatibility,
-    ExportOptions, ExternalChange, FileFingerprint, FilterGroup, FindMatch, FindOptions,
-    OpenOptions, ReparsePreview, ReplaceResult, RowsResponse, SelectionStats, SortKey,
+    ExportOptions, ExportScope, ExternalChange, FileFingerprint, FilterGroup, FindMatch,
+    FindOptions, OpenOptions, ReparsePreview, ReplaceResult, RowsResponse, ScopeCounts,
+    SelectionStats, SortKey, SplitOptions,
 };
 use crate::error::{AppError, AppResult};
 use crate::job::JobRegistry;
 use crate::parse::{parse, ParseSettings, ParsedFile};
 use crate::reopen::{self, CurrentInterpretation};
 use crate::state::{AppState, PendingFiles, SharedDocument};
-use crate::{encoding, export, filter as filter_mod, find as find_mod, save as save_mod, util};
+use crate::{
+    encoding, export, export_scope, filter as filter_mod, find as find_mod, save as save_mod, util,
+};
 
 type Db<'a> = State<'a, Mutex<AppState>>;
 
@@ -615,10 +618,12 @@ pub fn redo(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
 
 /// Scan for characters the target encoding cannot represent, so the UI can
 /// block a lossy export up front (nothing is ever substituted silently).
+/// `scope` limits the scan to what will actually be written (default: all).
 #[tauri::command]
 pub async fn check_encoding_compatibility(
     doc_id: u64,
     encoding: String,
+    scope: Option<ExportScope>,
     state: Db<'_>,
 ) -> AppResult<EncodingCompatibility> {
     const SAMPLE_LIMIT: usize = 100;
@@ -626,6 +631,7 @@ pub async fn check_encoding_compatibility(
     tauri::async_runtime::spawn_blocking(move || {
         let doc = handle.read().map_err(poisoned)?;
         let target = encoding::from_name(&encoding);
+        let resolved = export_scope::resolve_scope(&doc, &scope.unwrap_or(ExportScope::All))?;
         let mut affected = 0usize;
         let mut samples = Vec::new();
         let mut record = |row: Option<usize>, col: usize, value: &str| {
@@ -639,16 +645,18 @@ pub async fn check_encoding_compatibility(
             }
         };
         if doc.has_header_row() {
-            for (col, header) in doc.headers().iter().enumerate() {
-                if encoding::has_unmappable(header, target) {
-                    record(None, col, header);
+            let headers = doc.headers();
+            for &col in &resolved.cols {
+                if encoding::has_unmappable(&headers[col], target) {
+                    record(None, col, &headers[col]);
                 }
             }
         }
-        for (r, row) in doc.rows().iter().enumerate() {
-            for (c, cell) in row.iter().enumerate() {
-                if encoding::has_unmappable(cell, target) {
-                    record(Some(r), c, cell);
+        let rows = doc.rows();
+        for &r in &resolved.rows {
+            for &c in &resolved.cols {
+                if encoding::has_unmappable(&rows[r][c], target) {
+                    record(Some(r), c, &rows[r][c]);
                 }
             }
         }
@@ -663,62 +671,28 @@ pub async fn check_encoding_compatibility(
     .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
 }
 
-/// Start an atomic streaming save. Returns the job id; progress (rows +
-/// bytes) streams over the shared job events, and `get_meta` reflects the
-/// saved state once the job finishes. Guarded by `expected_revision`.
+/// The row/column counts a scoped export would write, for the export dialog.
+#[tauri::command]
+pub fn export_scope_counts(
+    doc_id: u64,
+    scope: ExportScope,
+    state: Db<'_>,
+) -> AppResult<ScopeCounts> {
+    read_doc(&state, doc_id, |doc| {
+        export_scope::scope_counts(doc, &scope)
+    })
+}
+
+/// Start an atomic streaming save of the COMPLETE document (Ctrl+S always
+/// writes everything). Returns the job id; progress (rows + bytes) streams
+/// over the shared job events, and `get_meta` reflects the saved state once
+/// the job finishes. Guarded by `expected_revision`.
 #[tauri::command]
 pub async fn start_save(
     doc_id: u64,
     path: String,
     options: ExportOptions,
     expected_revision: u64,
-    app: tauri::AppHandle,
-    state: Db<'_>,
-    jobs: State<'_, JobRegistry>,
-) -> AppResult<u64> {
-    start_write_job(
-        doc_id,
-        path,
-        options,
-        expected_revision,
-        true,
-        app,
-        state,
-        jobs,
-    )
-}
-
-/// Start an atomic streaming export: identical pipeline to `start_save`, but
-/// the document's save point, path and fingerprint are left untouched.
-#[tauri::command]
-pub async fn start_export(
-    doc_id: u64,
-    path: String,
-    options: ExportOptions,
-    expected_revision: u64,
-    app: tauri::AppHandle,
-    state: Db<'_>,
-    jobs: State<'_, JobRegistry>,
-) -> AppResult<u64> {
-    start_write_job(
-        doc_id,
-        path,
-        options,
-        expected_revision,
-        false,
-        app,
-        state,
-        jobs,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn start_write_job(
-    doc_id: u64,
-    path: String,
-    options: ExportOptions,
-    expected_revision: u64,
-    is_save: bool,
     app: tauri::AppHandle,
     state: Db<'_>,
     jobs: State<'_, JobRegistry>,
@@ -730,8 +704,7 @@ fn start_write_job(
         doc.check_revision(expected_revision)?;
     }
 
-    let kind = if is_save { "save" } else { "export" };
-    let ctx = jobs.begin_for_app(&app, kind, Some(doc_id));
+    let ctx = jobs.begin_for_app(&app, "save", Some(doc_id));
     let job_id = ctx.id;
     tauri::async_runtime::spawn(async move {
         let _ = crate::job::run_blocking(ctx, move |ctx| {
@@ -746,22 +719,68 @@ fn start_write_job(
                 // Read lock is dropped here, before taking the write lock.
             }
 
-            if is_save {
-                let fingerprint = util::stat_fingerprint(&dest);
-                let mut doc = handle.write().map_err(poisoned)?;
-                if doc.check_revision(expected_revision).is_ok() {
-                    // Nothing changed while streaming: the file matches the
-                    // document, so record the save point and new baseline.
-                    doc.mark_saved(Some(dest));
-                    doc.set_fingerprint(fingerprint);
-                } else if doc.path.as_deref() == Some(dest.as_path()) {
-                    // An edit raced the save: the file holds the pre-edit
-                    // snapshot, so the document stays dirty — but the file on
-                    // disk is still ours, so refresh the external-change
-                    // baseline.
-                    doc.set_fingerprint(fingerprint);
-                }
+            let fingerprint = util::stat_fingerprint(&dest);
+            let mut doc = handle.write().map_err(poisoned)?;
+            if doc.check_revision(expected_revision).is_ok() {
+                // Nothing changed while streaming: the file matches the
+                // document, so record the save point and new baseline.
+                doc.mark_saved(Some(dest));
+                doc.set_fingerprint(fingerprint);
+            } else if doc.path.as_deref() == Some(dest.as_path()) {
+                // An edit raced the save: the file holds the pre-edit
+                // snapshot, so the document stays dirty — but the file on
+                // disk is still ours, so refresh the external-change
+                // baseline.
+                doc.set_fingerprint(fingerprint);
             }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// Start a scoped, optionally split, atomic streaming export (F04). Writes
+/// the requested slice to one or more files (plus an optional manifest) and
+/// never touches the document's save point, path, or fingerprint.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn start_export(
+    doc_id: u64,
+    path: String,
+    options: ExportOptions,
+    scope: ExportScope,
+    split: SplitOptions,
+    write_manifest: bool,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+        // Validate the scope up front so obvious mistakes fail the invoke
+        // instead of a background job.
+        export_scope::resolve_scope(&doc, &scope)?;
+    }
+
+    let ctx = jobs.begin_for_app(&app, "export", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            export_scope::run_export(
+                &doc,
+                Path::new(&path),
+                &options,
+                &scope,
+                &split,
+                write_manifest,
+                ctx,
+            )?;
             Ok(())
         })
         .await;

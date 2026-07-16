@@ -13,6 +13,7 @@ import type {
   DocumentMeta,
   EncodingCompatibility,
   ExportOptions,
+  ExportScope,
   ExternalChange,
   FilterGroup,
   FindMatch,
@@ -22,6 +23,7 @@ import type {
   OpenOptions,
   ReparsePreview,
   SortKey,
+  SplitOptions,
 } from "../types";
 
 export type ThemePref = "light" | "dark" | "system";
@@ -144,12 +146,16 @@ export interface FileJobState {
   part: number | null;
 }
 
-/** A blocked lossy save awaiting the user's encoding decision. */
+/** A blocked lossy save/export awaiting the user's encoding decision. */
 export interface EncodingIssuesPrompt {
   docId: number;
   path: string;
   options: ExportOptions;
   compat: EncodingCompatibility;
+  /** What to re-run once the user picks a workable encoding. */
+  action:
+    | { type: "save" }
+    | { type: "export"; scope: ExportScope; split: SplitOptions; writeManifest: boolean };
 }
 
 // Resolvers for in-flight save/export jobs, keyed by job id. Module-level:
@@ -244,10 +250,17 @@ interface Store {
   setQuitPromptOpen: (open: boolean) => void;
   confirmQuit: (mode: "save" | "discard") => Promise<void>;
 
-  // save / export pipeline (F03)
+  // save / export pipeline (F03/F04)
   /** Resolve a blocked lossy save: retry with another encoding, or cancel. */
   resolveEncodingIssues: (retryEncoding: string | null) => Promise<void>;
   cancelFileJob: (jobId: number) => Promise<void>;
+  /** Scoped/split export of the active document (F04). Prompts for a path. */
+  exportScoped: (
+    options: ExportOptions,
+    scope: ExportScope,
+    split: SplitOptions,
+    writeManifest: boolean,
+  ) => Promise<void>;
 
   // editing
   setCell: (row: number, col: number, value: string) => Promise<void>;
@@ -426,7 +439,9 @@ export const useStore = create<Store>((set, get) => {
       try {
         const compat = await api.checkEncodingCompatibility(id, options.encoding);
         if (!compat.compatible) {
-          set({ encodingIssues: { docId: id, path, options, compat } });
+          set({
+            encodingIssues: { docId: id, path, options, compat, action: { type: "save" } },
+          });
           return false;
         }
       } catch (e) {
@@ -436,6 +451,38 @@ export const useStore = create<Store>((set, get) => {
     }
 
     return runSaveJob(id, path, options);
+  };
+
+  /** Run one scoped export job to completion (F04). */
+  const runExportJob = async (
+    id: number,
+    path: string,
+    options: ExportOptions,
+    scope: ExportScope,
+    split: SplitOptions,
+    writeManifest: boolean,
+  ): Promise<boolean> => {
+    const meta = get().tabs.find((t) => t.id === id);
+    if (!meta) return false;
+    try {
+      const jobId = await api.startExport(
+        id,
+        path,
+        options,
+        scope,
+        split,
+        writeManifest,
+        meta.revision,
+      );
+      const finished = await awaitJob(jobId);
+      if (finished.status === "failed") {
+        set({ error: finished.error ?? "export failed" });
+      }
+      return finished.status === "done";
+    } catch (e) {
+      set({ error: String(e) });
+      return false;
+    }
   };
 
   return {
@@ -1069,10 +1116,11 @@ export const useStore = create<Store>((set, get) => {
       set({ encodingIssues: null });
       if (!prompt || retryEncoding === null) return;
       const options: ExportOptions = { ...prompt.options, encoding: retryEncoding };
+      const scope = prompt.action.type === "export" ? prompt.action.scope : undefined;
       // Re-run the gate for the new encoding (a no-op for Unicode targets).
       if (isLegacyEncoding(retryEncoding)) {
         try {
-          const compat = await api.checkEncodingCompatibility(prompt.docId, retryEncoding);
+          const compat = await api.checkEncodingCompatibility(prompt.docId, retryEncoding, scope);
           if (!compat.compatible) {
             set({ encodingIssues: { ...prompt, options, compat } });
             return;
@@ -1082,11 +1130,50 @@ export const useStore = create<Store>((set, get) => {
           return;
         }
       }
-      await runSaveJob(prompt.docId, prompt.path, options);
+      if (prompt.action.type === "save") {
+        await runSaveJob(prompt.docId, prompt.path, options);
+      } else {
+        const { scope: s, split, writeManifest } = prompt.action;
+        await runExportJob(prompt.docId, prompt.path, options, s, split, writeManifest);
+      }
     },
 
     cancelFileJob: async (jobId) => {
       await api.cancelJob(jobId).catch(() => undefined);
+    },
+
+    exportScoped: async (options, scope, split, writeManifest) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const chosen = await saveFileDialog({
+        defaultPath: meta.fileName,
+        filters: FILE_FILTERS,
+      });
+      if (!chosen) return;
+
+      // Gate lossy encodings against exactly the cells this export writes.
+      if (isLegacyEncoding(options.encoding)) {
+        try {
+          const compat = await api.checkEncodingCompatibility(meta.id, options.encoding, scope);
+          if (!compat.compatible) {
+            set({
+              encodingIssues: {
+                docId: meta.id,
+                path: chosen,
+                options,
+                compat,
+                action: { type: "export", scope, split, writeManifest },
+              },
+            });
+            return;
+          }
+        } catch (e) {
+          set({ error: String(e) });
+          return;
+        }
+      }
+
+      await runExportJob(meta.id, chosen, options, scope, split, writeManifest);
     },
   };
 });

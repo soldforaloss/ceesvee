@@ -38,6 +38,8 @@ regex = "1"
 thiserror = "2"
 # Crash-safe saves: staging file in the destination directory + atomic rename.
 tempfile = "3"
+# Export manifests carry a SHA-256 per output file.
+sha2 = "0.10"
 
 # Single-instance is desktop-only: it forwards a second "Open with" launch
 # (and its file argument) to the already-running window instead of spawning a
