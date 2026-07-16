@@ -23,6 +23,7 @@ import { FilterDialog } from "./components/FilterDialog";
 import { FindBar } from "./components/FindBar";
 import { Grid } from "./components/Grid";
 import { Close } from "./components/Icons";
+import { JoinDialog } from "./components/JoinDialog";
 import { ProfilesDialog } from "./components/ProfilesDialog";
 import { ProfileSuggestionBar } from "./components/ProfileSuggestionBar";
 import { OpenModeDialog } from "./components/OpenModeDialog";
@@ -273,6 +274,7 @@ export default function App() {
       {activeModal === "repair" && <RepairDialog onClose={() => setModal(null)} />}
       {activeModal === "outlier" && <OutlierDialog onClose={() => setModal(null)} />}
       {activeModal === "append" && <AppendDialog onClose={() => setModal(null)} />}
+      {activeModal === "join" && <JoinDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       <CommandPalette />
       <CellEditorDialog />

@@ -29,6 +29,7 @@ use crate::dto::{
 };
 use crate::error::{AppError, AppResult};
 use crate::job::JobRegistry;
+use crate::joins::{self, JoinPreview, JoinSpec};
 use crate::outlier::{
     self, CachedOutlier, OutlierAction, OutlierActionPreview, OutlierCache, OutlierSpec,
 };
@@ -1224,6 +1225,76 @@ pub fn get_append_report(
     append_cache: State<'_, AppendCache>,
 ) -> Option<AppendReport> {
     append_cache.get(doc_id)
+}
+
+// ----- relational joins (F21) --------------------------------------------------
+
+/// Cardinality preview of a join — match/unmatched/duplicate-key counts and
+/// the projected output size. Nothing is created.
+#[tauri::command]
+pub async fn preview_join(
+    left_doc: u64,
+    right_doc: u64,
+    spec: JoinSpec,
+    left_revision: u64,
+    right_revision: u64,
+    state: Db<'_>,
+) -> AppResult<JoinPreview> {
+    let left = doc_handle(&state, left_doc)?;
+    let right = doc_handle(&state, right_doc)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let left = left.read().map_err(poisoned)?;
+        let right = right.read().map_err(poisoned)?;
+        left.check_revision(left_revision)?;
+        right.check_revision(right_revision)?;
+        joins::preview(&left, &right, &spec)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Run a join as a cancellable "derive" job (F21). The NEW document
+/// registers under the returned doc id; both sources stay untouched.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn start_join(
+    left_doc: u64,
+    right_doc: u64,
+    spec: JoinSpec,
+    left_revision: u64,
+    right_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<IndexedOpenStart> {
+    let left = doc_handle(&state, left_doc)?;
+    let right = doc_handle(&state, right_doc)?;
+    let doc_id = lock(&state)?.alloc_id();
+    let cache_root = index_cache_root(&app)?;
+
+    let ctx = jobs.begin_for_app(&app, "derive", Some(doc_id));
+    let job_id = ctx.id;
+    let app_for_job = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            use tauri::Manager;
+            let left = left.read().map_err(poisoned)?;
+            let right = right.read().map_err(poisoned)?;
+            left.check_revision(left_revision)?;
+            right.check_revision(right_revision)?;
+            let doc = joins::run(&left, &right, &spec, doc_id, cache_root, ctx)?;
+            drop(left);
+            drop(right);
+            let registry = app_for_job.state::<Mutex<AppState>>();
+            registry
+                .lock()
+                .map_err(|_| AppError::Other("internal state lock error".into()))?
+                .insert(doc);
+            Ok(())
+        })
+        .await;
+    });
+    Ok(IndexedOpenStart { job_id, doc_id })
 }
 
 #[tauri::command]
