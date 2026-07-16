@@ -268,6 +268,62 @@ export interface SemanticActionPreview {
   newColumn: string | null;
 }
 
+/** Numeric comparison operator for cross-column rules (F27). */
+export type CompareOp = "lt" | "le" | "gt" | "ge" | "eq" | "ne";
+
+/** Condition on the "when" column of a conditional-required rule (F27). */
+export type WhenCondition =
+  | { type: "equals"; value: string }
+  | { type: "nonBlank" }
+  | { type: "blank" };
+
+/** Cross-column validation rule (F27) — a closed set; columns by NAME. */
+export type CrossRule =
+  | { type: "columnsEqual"; left: string; right: string; negate?: boolean }
+  | { type: "numericCompare"; left: string; op: CompareOp; right: string }
+  | { type: "dateOrder"; earlier: string; later: string; allowEqual?: boolean }
+  | { type: "conditionalRequired"; whenColumn: string; when: WhenCondition; thenRequired: string }
+  | { type: "exactlyOne"; columns: string[] }
+  | { type: "atLeastOne"; columns: string[] }
+  | { type: "atMostOne"; columns: string[] }
+  | {
+      type: "sumEquals";
+      parts: string[];
+      total: string;
+      tolerance: number;
+      tolerancePercent?: boolean;
+    }
+  | { type: "allowedCombinations"; columns: string[]; allowed: string[][] };
+
+/** One sampled cross-validation violation (F27). */
+export interface CrossViolation {
+  /** Absolute row index. */
+  row: number;
+  /** [column name, value] for the rule's referenced columns. */
+  values: [string, string][];
+  reason: string;
+}
+
+/** Per-rule cross-validation outcome (F27). */
+export interface RuleViolations {
+  /** Index into the submitted rule list. */
+  rule: number;
+  description: string;
+  violations: number;
+  /** First violations (bounded sample). */
+  sample: CrossViolation[];
+}
+
+export interface CrossValReport {
+  revision: number;
+  scannedRows: number;
+  /** Sum across rules (a row can violate several). */
+  totalViolations: number;
+  /** Distinct rows violating at least one rule. */
+  violatingRows: number;
+  rules: RuleViolations[];
+}
+
 /** Copy As output format (F14). */
 export type CopyFormat =
   | { type: "tsv" }
@@ -699,6 +755,8 @@ export interface FileProfile {
    * they survive rescans. "freeText" forces plain text.
    */
   semanticTypes: [string, SemanticType][];
+  /** F27: cross-column validation rules (closed DTO set, columns by name). */
+  crossRules: CrossRule[];
 }
 
 /** The persisted settings document (versioned JSON in app-data). */

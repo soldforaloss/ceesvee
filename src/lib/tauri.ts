@@ -15,6 +15,8 @@ import type {
   ComparePage,
   CompareSpec,
   CopyFormat,
+  CrossRule,
+  CrossValReport,
   PastePreview,
   PasteSpecialOptions,
   DedupSpec,
@@ -217,6 +219,28 @@ export const applySemanticAction = (
     column,
     semantic,
     action,
+    expectedRevision,
+  });
+
+/** The last completed cross-validation report + the rules it ran (F27). */
+export const getCrossvalReport = (docId: number) =>
+  invoke<[CrossRule[], CrossValReport] | null>("get_crossval_report", { docId });
+
+/** Run cross-column rules as a cancellable job (F27). */
+export const startCrossvalScan = (docId: number, rules: CrossRule[], expectedRevision: number) =>
+  invoke<number>("start_crossval_scan", { docId, rules, expectedRevision });
+
+/** Filter to rows violating one rule (index) or any rule (null) (F27). */
+export const applyCrossvalFilter = (
+  docId: number,
+  rules: CrossRule[],
+  rule: number | null,
+  expectedRevision: number,
+) =>
+  invoke<DocumentMeta>("apply_crossval_filter", {
+    docId,
+    rules,
+    rule,
     expectedRevision,
   });
 

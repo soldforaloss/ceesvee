@@ -16,6 +16,7 @@ use crate::archive::{self, ArchiveCache, ZipEntryInfo};
 use crate::clipboard::{self, CopyFormat};
 use crate::cluster::{self, ClusterCache, ClusterReport, ClusterSpec};
 use crate::compare::{self, CompareCache, CompareInfo, ComparePage, CompareSpec, DiffStatus};
+use crate::crossval::{self, CrossRule, CrossValCache, CrossValReport};
 use crate::dedup::{self, DedupCache, DedupSpec, DuplicateKeepStrategy, DuplicateReport};
 use crate::diagnostics::{self, DiagnosticsCache, DiagnosticsReport};
 use crate::document::Document;
@@ -666,6 +667,7 @@ pub fn close_document(
     compare_cache: State<'_, CompareCache>,
     cluster_cache: State<'_, ClusterCache>,
     semantic_cache: State<'_, SemanticCache>,
+    crossval_cache: State<'_, CrossValCache>,
 ) -> AppResult<()> {
     lock(&state)?.remove(doc_id);
     diagnostics_cache.remove(doc_id);
@@ -674,6 +676,7 @@ pub fn close_document(
     compare_cache.remove_doc(doc_id);
     cluster_cache.remove(doc_id);
     semantic_cache.remove(doc_id);
+    crossval_cache.remove(doc_id);
     Ok(())
 }
 
@@ -867,6 +870,79 @@ pub async fn apply_semantic_action(
             }
             None => doc.set_cells(changes)?,
         }
+        Ok(doc.meta())
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+// ----- cross-column validation (F27) -----------------------------------------
+
+/// The last completed cross-validation report (with the rules it ran).
+#[tauri::command]
+pub fn get_crossval_report(
+    doc_id: u64,
+    crossval_cache: State<'_, CrossValCache>,
+) -> Option<(Vec<CrossRule>, CrossValReport)> {
+    crossval_cache.get(doc_id)
+}
+
+/// Run cross-column rules as a cancellable job (F27). Rule configurations
+/// are validated (shape + column resolution) before any row is read.
+#[tauri::command]
+pub async fn start_crossval_scan(
+    doc_id: u64,
+    rules: Vec<CrossRule>,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    crossval_cache: State<'_, CrossValCache>,
+) -> AppResult<u64> {
+    crossval::validate_rules(&rules)?;
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+    }
+    let sink = crossval_cache.share();
+    let ctx = jobs.begin_for_app(&app, "crossval", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            let report = crossval::scan(&doc, &rules, ctx)?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, (rules, report));
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// Filter the grid to rows violating one rule (`rule`) or any rule (None),
+/// guarded by the report's revision so stale results cannot be applied.
+#[tauri::command]
+pub async fn apply_crossval_filter(
+    doc_id: u64,
+    rules: Vec<CrossRule>,
+    rule: Option<usize>,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let rows = {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            crossval::violating_rows(&doc, &rules, rule)?
+        };
+        let mut doc = handle.write().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+        doc.set_filter(rows);
         Ok(doc.meta())
     })
     .await

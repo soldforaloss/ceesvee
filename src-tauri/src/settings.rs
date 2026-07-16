@@ -103,6 +103,10 @@ pub struct FileProfile {
     /// back to plain text regardless of what detection says.
     #[serde(default)]
     pub semantic_types: Vec<(String, crate::semantic::SemanticType)>,
+
+    /// F27: cross-column validation rules (closed DTO set, columns by name).
+    #[serde(default)]
+    pub cross_rules: Vec<crate::crossval::CrossRule>,
 }
 
 /// The persisted settings document.
@@ -427,7 +431,29 @@ mod tests {
                 max: Some(1000.0),
             }],
             semantic_types: Vec::new(),
+            cross_rules: Vec::new(),
         }
+    }
+
+    #[test]
+    fn cross_rules_round_trip_and_default_empty() {
+        use crate::crossval::CrossRule;
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = AppSettings::default();
+        let mut p = profile();
+        assert!(p.cross_rules.is_empty());
+        p.cross_rules = vec![CrossRule::ColumnsEqual {
+            left: "a".into(),
+            right: "b".into(),
+            negate: true,
+        }];
+        settings.profiles.push(p);
+        save_settings(dir.path(), &settings).unwrap();
+        let loaded = load_settings(dir.path());
+        assert_eq!(
+            loaded.profiles[0].cross_rules,
+            settings.profiles[0].cross_rules
+        );
     }
 
     #[test]
