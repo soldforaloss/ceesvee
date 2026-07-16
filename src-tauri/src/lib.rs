@@ -4,6 +4,7 @@
 mod analyze;
 mod commands;
 mod delimiter;
+mod diagnostics;
 mod document;
 mod dto;
 mod encoding;
@@ -15,12 +16,14 @@ mod find;
 /// registry, progress plumbing and cancellation as a stable internal API.
 pub mod job;
 mod parse;
+mod reopen;
 mod sort;
 mod state;
 mod util;
 
 use std::sync::Mutex;
 
+use crate::diagnostics::DiagnosticsCache;
 use crate::job::JobRegistry;
 use crate::state::{AppState, PendingFiles};
 
@@ -70,15 +73,22 @@ pub fn run() {
         .manage(Mutex::new(AppState::default()))
         .manage(PendingFiles(Mutex::new(initial_files)))
         .manage(JobRegistry::default())
+        .manage(DiagnosticsCache::default())
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
-            commands::reparse,
+            commands::preview_reparse,
+            commands::apply_reparse,
+            commands::get_file_fingerprint,
+            commands::check_external_change,
             commands::new_document,
             commands::close_document,
             commands::get_meta,
             commands::list_encodings,
             commands::take_pending_files,
             commands::cancel_job,
+            commands::get_diagnostics,
+            commands::start_diagnostics_scan,
+            commands::apply_diagnostic_filter,
             commands::get_rows,
             commands::selection_stats,
             commands::column_summaries,

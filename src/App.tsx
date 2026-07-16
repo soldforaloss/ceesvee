@@ -1,19 +1,25 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useState } from "react";
 
+import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { EmptyState } from "./components/EmptyState";
 import { ExportDialog } from "./components/ExportDialog";
+import { ExternalChangeDialog } from "./components/ExternalChangeDialog";
 import { FilterDialog } from "./components/FilterDialog";
 import { FindBar } from "./components/FindBar";
 import { Grid } from "./components/Grid";
 import { Close } from "./components/Icons";
+import { QuitDialog } from "./components/QuitDialog";
+import { ReopenDialog } from "./components/ReopenDialog";
 import { SortDialog } from "./components/SortDialog";
 import { SourceBar } from "./components/SourceBar";
 import { StatusBar } from "./components/StatusBar";
 import { SummaryPanel } from "./components/SummaryPanel";
 import { Tabs } from "./components/Tabs";
 import { Toolbar } from "./components/Toolbar";
+import { onJobFinished, onJobProgress } from "./lib/jobs";
 import * as api from "./lib/tauri";
 import { checkForUpdates } from "./lib/updater";
 import { useActiveMeta, useStore } from "./store/useStore";
@@ -29,6 +35,7 @@ export default function App() {
   const [exportOpen, setExportOpen] = useState(false);
   const [summariesOpen, setSummariesOpen] = useState(false);
   const [filterOpen, setFilterOpen] = useState(false);
+  const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const [dragOver, setDragOver] = useState(false);
 
@@ -45,6 +52,52 @@ export default function App() {
   // Check for a newer release once at launch (no-op in dev).
   useEffect(() => {
     void checkForUpdates();
+  }, []);
+
+  // Route background-job progress/completion events into the store.
+  useEffect(() => {
+    let unProgress: UnlistenFn | undefined;
+    let unFinished: UnlistenFn | undefined;
+    void onJobProgress((p) => useStore.getState().handleJobProgress(p))
+      .then((fn) => {
+        unProgress = fn;
+      })
+      .catch(() => undefined);
+    void onJobFinished((f) => void useStore.getState().handleJobFinished(f))
+      .then((fn) => {
+        unFinished = fn;
+      })
+      .catch(() => undefined);
+    return () => {
+      unProgress?.();
+      unFinished?.();
+    };
+  }, []);
+
+  // Intercept the window close: with unsaved edits, quitting must go through
+  // Save all / Discard all / Cancel (the QuitDialog destroys the window).
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    void getCurrentWindow()
+      .onCloseRequested((event) => {
+        const s = useStore.getState();
+        if (s.tabs.some((t) => t.dirty)) {
+          event.preventDefault();
+          s.setQuitPromptOpen(true);
+        }
+      })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => undefined);
+    return () => unlisten?.();
+  }, []);
+
+  // Detect files modified outside CEESVEE whenever the window regains focus.
+  useEffect(() => {
+    const onFocus = () => void useStore.getState().checkExternalChanges();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
   }, []);
 
   // Open files passed via "Open with CEESVEE": at launch (cold start, drained
@@ -165,15 +218,18 @@ export default function App() {
       <SourceBar />
       <FindBar />
 
-      <main className="relative min-h-0 flex-1">
-        {meta ? <Grid meta={meta} dataVersion={dataVersion} dark={dark} /> : <EmptyState />}
-        {dragOver && (
-          <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-violet-500/10 backdrop-blur-[1px]">
-            <div className="rounded-xl border-2 border-dashed border-violet-400 bg-white/85 px-6 py-4 text-sm font-medium text-violet-700 shadow-lg dark:bg-zinc-900/85 dark:text-violet-300">
-              Drop to open
+      <main className="relative flex min-h-0 flex-1">
+        <div className="relative min-w-0 flex-1">
+          {meta ? <Grid meta={meta} dataVersion={dataVersion} dark={dark} /> : <EmptyState />}
+          {dragOver && (
+            <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-violet-500/10 backdrop-blur-[1px]">
+              <div className="rounded-xl border-2 border-dashed border-violet-400 bg-white/85 px-6 py-4 text-sm font-medium text-violet-700 shadow-lg dark:bg-zinc-900/85 dark:text-violet-300">
+                Drop to open
+              </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
+        {diagnosticsOpen && meta && <DiagnosticsPanel />}
       </main>
 
       <StatusBar />
@@ -182,6 +238,9 @@ export default function App() {
       {exportOpen && <ExportDialog onClose={() => setExportOpen(false)} />}
       {summariesOpen && <SummaryPanel onClose={() => setSummariesOpen(false)} />}
       {filterOpen && <FilterDialog onClose={() => setFilterOpen(false)} />}
+      <ReopenDialog />
+      <ExternalChangeDialog />
+      <QuitDialog />
 
       {error && (
         <div className="fixed bottom-10 right-4 z-50 flex max-w-md items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 shadow-lg dark:border-red-900/60 dark:bg-red-950/80 dark:text-red-300">

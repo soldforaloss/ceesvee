@@ -155,3 +155,9 @@ export const Dot = ({ className }: IconProps) => (
     <circle cx="4" cy="4" r="4" fill="currentColor" />
   </svg>
 );
+
+export const Pulse = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+  </svg>
+);

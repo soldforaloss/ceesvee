@@ -6,12 +6,16 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   CellRect,
   ColumnSummary,
+  DiagnosticsReport,
   DocumentMeta,
   ExportOptions,
+  ExternalChange,
+  FileFingerprint,
   FilterGroup,
   FindMatch,
   FindOptions,
   OpenOptions,
+  ReparsePreview,
   ReplaceResult,
   RowsResponse,
   SelectionStats,
@@ -21,8 +25,27 @@ import type {
 export const openFile = (path: string, options?: OpenOptions) =>
   invoke<DocumentMeta>("open_file", { path, options });
 
-export const reparse = (docId: number, options: OpenOptions) =>
-  invoke<DocumentMeta>("reparse", { docId, options });
+/**
+ * Parse the document's file with new settings and describe the outcome
+ * without touching the open document.
+ */
+export const previewReparse = (docId: number, options: OpenOptions, maxRows: number) =>
+  invoke<ReparsePreview>("preview_reparse", { docId, options, maxRows });
+
+/**
+ * Replace the open document by re-reading its file with new settings.
+ * Rejected when the document changed since the preview's revision.
+ */
+export const applyReparse = (docId: number, options: OpenOptions, expectedRevision: number) =>
+  invoke<DocumentMeta>("apply_reparse", { docId, options, expectedRevision });
+
+/** The stored fingerprint of the document's backing file, if any. */
+export const getFileFingerprint = (docId: number) =>
+  invoke<FileFingerprint | null>("get_file_fingerprint", { docId });
+
+/** Compare the stored source fingerprint with the file on disk. */
+export const checkExternalChange = (docId: number) =>
+  invoke<ExternalChange>("check_external_change", { docId });
 
 export const newDocument = (rows?: number, cols?: number) =>
   invoke<DocumentMeta>("new_document", { rows, cols });
@@ -37,6 +60,22 @@ export const takePendingFiles = () => invoke<string[]>("take_pending_files");
 
 /** Request cooperative cancellation of a running background job. */
 export const cancelJob = (jobId: number) => invoke<boolean>("cancel_job", { jobId });
+
+/** The last completed diagnostics report for a document, if any. */
+export const getDiagnostics = (docId: number) =>
+  invoke<DiagnosticsReport | null>("get_diagnostics", { docId });
+
+/**
+ * Start a background diagnostics scan; resolves with the job id. Progress and
+ * completion arrive over the job events; fetch the report with
+ * {@link getDiagnostics} once finished.
+ */
+export const startDiagnosticsScan = (docId: number, expectedRevision: number) =>
+  invoke<number>("start_diagnostics_scan", { docId, expectedRevision });
+
+/** Filter the grid to the rows affected by a row-filterable diagnostic. */
+export const applyDiagnosticFilter = (docId: number, issueId: string, expectedRevision: number) =>
+  invoke<DocumentMeta>("apply_diagnostic_filter", { docId, issueId, expectedRevision });
 
 export const getRows = (docId: number, start: number, count: number) =>
   invoke<RowsResponse>("get_rows", { docId, start, count });

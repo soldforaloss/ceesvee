@@ -12,14 +12,17 @@ use std::sync::{Mutex, MutexGuard};
 
 use tauri::State;
 
+use crate::diagnostics::{self, DiagnosticsCache, DiagnosticsReport};
 use crate::document::Document;
 use crate::dto::{
-    CellRect, ColumnSummary, DocumentMeta, ExportOptions, FilterGroup, FindMatch, FindOptions,
-    OpenOptions, ReplaceResult, RowsResponse, SelectionStats, SortKey,
+    CellRect, ColumnSummary, DocumentMeta, ExportOptions, ExternalChange, FileFingerprint,
+    FilterGroup, FindMatch, FindOptions, OpenOptions, ReparsePreview, ReplaceResult, RowsResponse,
+    SelectionStats, SortKey,
 };
 use crate::error::{AppError, AppResult};
 use crate::job::JobRegistry;
 use crate::parse::{parse, ParseSettings, ParsedFile};
+use crate::reopen::{self, CurrentInterpretation};
 use crate::state::{AppState, PendingFiles, SharedDocument};
 use crate::{encoding, export, filter as filter_mod, find as find_mod, util};
 
@@ -87,6 +90,25 @@ fn looks_like_header(records: &[Vec<String>]) -> bool {
     }
 }
 
+/// Read and parse a file off the UI thread, also capturing its fingerprint.
+async fn parse_file(
+    path: std::path::PathBuf,
+    delimiter: Option<u8>,
+    encoding: Option<&'static encoding_rs::Encoding>,
+) -> AppResult<(ParsedFile, Option<FileFingerprint>)> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = std::fs::read(&path)?;
+        let fingerprint = util::stat_fingerprint(&path);
+        let settings = ParseSettings {
+            delimiter,
+            encoding,
+        };
+        Ok((parse(&bytes, &settings)?, fingerprint))
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
 // ----- open / new / close ------------------------------------------------
 
 #[tauri::command]
@@ -99,66 +121,122 @@ pub async fn open_file(
     let opt_delim = options.delimiter.as_deref().map(util::delimiter_to_byte);
     let opt_enc = options.encoding.as_deref().map(encoding::from_name);
     let forced_header = options.has_header_row;
-    let read_path = PathBuf::from(&path);
 
-    let parsed = tauri::async_runtime::spawn_blocking(move || -> AppResult<ParsedFile> {
-        let bytes = std::fs::read(&read_path)?;
-        let settings = ParseSettings {
-            delimiter: opt_delim,
-            encoding: opt_enc,
-        };
-        parse(&bytes, &settings)
-    })
-    .await
-    .map_err(|e| AppError::Other(format!("background task failed: {e}")))??;
-
+    let (parsed, fingerprint) = parse_file(PathBuf::from(&path), opt_delim, opt_enc).await?;
     let has_header = forced_header.unwrap_or_else(|| looks_like_header(&parsed.records));
 
     let mut guard = lock(&state)?;
     let id = guard.alloc_id();
-    let doc = Document::from_parsed(id, Some(PathBuf::from(&path)), parsed, has_header);
+    let mut doc = Document::from_parsed(id, Some(PathBuf::from(&path)), parsed, has_header);
+    doc.set_fingerprint(fingerprint);
     let meta = doc.meta();
     guard.insert(doc);
     Ok(meta)
 }
 
-/// Re-read the document's file with new delimiter/encoding/header overrides.
+/// Parse the document's file with new delimiter/encoding/header overrides and
+/// describe the outcome WITHOUT touching the open document. The apply step is
+/// separate ([`apply_reparse`]) and guarded by the revision echoed back here.
 #[tauri::command]
-pub async fn reparse(doc_id: u64, options: OpenOptions, state: Db<'_>) -> AppResult<DocumentMeta> {
-    let (path, current_header) = read_doc(&state, doc_id, |doc| {
+pub async fn preview_reparse(
+    doc_id: u64,
+    options: OpenOptions,
+    max_rows: usize,
+    state: Db<'_>,
+) -> AppResult<ReparsePreview> {
+    let (path, current) = read_doc(&state, doc_id, |doc| {
         let path = doc
             .path
             .clone()
-            .ok_or_else(|| AppError::invalid("document has no file to reparse"))?;
+            .ok_or_else(|| AppError::invalid("document has no file to reopen"))?;
+        Ok((path, CurrentInterpretation::of(doc)))
+    })?;
+
+    let opt_delim = options.delimiter.as_deref().map(util::delimiter_to_byte);
+    let opt_enc = options.encoding.as_deref().map(encoding::from_name);
+    let (parsed, _) = parse_file(path, opt_delim, opt_enc).await?;
+    let has_header = options.has_header_row.unwrap_or(current.has_header_row);
+
+    Ok(reopen::build_preview(
+        parsed, has_header, &current, max_rows,
+    ))
+}
+
+/// Re-read the document's file with new settings, replacing the open document.
+/// Rejected when the document changed since `expected_revision` was captured
+/// (so unsaved edits can never be discarded without fresh confirmation); a
+/// parse failure leaves the current document untouched.
+#[tauri::command]
+pub async fn apply_reparse(
+    doc_id: u64,
+    options: OpenOptions,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    let (path, current_header) = read_doc(&state, doc_id, |doc| {
+        doc.check_revision(expected_revision)?;
+        let path = doc
+            .path
+            .clone()
+            .ok_or_else(|| AppError::invalid("document has no file to reopen"))?;
         Ok((path, doc.has_header_row()))
     })?;
 
     let opt_delim = options.delimiter.as_deref().map(util::delimiter_to_byte);
     let opt_enc = options.encoding.as_deref().map(encoding::from_name);
-    let forced_header = options.has_header_row.or(Some(current_header));
-    let read_path = path.clone();
-
-    let parsed = tauri::async_runtime::spawn_blocking(move || -> AppResult<ParsedFile> {
-        let bytes = std::fs::read(&read_path)?;
-        let settings = ParseSettings {
-            delimiter: opt_delim,
-            encoding: opt_enc,
-        };
-        parse(&bytes, &settings)
-    })
-    .await
-    .map_err(|e| AppError::Other(format!("background task failed: {e}")))??;
-
-    let has_header = forced_header.unwrap_or_else(|| looks_like_header(&parsed.records));
+    let (parsed, fingerprint) = parse_file(path.clone(), opt_delim, opt_enc).await?;
+    let has_header = options.has_header_row.unwrap_or(current_header);
 
     write_doc(&state, doc_id, |doc| {
+        // Re-check under the write lock: an edit may have landed while the
+        // file was being parsed.
+        doc.check_revision(expected_revision)?;
         let mut fresh = Document::from_parsed(doc_id, Some(path), parsed, has_header);
         // Continue the revision sequence so anything captured against the old
         // incarnation can never accidentally match the new one.
         fresh.set_revision(doc.revision() + 1);
+        fresh.set_fingerprint(fingerprint);
         let meta = fresh.meta();
         *doc = fresh;
         Ok(meta)
+    })
+}
+
+/// The stored fingerprint of the document's backing file, if any.
+#[tauri::command]
+pub fn get_file_fingerprint(doc_id: u64, state: Db<'_>) -> AppResult<Option<FileFingerprint>> {
+    read_doc(&state, doc_id, |doc| Ok(doc.fingerprint()))
+}
+
+/// Compare the stored source fingerprint with the file on disk to detect
+/// modifications made outside CEESVEE. Never mutates anything.
+#[tauri::command]
+pub async fn check_external_change(doc_id: u64, state: Db<'_>) -> AppResult<ExternalChange> {
+    let (path, stored) = read_doc(&state, doc_id, |doc| {
+        Ok((doc.path.clone(), doc.fingerprint()))
+    })?;
+
+    let Some(path) = path else {
+        // Unsaved documents have no backing file to drift from.
+        return Ok(ExternalChange {
+            changed: false,
+            exists: false,
+            disk: None,
+            stored,
+        });
+    };
+
+    let disk = tauri::async_runtime::spawn_blocking(move || util::stat_fingerprint(&path))
+        .await
+        .map_err(|e| AppError::Other(format!("background task failed: {e}")))?;
+
+    Ok(ExternalChange {
+        // Only meaningful when we have a baseline: a missing stored
+        // fingerprint (legacy sessions) never reports a change.
+        changed: stored.is_some() && disk != stored,
+        exists: disk.is_some(),
+        disk,
+        stored,
     })
 }
 
@@ -177,8 +255,13 @@ pub fn new_document(
 }
 
 #[tauri::command]
-pub fn close_document(doc_id: u64, state: Db<'_>) -> AppResult<()> {
+pub fn close_document(
+    doc_id: u64,
+    state: Db<'_>,
+    diagnostics_cache: State<'_, DiagnosticsCache>,
+) -> AppResult<()> {
     lock(&state)?.remove(doc_id);
+    diagnostics_cache.remove(doc_id);
     Ok(())
 }
 
@@ -209,6 +292,79 @@ pub fn take_pending_files(pending: State<'_, PendingFiles>) -> Vec<String> {
 #[tauri::command]
 pub fn cancel_job(job_id: u64, jobs: State<'_, JobRegistry>) -> bool {
     jobs.cancel(job_id)
+}
+
+// ----- diagnostics ---------------------------------------------------------
+
+/// The last completed diagnostics report for a document, if any. The report
+/// carries the revision it was computed against; the UI offers a rescan when
+/// the document has moved on.
+#[tauri::command]
+pub fn get_diagnostics(
+    doc_id: u64,
+    diagnostics_cache: State<'_, DiagnosticsCache>,
+) -> Option<DiagnosticsReport> {
+    diagnostics_cache.get(doc_id)
+}
+
+/// Start a background diagnostics scan, returning its job id immediately.
+/// Progress streams over `job-progress`; on `job-finished` (done) the report
+/// is available via `get_diagnostics`. Rejected up front when
+/// `expected_revision` no longer matches the document.
+#[tauri::command]
+pub async fn start_diagnostics_scan(
+    doc_id: u64,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    diagnostics_cache: State<'_, DiagnosticsCache>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    // Fail fast (before spawning a job) when the caller's snapshot is stale.
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+    }
+
+    let ctx = jobs.begin_for_app(&app, "diagnostics", Some(doc_id));
+    let job_id = ctx.id;
+    let sink = diagnostics_cache.share();
+    tauri::async_runtime::spawn(async move {
+        // Terminal status (done / cancelled / failed) is emitted by
+        // run_blocking; the report only becomes visible on success.
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            // The document may have changed between the fast check above and
+            // the read lock being granted; a stale scan would waste work and
+            // its result would have to be discarded anyway.
+            doc.check_revision(expected_revision)?;
+            let report = diagnostics::scan(&doc, ctx)?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, report);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// Replace the document's filter view with the rows affected by a
+/// row-filterable diagnostic issue.
+#[tauri::command]
+pub fn apply_diagnostic_filter(
+    doc_id: u64,
+    issue_id: String,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    write_doc(&state, doc_id, |doc| {
+        doc.check_revision(expected_revision)?;
+        let rows = diagnostics::issue_rows(doc, &issue_id)?;
+        doc.set_filter(rows);
+        Ok(doc.meta())
+    })
 }
 
 // ----- windowed reads ----------------------------------------------------
@@ -468,15 +624,20 @@ pub async fn save(
     // await inside; other documents stay fully available).
     let bytes = read_doc(&state, doc_id, |doc| export::serialize(doc, &options))?;
 
-    // Write to disk off the UI thread.
+    // Write to disk off the UI thread, then capture the resulting identity.
     let write_path = PathBuf::from(&path);
-    tauri::async_runtime::spawn_blocking(move || std::fs::write(&write_path, &bytes))
+    let fingerprint =
+        tauri::async_runtime::spawn_blocking(move || -> AppResult<Option<FileFingerprint>> {
+            std::fs::write(&write_path, &bytes)?;
+            Ok(util::stat_fingerprint(&write_path))
+        })
         .await
         .map_err(|e| AppError::Other(format!("background task failed: {e}")))??;
 
-    // Record the save point.
+    // Record the save point (and the new baseline for external-change checks).
     write_doc(&state, doc_id, |doc| {
         doc.mark_saved(Some(PathBuf::from(&path)));
+        doc.set_fingerprint(fingerprint);
         Ok(doc.meta())
     })
 }

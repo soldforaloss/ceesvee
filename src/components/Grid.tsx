@@ -80,6 +80,7 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   const findIndex = useStore((s) => s.find.index);
   const frozenCols = useStore((s) => s.frozenCols[docId] ?? 0);
   const summaries = useStore((s) => (s.summariesDocId === docId ? s.summaries : null));
+  const jumpTarget = useStore((s) => s.jumpTarget);
 
   // Detected type per column (defaults to text until summaries load).
   const columnKinds = useMemo<ColumnKind[]>(() => {
@@ -298,6 +299,29 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
       },
     });
   }, [findMatches, findIndex]);
+
+  // ----- jump requests (e.g. a diagnostics sample) ------------------------
+
+  useEffect(() => {
+    if (!jumpTarget) return;
+    const row = Math.min(jumpTarget.row, Math.max(0, meta.rowCount - 1));
+    const col = Math.min(jumpTarget.col, Math.max(0, colCount - 1));
+    gridRef.current?.scrollTo(col, row, "both", 0, 0, {
+      vAlign: "center",
+      hAlign: "center",
+    });
+    setSelectionState({
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: [col, row],
+        range: { x: col, y: row, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    });
+    // Depend on the nonce so repeated jumps to the same cell still scroll.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jumpTarget?.nonce]);
 
   return (
     <div className="gdg-wrapper">

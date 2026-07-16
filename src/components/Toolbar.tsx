@@ -11,6 +11,7 @@ import {
   Filter,
   FolderOpen,
   Moon,
+  Pulse,
   Redo,
   Refresh,
   RowPlus,
@@ -59,6 +60,8 @@ export function Toolbar({ onSort, onExport, onSummaries, onFilter }: ToolbarProp
   const setFindOpen = useStore((s) => s.setFindOpen);
   const findIsOpen = useStore((s) => s.find.open);
   const setTheme = useStore((s) => s.setTheme);
+  const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
+  const setDiagnosticsOpen = useStore((s) => s.setDiagnosticsOpen);
 
   const hasDoc = meta !== null;
 
@@ -109,6 +112,14 @@ export function Toolbar({ onSort, onExport, onSummaries, onFilter }: ToolbarProp
     },
     { label: "Sort…", icon: <SortIcon />, onClick: onSort, disabled: !hasDoc },
     { label: "Column summaries", icon: <Stats />, onClick: onSummaries, disabled: !hasDoc },
+    {
+      label: "Diagnostics",
+      title: "Data-fidelity diagnostics",
+      icon: <Pulse />,
+      onClick: () => setDiagnosticsOpen(!diagnosticsOpen),
+      active: diagnosticsOpen,
+      disabled: !hasDoc,
+    },
     { label: "Export / Save As…", icon: <Download />, onClick: onExport, disabled: !hasDoc },
   ];
 
