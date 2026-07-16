@@ -3,6 +3,7 @@ import { useState } from "react";
 import { checkForUpdates } from "../lib/updater";
 import { useActiveMeta, useStore } from "../store/useStore";
 import {
+  BarChart,
   Bookmark,
   ChevronDown,
   ColumnPlus,
@@ -64,6 +65,8 @@ export function Toolbar({ onSort, onExport, onSummaries, onFilter, onProfiles }:
   const setTheme = useStore((s) => s.setTheme);
   const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
   const setDiagnosticsOpen = useStore((s) => s.setDiagnosticsOpen);
+  const explorerOpen = useStore((s) => s.explorer.open);
+  const setExplorerOpen = useStore((s) => s.setExplorerOpen);
 
   const hasDoc = meta !== null;
 
@@ -114,6 +117,14 @@ export function Toolbar({ onSort, onExport, onSummaries, onFilter, onProfiles }:
     },
     { label: "Sort…", icon: <SortIcon />, onClick: onSort, disabled: !hasDoc },
     { label: "Column summaries", icon: <Stats />, onClick: onSummaries, disabled: !hasDoc },
+    {
+      label: "Column explorer",
+      title: "Interactive column profiling and filtering",
+      icon: <BarChart />,
+      onClick: () => setExplorerOpen(!explorerOpen),
+      active: explorerOpen,
+      disabled: !hasDoc,
+    },
     {
       label: "Diagnostics",
       title: "Data-fidelity diagnostics",

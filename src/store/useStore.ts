@@ -4,12 +4,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import * as api from "../lib/tauri";
 import { applyReplace } from "../lib/replace";
+import { rangeConditions, specOf, valueCondition, withAndConditions } from "../lib/explorer";
 import { matchingProfiles, profileSettingsDiffer } from "../lib/profiles";
 import { currentOpenOptions, fingerprintKey } from "../lib/reopen";
 import { isLegacyEncoding } from "../lib/save";
 import type {
   AppSettings,
   CellRect,
+  ColumnProfile,
   ColumnSummary,
   DiagnosticsReport,
   DocumentMeta,
@@ -24,6 +26,7 @@ import type {
   JobFinished,
   JobProgress,
   OpenOptions,
+  ProfileScope,
   ProfileValidation,
   ReparsePreview,
   SortKey,
@@ -196,6 +199,27 @@ export interface ProfileSuggestion {
   profile: FileProfile;
 }
 
+/** Column-explorer panel state (F05); profile data is for the ACTIVE doc. */
+export interface ExplorerState {
+  open: boolean;
+  scope: ProfileScope;
+  profile: ColumnProfile | null;
+  jobId: number | null;
+  processed: number;
+  total: number | null;
+  error: string | null;
+}
+
+const initialExplorer: ExplorerState = {
+  open: false,
+  scope: "all",
+  profile: null,
+  jobId: null,
+  processed: 0,
+  total: null,
+  error: null,
+};
+
 const initialFilter: FilterState = {
   open: false,
   spec: {
@@ -263,6 +287,8 @@ interface Store {
   profileSuggestion: ProfileSuggestion | null;
   /** Latest profile-validation result, for the profiles dialog. */
   profileValidation: ProfileValidation | null;
+  /** Column-explorer panel state (F05). */
+  explorer: ExplorerState;
 
   // lifecycle / chrome
   init: () => void;
@@ -310,6 +336,17 @@ interface Store {
     split: SplitOptions,
     writeManifest: boolean,
   ) => Promise<void>;
+
+  // column explorer (F05)
+  setExplorerOpen: (open: boolean) => void;
+  setExplorerColumn: (column: number) => void;
+  setExplorerScope: (scope: ProfileScope) => void;
+  /** Fetch (cached) or compute the profile for the current column/scope. */
+  refreshExplorerProfile: () => Promise<void>;
+  cancelExplorerProfile: () => Promise<void>;
+  /** Filter actions from a selected value ("only" | "exclude" | "and"). */
+  applyValueFilter: (value: string, mode: "only" | "exclude" | "and") => Promise<void>;
+  applyRangeFilter: (min: string | null, max: string | null) => Promise<void>;
 
   // file profiles (F08)
   saveProfiles: (profiles: FileProfile[]) => Promise<void>;
@@ -442,6 +479,15 @@ export const useStore = create<Store>((set, get) => {
       reopen: initialReopen,
       profileSuggestion:
         s.profileSuggestion && s.profileSuggestion.docId === id ? s.profileSuggestion : null,
+      // The panel stays open across switches, but the profile is per-doc.
+      explorer: {
+        ...s.explorer,
+        profile: null,
+        jobId: null,
+        processed: 0,
+        total: null,
+        error: null,
+      },
     };
   };
 
@@ -668,6 +714,7 @@ export const useStore = create<Store>((set, get) => {
     settings: null,
     profileSuggestion: null,
     profileValidation: null,
+    explorer: initialExplorer,
 
     init: () => {
       const theme = loadTheme();
@@ -981,7 +1028,12 @@ export const useStore = create<Store>((set, get) => {
 
     // ----- diagnostics ------------------------------------------------------
 
-    setDiagnosticsOpen: (open) => set({ diagnosticsOpen: open }),
+    setDiagnosticsOpen: (open) =>
+      set((s) => ({
+        diagnosticsOpen: open,
+        // The side area shows one panel at a time.
+        explorer: open ? { ...s.explorer, open: false } : s.explorer,
+      })),
 
     runDiagnosticsScan: async () => {
       const meta = activeMeta();
@@ -1057,6 +1109,14 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
+      if (progress.kind === "profile") {
+        if (get().explorer.jobId !== progress.jobId) return;
+        set((s) => ({
+          explorer: { ...s.explorer, processed: progress.processed, total: progress.total },
+        }));
+        return;
+      }
+
       if (progress.kind !== "diagnostics") return;
       // Only track the scan we started (guards against reused ids after e.g.
       // an app-side restart of the job system).
@@ -1077,6 +1137,24 @@ export const useStore = create<Store>((set, get) => {
           delete fileJobs[finished.jobId];
           return { fileJobs };
         });
+        return;
+      }
+
+      if (finished.kind === "profile") {
+        if (get().explorer.jobId !== finished.jobId) return;
+        if (finished.status === "done") {
+          // The job cached its result; fetch it (still-valid or recompute).
+          set((s) => ({ explorer: { ...s.explorer, jobId: null } }));
+          void get().refreshExplorerProfile();
+        } else {
+          set((s) => ({
+            explorer: {
+              ...s.explorer,
+              jobId: null,
+              error: finished.status === "failed" ? (finished.error ?? "profiling failed") : null,
+            },
+          }));
+        }
         return;
       }
 
@@ -1337,6 +1415,77 @@ export const useStore = create<Store>((set, get) => {
       // Remember the options per document, to seed the next export dialog.
       set({ lastExportOptions: options });
       await runExportJob(meta.id, chosen, options, scope, split, writeManifest);
+    },
+
+    // ----- column explorer (F05) ------------------------------------------------
+
+    setExplorerOpen: (open) => {
+      set((s) => ({
+        explorer: { ...s.explorer, open },
+        // The side area shows one panel at a time.
+        diagnosticsOpen: open ? false : s.diagnosticsOpen,
+      }));
+      if (open) void get().refreshExplorerProfile();
+    },
+
+    setExplorerColumn: (column) => {
+      set({ activeExplorerColumn: column });
+      void get().refreshExplorerProfile();
+    },
+
+    setExplorerScope: (scope) => {
+      set((s) => ({ explorer: { ...s.explorer, scope } }));
+      void get().refreshExplorerProfile();
+    },
+
+    refreshExplorerProfile: async () => {
+      const meta = activeMeta();
+      const { explorer, activeExplorerColumn } = get();
+      if (!meta || !explorer.open || meta.colCount === 0) return;
+      const column = Math.min(activeExplorerColumn ?? 0, meta.colCount - 1);
+      try {
+        // Served from the per-column cache whenever it is still valid.
+        const cached = await api.getColumnProfile(meta.id, column, explorer.scope);
+        if (cached) {
+          set((s) => ({
+            explorer: { ...s.explorer, profile: cached, jobId: null, error: null },
+          }));
+          return;
+        }
+        const jobId = await api.startColumnProfile(meta.id, column, explorer.scope, meta.revision);
+        set((s) => ({
+          explorer: { ...s.explorer, jobId, processed: 0, total: null, error: null },
+        }));
+      } catch (e) {
+        set((s) => ({ explorer: { ...s.explorer, error: String(e), jobId: null } }));
+      }
+    },
+
+    cancelExplorerProfile: async () => {
+      const jobId = get().explorer.jobId;
+      if (jobId != null) await api.cancelJob(jobId).catch(() => undefined);
+    },
+
+    applyValueFilter: async (value, mode) => {
+      const { activeExplorerColumn, filter } = get();
+      const column = activeExplorerColumn ?? 0;
+      const condition = valueCondition(column, value, mode === "exclude");
+      const spec =
+        mode === "and" ? withAndConditions(filter.spec, [condition]) : specOf([condition]);
+      set((s) => ({ filter: { ...s.filter, spec } }));
+      await mutate((id) => api.setFilter(id, spec));
+      void get().refreshExplorerProfile();
+    },
+
+    applyRangeFilter: async (min, max) => {
+      const { activeExplorerColumn, filter } = get();
+      const column = activeExplorerColumn ?? 0;
+      const conditions = rangeConditions(column, min, max);
+      if (conditions.length === 0) return;
+      const spec = withAndConditions(filter.spec, conditions);
+      set((s) => ({ filter: { ...s.filter, spec } }));
+      await mutate((id) => api.setFilter(id, spec));
+      void get().refreshExplorerProfile();
     },
 
     // ----- file profiles (F08) -------------------------------------------------

@@ -284,6 +284,58 @@ export interface ScopeCounts {
   cols: number;
 }
 
+/** Which rows a column profile covers (F05). */
+export type ProfileScope = "all" | "visibleRows";
+
+export interface ValueCount {
+  value: string;
+  count: number;
+}
+
+export interface TypeCounts {
+  number: number;
+  date: number;
+  bool: number;
+  text: number;
+}
+
+export interface NumericProfile {
+  min: number;
+  max: number;
+  mean: number;
+  median: number;
+  q1: number;
+  q3: number;
+}
+
+export interface TextProfile {
+  minLen: number;
+  maxLen: number;
+  avgLen: number;
+}
+
+/** Interactive profile of one column (F05). */
+export interface ColumnProfile {
+  column: number;
+  scope: ProfileScope;
+  /** Document revision this profile was computed against. */
+  revision: number;
+  rowCount: number;
+  blankCount: number;
+  inferredKind: ColumnKind;
+  typeCounts: TypeCounts;
+  distinctCount: number;
+  /** True above the documented exact limit (HyperLogLog estimate). */
+  distinctIsApproximate: boolean;
+  topValues: ValueCount[];
+  /** True when the bounded sketch evicted counters (counts are lower bounds). */
+  topIsApproximate: boolean;
+  numeric: NumericProfile | null;
+  earliestDate: string | null;
+  latestDate: string | null;
+  text: TextProfile | null;
+}
+
 /** How a file profile decides whether it applies to a path (F08). */
 export type ProfileMatch =
   | { type: "exactPath"; path: string }

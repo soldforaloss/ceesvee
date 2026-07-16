@@ -3,6 +3,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useState } from "react";
 
+import { ColumnExplorerPanel } from "./components/ColumnExplorerPanel";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { EmptyState } from "./components/EmptyState";
 import { EncodingIssuesDialog } from "./components/EncodingIssuesDialog";
@@ -236,6 +237,7 @@ export default function App() {
           )}
         </div>
         {diagnosticsOpen && meta && <DiagnosticsPanel />}
+        {meta && <ColumnExplorerPanel />}
       </main>
 
       <StatusBar />

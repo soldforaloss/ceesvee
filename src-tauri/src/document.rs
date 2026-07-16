@@ -127,6 +127,14 @@ pub struct Document {
     /// long-running results carry the revision they were computed against and
     /// are rejected when it no longer matches (see [`Document::check_revision`]).
     revision: u64,
+    /// Per-column: the revision that last changed that column's DATA (cell
+    /// edits touch just their columns; row inserts/deletes and column
+    /// structure changes touch every column; pure reorderings touch none).
+    /// Lets per-column caches (F05 profiles) survive edits to other columns.
+    col_revisions: Vec<u64>,
+    /// The revision at which the filter view last changed, for caches scoped
+    /// to the visible rows.
+    filter_revision: u64,
     /// Fidelity information captured when the source file was parsed
     /// (decode damage, ragged records). Refreshed only by a reparse.
     import_info: ImportInfo,
@@ -165,6 +173,7 @@ impl Document {
             (headers, records)
         };
 
+        let n_cols_final = headers.len();
         Document {
             id,
             path,
@@ -185,6 +194,8 @@ impl Document {
             saved_marker: 0,
             filter_view: None,
             revision: 1,
+            col_revisions: vec![1; n_cols_final],
+            filter_revision: 1,
             import_info: import,
             fingerprint: None,
         }
@@ -215,6 +226,8 @@ impl Document {
             saved_marker: 0,
             filter_view: None,
             revision: 1,
+            col_revisions: vec![1; cols],
+            filter_revision: 1,
             import_info: ImportInfo::default(),
             fingerprint: None,
         }
@@ -274,6 +287,20 @@ impl Document {
         self.revision = revision;
     }
 
+    /// The revision that last changed this column's data. Out-of-range columns
+    /// report the document revision (always-invalid, always-safe).
+    pub fn column_revision(&self, col: usize) -> u64 {
+        self.col_revisions
+            .get(col)
+            .copied()
+            .unwrap_or(self.revision)
+    }
+
+    /// The revision at which the filter view last changed.
+    pub fn filter_revision(&self) -> u64 {
+        self.filter_revision
+    }
+
     /// Guard a deferred operation: fail with [`AppError::StaleRevision`] when
     /// the document has changed since `expected` was captured.
     pub fn check_revision(&self, expected: u64) -> AppResult<()> {
@@ -309,11 +336,13 @@ impl Document {
         // The visible-row set is an input to scoped previews, so changing it
         // must invalidate them.
         self.revision += 1;
+        self.filter_revision = self.revision;
     }
 
     pub fn clear_filter(&mut self) {
         if self.filter_view.take().is_some() {
             self.revision += 1;
+            self.filter_revision = self.revision;
         }
     }
 
@@ -766,21 +795,24 @@ impl Document {
         self.dirty_cells.clear();
         self.saved_marker = usize::MAX;
         self.revision += 1;
+        self.touch_all_columns();
     }
 
     pub fn undo(&mut self) -> AppResult<()> {
         let op = self.undo_stack.pop().ok_or(AppError::NothingToUndo)?;
         self.revert(&op);
-        self.redo_stack.push(op);
         self.revision += 1;
+        self.stamp_touched(&op);
+        self.redo_stack.push(op);
         Ok(())
     }
 
     pub fn redo(&mut self) -> AppResult<()> {
         let op = self.redo_stack.pop().ok_or(AppError::NothingToRedo)?;
         self.apply(&op);
-        self.undo_stack.push(op);
         self.revision += 1;
+        self.stamp_touched(&op);
+        self.undo_stack.push(op);
         Ok(())
     }
 
@@ -795,9 +827,59 @@ impl Document {
         if self.saved_marker > self.undo_stack.len() {
             self.saved_marker = usize::MAX;
         }
+        self.revision += 1;
+        self.stamp_touched(&op);
         self.undo_stack.push(op);
         self.redo_stack.clear();
-        self.revision += 1;
+    }
+
+    /// Record which columns' DATA the operation changed, at the (freshly
+    /// bumped) current revision. Pure reorderings (row moves, sorts) leave a
+    /// column's value multiset intact, so they deliberately touch nothing —
+    /// per-column profiles stay valid across them.
+    fn stamp_touched(&mut self, op: &EditOp) {
+        self.stamp_op(op);
+        // Column-structure ops change the width; keep the vector aligned (any
+        // such op also touched every column, so the fill value is fresh).
+        if self.col_revisions.len() != self.headers.len() {
+            let rev = self.revision;
+            self.col_revisions.resize(self.headers.len(), rev);
+        }
+    }
+
+    fn stamp_op(&mut self, op: &EditOp) {
+        let rev = self.revision;
+        match op {
+            EditOp::SetCells(edits) => {
+                for e in edits {
+                    if let Some(r) = self.col_revisions.get_mut(e.col) {
+                        *r = rev;
+                    }
+                }
+            }
+            EditOp::RenameColumn { col, .. } => {
+                if let Some(r) = self.col_revisions.get_mut(*col) {
+                    *r = rev;
+                }
+            }
+            EditOp::MoveRow { .. } | EditOp::SortRows { .. } => {}
+            EditOp::InsertRows { .. } | EditOp::DeleteRows { .. } => self.touch_all_columns(),
+            EditOp::InsertColumn { .. }
+            | EditOp::DeleteColumns { .. }
+            | EditOp::MoveColumn { .. } => self.touch_all_columns(),
+            EditOp::Composite(ops) => {
+                for sub in ops {
+                    self.stamp_op(sub);
+                }
+            }
+        }
+    }
+
+    fn touch_all_columns(&mut self) {
+        let rev = self.revision;
+        for r in &mut self.col_revisions {
+            *r = rev;
+        }
     }
 
     fn check_cell(&self, row: usize, col: usize) -> AppResult<()> {
@@ -1392,6 +1474,61 @@ mod tests {
             Err(AppError::StaleRevision { .. })
         ));
         assert!(d.check_revision(d.revision()).is_ok());
+    }
+
+    #[test]
+    fn column_revisions_track_only_touched_columns() {
+        let mut d = doc_from("a,b\n1,2\n3,4", true);
+        let base_b = d.column_revision(1);
+
+        // Editing column A must not invalidate column B's revision.
+        d.set_cell(0, 0, "X".into()).unwrap();
+        assert_eq!(d.column_revision(0), d.revision());
+        assert_eq!(d.column_revision(1), base_b);
+
+        // Row structure changes touch every column.
+        d.insert_rows(0, 1).unwrap();
+        assert_eq!(d.column_revision(0), d.revision());
+        assert_eq!(d.column_revision(1), d.revision());
+
+        // Pure reorderings keep each column's value multiset: no touch.
+        let before = (d.column_revision(0), d.column_revision(1), d.revision());
+        d.sort(&[SortKey {
+            column: 0,
+            descending: true,
+        }])
+        .unwrap();
+        assert!(d.revision() > before.2, "sort still bumps the doc revision");
+        assert_eq!(d.column_revision(0), before.0);
+        assert_eq!(d.column_revision(1), before.1);
+
+        // Undo of a cell edit re-touches exactly that column.
+        d.undo().unwrap(); // undo sort (touches nothing)
+        let after_sort_undo = d.column_revision(0);
+        d.undo().unwrap(); // undo insert_rows (touches all)
+        assert!(d.column_revision(0) > after_sort_undo);
+
+        // Column structure changes touch all and keep the vector aligned.
+        d.insert_column(0, "new".into()).unwrap();
+        assert_eq!(d.column_revision(2), d.revision());
+        assert_eq!(d.column_revision(0), d.revision());
+    }
+
+    #[test]
+    fn filter_revision_tracks_view_changes_only() {
+        let mut d = doc_from("a\n1\n2", true);
+        let f0 = d.filter_revision();
+        d.set_cell(0, 0, "9".into()).unwrap();
+        assert_eq!(
+            d.filter_revision(),
+            f0,
+            "cell edits leave the filter revision"
+        );
+        d.set_filter(vec![0]);
+        assert_eq!(d.filter_revision(), d.revision());
+        let f1 = d.filter_revision();
+        d.clear_filter();
+        assert!(d.filter_revision() > f1);
     }
 
     #[test]

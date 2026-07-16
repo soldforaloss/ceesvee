@@ -17,6 +17,7 @@ mod find;
 /// registry, progress plumbing and cancellation as a stable internal API.
 pub mod job;
 mod parse;
+mod profile;
 mod reopen;
 mod save;
 mod settings;
@@ -28,6 +29,7 @@ use std::sync::Mutex;
 
 use crate::diagnostics::DiagnosticsCache;
 use crate::job::JobRegistry;
+use crate::profile::ProfileCache;
 use crate::state::{AppState, PendingFiles};
 
 /// Extract file paths from a process argument list, skipping the executable and
@@ -77,6 +79,7 @@ pub fn run() {
         .manage(PendingFiles(Mutex::new(initial_files)))
         .manage(JobRegistry::default())
         .manage(DiagnosticsCache::default())
+        .manage(ProfileCache::default())
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
             commands::preview_reparse,
@@ -120,6 +123,8 @@ pub fn run() {
             commands::get_settings,
             commands::set_settings,
             commands::validate_profile,
+            commands::get_column_profile,
+            commands::start_column_profile,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
