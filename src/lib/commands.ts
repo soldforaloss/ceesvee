@@ -48,6 +48,12 @@ export interface AppCommand {
   runWith?: (arg: string) => string | null;
   /** Allow the shortcut to fire while focus is in an input/textarea. */
   allowInEditable?: boolean;
+  /**
+   * Exclude from palette search results (shortcut-only aliases). The command
+   * still dispatches from its binding and stays listed in the shortcut
+   * editor, so the alias remains rebindable.
+   */
+  hidden?: boolean;
 }
 
 /** A palette entry scored against the current query. */
@@ -112,6 +118,7 @@ export class CommandRegistry {
   search(query: string): RankedCommand[] {
     const ranked: RankedCommand[] = [];
     for (const command of this.allCommands()) {
+      if (command.hidden) continue; // shortcut-only aliases
       const score = query === "" ? 0 : fuzzyScore(query, command.title, command.keywords);
       if (score === null) continue;
       ranked.push({
