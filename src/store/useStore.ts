@@ -734,6 +734,13 @@ interface Store {
    * — range-shaped operations (range export) are unavailable then.
    */
   selectionPhysicalRect: () => CellRect | null;
+  /** One DISPLAY column translated to its physical column. */
+  displayColToPhysical: (col: number) => number;
+  /**
+   * The selection rectangle's columns as PHYSICAL indices in DISPLAY order
+   * (what the user sees left-to-right), or null without a rectangle.
+   */
+  selectionRectPhysicalCols: () => number[] | null;
 
   // documents
   openDialog: () => Promise<void>;
@@ -1226,6 +1233,10 @@ export const useStore = create<Store>((set, get) => {
           const hydrated = hydrateFilter(remapped.filter);
           set((s) => ({ filter: { ...s.filter, spec: hydrated } }));
           reloadDoc(await api.setFilter(meta.id, hydrated));
+        } else if (meta.filtered) {
+          // The view's filter could not be applied (missing columns) — a
+          // PREVIOUS filter must not survive as if it were this view's.
+          reloadDoc(await api.clearFilter(meta.id));
         }
       } else if (meta.filtered) {
         reloadDoc(await api.clearFilter(meta.id));
@@ -1243,10 +1254,13 @@ export const useStore = create<Store>((set, get) => {
       return;
     }
 
-    set((s) => ({
+    set(() => ({
       columnLayout: layoutIsTrivial(layout) ? null : layout,
       wrapText: view.wrapText,
-      columnWidths: { ...s.columnWidths, ...widthsFromIds(view.columnWidths, ids) },
+      // REPLACE the width map: widths the view does not specify return to
+      // defaults — merging would leave the previous layout's widths behind
+      // and the named view would not actually be restored.
+      columnWidths: widthsFromIds(view.columnWidths, ids),
       activeViewId: view.id,
       viewSortKeys: appliedSort,
       viewWarning:
@@ -1844,6 +1858,26 @@ export const useStore = create<Store>((set, get) => {
       if (!rect) return null;
       const rects = selectionPhysicalRects(rect);
       return rects.length === 1 ? rects[0] : null;
+    },
+
+    displayColToPhysical: (col) => {
+      const meta = activeMeta();
+      const layout = get().columnLayout;
+      if (!meta || layoutIsTrivial(layout)) return col;
+      return projectColumns(meta.columnIds, layout).physical[col] ?? col;
+    },
+
+    selectionRectPhysicalCols: () => {
+      const rect = get().selectionRect;
+      const meta = activeMeta();
+      if (!rect || !meta) return null;
+      const layout = get().columnLayout;
+      const projection = layoutIsTrivial(layout) ? null : projectColumns(meta.columnIds, layout);
+      const cols: number[] = [];
+      for (let c = rect.x; c < rect.x + rect.width; c++) {
+        cols.push(projection ? (projection.physical[c] ?? c) : c);
+      }
+      return cols;
     },
 
     setScrollPosition: (row, column) => {

@@ -51,8 +51,8 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
   );
 
   const choices = useMemo(
-    () => scopeChoices(filtered, selectionRect, selectedRows, selectedCols),
-    [filtered, selectionRect, selectedRows, selectedCols],
+    () => scopeChoices(filtered, selectionRect, selectedRows, selectedCols, viewSorted),
+    [filtered, selectionRect, selectedRows, selectedCols, viewSorted],
   );
   const [scopeIdx, setScopeIdx] = useState(0);
   const rowScope = (choices[scopeIdx] ?? choices[0]).scope;
@@ -172,8 +172,8 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
 
         {viewSorted && (
           <p className="text-xs text-zinc-500 dark:text-zinc-400">
-            A view sort is applied: "Visible rows" (and any column export) writes rows in the
-            current view order; "All rows" keeps the file's own order.
+            A view sort is applied: the "Visible rows" scope (and any column export) writes rows in
+            the current view order; "All rows" keeps the file's own order.
           </p>
         )}
 

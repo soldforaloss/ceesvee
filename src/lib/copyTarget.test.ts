@@ -4,13 +4,20 @@ import { resolveCopyTarget } from "./copyTarget";
 
 describe("copy target resolution (F14)", () => {
   it("visible scope covers every visible row with all columns", () => {
-    const target = resolveCopyTarget("visible", { x: 1, y: 2, width: 2, height: 2 }, [], [], 4);
+    const target = resolveCopyTarget("visible", { y: 2, height: 2, cols: [1, 2] }, [], [], 4);
     expect(target).toEqual({ rows: null, cols: [0, 1, 2, 3] });
   });
 
   it("selection scope prefers the active rectangle", () => {
-    const target = resolveCopyTarget("selection", { x: 1, y: 5, width: 2, height: 3 }, [9], [2], 4);
+    const target = resolveCopyTarget("selection", { y: 5, height: 3, cols: [1, 2] }, [9], [2], 4);
     expect(target).toEqual({ rows: [5, 6, 7], cols: [1, 2] });
+  });
+
+  it("keeps the caller's pre-translated physical column order (F12 layouts)", () => {
+    // Display order "c2 before c0": the rect's columns arrive already
+    // translated; the copy must preserve that on-screen order.
+    const target = resolveCopyTarget("selection", { y: 0, height: 1, cols: [2, 0] }, [], [], 3);
+    expect(target).toEqual({ rows: [0], cols: [2, 0] });
   });
 
   it("falls back to row markers, then column markers", () => {

@@ -68,9 +68,14 @@ export function CopyAsDialog({ onClose }: { onClose: () => void }) {
   };
 
   const copy = async () => {
+    // The rect's columns are translated to PHYSICAL indices in display
+    // order, so the copy matches what is on screen under an F12 layout.
+    const rectCols = useStore.getState().selectionRectPhysicalCols();
     const target = resolveCopyTarget(
       scope,
-      selectionRect,
+      selectionRect && rectCols
+        ? { y: selectionRect.y, height: selectionRect.height, cols: rectCols }
+        : null,
       selectedRows,
       selectedCols,
       meta.colCount,

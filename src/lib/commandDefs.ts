@@ -147,7 +147,9 @@ function staticCommands(): AppCommand[] {
       },
       run: () => {
         const rect = state().selectionRect;
-        if (rect) state().openCellEditor(rect.y, rect.x);
+        // The rect is display-space; the editor targets the PHYSICAL column
+        // (F12 layouts can hide/reorder columns).
+        if (rect) state().openCellEditor(rect.y, state().displayColToPhysical(rect.x));
       },
     },
     {

@@ -30,7 +30,10 @@ export function PasteSpecialDialog({ onClose }: { onClose: () => void }) {
   const previewRequest = useRef(0);
 
   const anchorRow = selectionRect?.y ?? 0;
-  const anchorCol = selectionRect?.x ?? 0;
+  // The rect is display-space; the paste anchor is a PHYSICAL column (F12
+  // layouts can hide/reorder columns) — consistent with the grid's own
+  // paste, which translates its anchor the same way.
+  const anchorCol = useStore.getState().displayColToPhysical(selectionRect?.x ?? 0);
   const selectionRows = selectionRect?.height ?? 0;
   const selectionCols = selectionRect?.width ?? 0;
 

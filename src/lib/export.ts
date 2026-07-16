@@ -10,17 +10,22 @@ export interface ScopeChoice {
 
 /**
  * Build the scope menu for the export dialog from the current view/selection.
- * "All rows" is always available; the others appear when meaningful.
+ * "All rows" is always available; the others appear when meaningful. A
+ * non-destructive view sort (F12) also makes "visible rows" meaningful —
+ * it is the only scope that writes rows in the current VIEW order.
  */
 export function scopeChoices(
   filtered: boolean,
   selectionRect: CellRect | null,
   selectedRows: number[],
   selectedCols: number[],
+  viewSorted = false,
 ): ScopeChoice[] {
   const choices: ScopeChoice[] = [{ scope: { type: "all" }, label: "All rows" }];
   if (filtered) {
     choices.push({ scope: { type: "visibleRows" }, label: "Visible (filtered) rows" });
+  } else if (viewSorted) {
+    choices.push({ scope: { type: "visibleRows" }, label: "Visible rows (view sort order)" });
   }
   if (selectedRows.length > 0) {
     choices.push({
