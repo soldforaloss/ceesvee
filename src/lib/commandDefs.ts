@@ -281,6 +281,26 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("semantic"),
     },
     {
+      id: "file.follow",
+      title: "Open in follow mode…",
+      keywords: ["tail", "watch", "log", "live", "growing", "monitor"],
+      category: "File",
+      unavailableReason: () => null,
+      run: () => {
+        void (async () => {
+          const { open } = await import("@tauri-apps/plugin-dialog");
+          const chosen = await open({
+            filters: [
+              { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
+            ],
+          });
+          if (typeof chosen === "string") {
+            await state().startFollowFile(chosen);
+          }
+        })();
+      },
+    },
+    {
       id: "file.dialect",
       title: "Advanced import…",
       keywords: ["dialect", "preamble", "comment", "quote", "escape", "header rows", "skip"],

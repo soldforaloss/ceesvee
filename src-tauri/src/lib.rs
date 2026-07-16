@@ -22,6 +22,7 @@ mod export;
 mod export_scope;
 mod filter;
 mod find;
+mod follow;
 mod groupby;
 mod index;
 /// Public so downstream features (and the test harness) can treat the job
@@ -113,6 +114,7 @@ pub fn run() {
         .manage(crate::append::AppendCache::default())
         .manage(crate::recipe::RecipeCache::default())
         .manage(crate::pii::PiiCache::default())
+        .manage(crate::follow::FollowRegistry::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -138,6 +140,10 @@ pub fn run() {
             commands::apply_reparse,
             commands::preview_dialect,
             commands::apply_dialect,
+            commands::start_follow,
+            commands::set_follow_paused,
+            commands::stop_follow,
+            commands::set_row_range_filter,
             commands::get_file_fingerprint,
             commands::check_external_change,
             commands::new_document,

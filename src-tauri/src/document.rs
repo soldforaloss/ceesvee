@@ -264,6 +264,8 @@ pub struct Document {
     next_op_id: u64,
     /// Append-only crash-recovery journal (F16), when journaling is on.
     journal: Option<crate::journal::JournalWriter>,
+    /// Read-only follow/tail mode (F19).
+    follow: bool,
     /// `undo_stack.len()` at the last save; the document is dirty when it differs.
     saved_marker: usize,
     /// Absolute indices of the rows matching the active filter, in order; `None`
@@ -354,6 +356,7 @@ impl Document {
             redo_meta: Vec::new(),
             next_op_id: 0,
             journal: None,
+            follow: false,
             saved_marker: 0,
             filter_view: None,
             revision: 1,
@@ -393,6 +396,7 @@ impl Document {
             redo_meta: Vec::new(),
             next_op_id: 0,
             journal: None,
+            follow: false,
             saved_marker: 0,
             filter_view: None,
             revision: 1,
@@ -439,6 +443,7 @@ impl Document {
             redo_meta: Vec::new(),
             next_op_id: 0,
             journal: None,
+            follow: false,
             saved_marker: 0,
             filter_view: None,
             revision: 1,
@@ -485,11 +490,36 @@ impl Document {
     /// Guard for mutation paths: fail with [`AppError::ReadOnly`] on an
     /// indexed document.
     pub fn ensure_editable(&self) -> AppResult<()> {
+        if self.follow {
+            return Err(AppError::invalid(
+                "follow mode is read-only — stop following to edit",
+            ));
+        }
         if self.is_editable() {
             Ok(())
         } else {
             Err(AppError::ReadOnly)
         }
+    }
+
+    // ----- follow mode (F19) -------------------------------------------------
+
+    /// Put the document into read-only follow mode (F19).
+    pub fn set_follow(&mut self, follow: bool) {
+        self.follow = follow;
+    }
+
+    /// Append rows arriving from the follow watcher (F19). Bypasses the
+    /// editable gate deliberately — follow documents have no undo history,
+    /// and the rows come from the file itself.
+    pub fn append_follow_rows(&mut self, rows: Vec<Vec<String>>) {
+        let width = self.headers.len();
+        for mut row in rows {
+            row.resize(width, String::new());
+            self.rows.push(row);
+        }
+        self.revision += 1;
+        self.touch_all_columns();
     }
 
     /// Wire name of the backing, carried on [`DocumentMeta`].
@@ -890,6 +920,7 @@ impl Document {
             revision: self.revision,
             backing: self.backing_name().to_string(),
             archive: self.archive.clone(),
+            follow: self.follow,
         }
     }
 

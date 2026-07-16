@@ -29,6 +29,7 @@ use crate::dto::{
     ScopeCounts, SelectionStats, SortKey, SplitOptions,
 };
 use crate::error::{AppError, AppResult};
+use crate::follow::{self, FollowRegistry};
 use crate::groupby::{self, GroupByPreview, GroupBySpec};
 use crate::job::JobRegistry;
 use crate::joins::{self, JoinPreview, JoinSpec};
@@ -652,6 +653,99 @@ pub async fn apply_reparse(
     })
 }
 
+// ----- follow / tail mode (F19) -----------------------------------------------
+
+/// Open a plain, uncompressed file in READ-ONLY follow mode (F19): a full
+/// parse, then a watcher that appends complete records as the file grows.
+#[tauri::command]
+pub async fn start_follow(
+    path: String,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    follows: State<'_, FollowRegistry>,
+) -> AppResult<DocumentMeta> {
+    let source = PathBuf::from(&path);
+    if !source.is_file() {
+        return Err(AppError::invalid("not a file"));
+    }
+    let start_offset = std::fs::metadata(&source)?.len();
+    let (parsed, fingerprint) = parse_file(source.clone(), None, None).await?;
+    let delimiter = parsed.delimiter;
+    let has_header = looks_like_header(&parsed.records);
+
+    let mut guard = lock(&state)?;
+    let id = guard.alloc_id();
+    let mut doc = Document::from_parsed(id, Some(source.clone()), parsed, has_header);
+    doc.set_fingerprint(fingerprint);
+    doc.set_follow(true);
+    let n_cols = doc.n_cols();
+    let meta = doc.meta();
+    guard.insert(doc);
+    let handle = guard.doc(id)?;
+    drop(guard);
+
+    let control = follow::spawn_watcher(
+        app,
+        handle,
+        follow::WatcherConfig {
+            doc_id: id,
+            path: source,
+            start_offset,
+            delimiter,
+            n_cols,
+        },
+    );
+    follows.insert(id, control);
+    Ok(meta)
+}
+
+/// Pause or resume a follow watcher. Pausing stops VIEW updates only —
+/// the file keeps its bytes and polling resumes from the same offset.
+#[tauri::command]
+pub fn set_follow_paused(
+    doc_id: u64,
+    paused: bool,
+    follows: State<'_, FollowRegistry>,
+) -> AppResult<()> {
+    if follows.set_paused(doc_id, paused) {
+        Ok(())
+    } else {
+        Err(AppError::invalid("that document is not being followed"))
+    }
+}
+
+/// Filter the grid to rows from `from_row` onward (F19: "only newly added
+/// rows"). Clearing uses the ordinary clear_filter.
+#[tauri::command]
+pub fn set_row_range_filter(
+    doc_id: u64,
+    from_row: usize,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    write_doc(&state, doc_id, |doc| {
+        let rows: Vec<usize> = (from_row.min(doc.n_rows())..doc.n_rows()).collect();
+        doc.set_filter(rows);
+        Ok(doc.meta())
+    })
+}
+
+/// Stop following: the watcher exits, its file handle closes, and the
+/// document stays open as a read-only snapshot.
+#[tauri::command]
+pub fn stop_follow(
+    doc_id: u64,
+    state: Db<'_>,
+    follows: State<'_, FollowRegistry>,
+) -> AppResult<()> {
+    follows.stop(doc_id);
+    if let Ok(handle) = doc_handle(&state, doc_id) {
+        if let Ok(mut doc) = handle.write() {
+            doc.set_follow(false);
+        }
+    }
+    Ok(())
+}
+
 // ----- advanced dialect / preamble import (F18) -----------------------------------
 
 /// Parse the document's file under a full dialect (preamble skips, comment
@@ -786,7 +880,10 @@ pub fn close_document(
     outlier_cache: State<'_, OutlierCache>,
     append_cache: State<'_, AppendCache>,
     pii_cache: State<'_, PiiCache>,
+    follows: State<'_, FollowRegistry>,
 ) -> AppResult<()> {
+    // Closing a followed tab stops its watcher and releases the handle.
+    follows.stop(doc_id);
     // A clean close deletes the crash-recovery journal (F16): there is
     // nothing left to recover once the user closed the tab deliberately.
     if let Ok(handle) = doc_handle(&state, doc_id) {

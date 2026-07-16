@@ -24,6 +24,7 @@ import { ExportDialog } from "./components/ExportDialog";
 import { ExternalChangeDialog } from "./components/ExternalChangeDialog";
 import { FilterDialog } from "./components/FilterDialog";
 import { FindBar } from "./components/FindBar";
+import { FollowBar } from "./components/FollowBar";
 import { Grid } from "./components/Grid";
 import { GroupByDialog } from "./components/GroupByDialog";
 import { Close } from "./components/Icons";
@@ -49,6 +50,7 @@ import { Toolbar } from "./components/Toolbar";
 import { TransformDialog } from "./components/TransformDialog";
 import { registry } from "./lib/commands";
 import { registerAppCommands } from "./lib/commandDefs";
+import { onFollowEvents } from "./lib/follow";
 import { onJobFinished, onJobProgress } from "./lib/jobs";
 import { bindingFromEvent, effectiveBindings } from "./lib/shortcuts";
 import * as api from "./lib/tauri";
@@ -103,6 +105,22 @@ export default function App() {
     return () => {
       unProgress?.();
       unFinished?.();
+    };
+  }, []);
+
+  // Route follow-mode watcher events (F19) into the store.
+  useEffect(() => {
+    let unlistens: UnlistenFn[] = [];
+    void onFollowEvents(
+      (update) => useStore.getState().handleFollowUpdate(update),
+      (alert) => useStore.getState().handleFollowAlert(alert),
+    )
+      .then((fns) => {
+        unlistens = fns;
+      })
+      .catch(() => undefined);
+    return () => {
+      for (const fn of unlistens) fn();
     };
   }, []);
 
@@ -238,6 +256,7 @@ export default function App() {
       <Toolbar />
       <Tabs />
       <SourceBar />
+      <FollowBar />
       <ProfileSuggestionBar />
       <FindBar />
 

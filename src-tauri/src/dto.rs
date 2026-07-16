@@ -35,6 +35,9 @@ pub struct DocumentMeta {
     pub dirty: bool,
     pub can_undo: bool,
     pub can_redo: bool,
+    /// Read-only follow/tail mode (F19).
+    #[serde(default)]
+    pub follow: bool,
     /// Monotonically increasing revision, bumped on every mutation. Previews
     /// and deferred operations echo this back as `expectedRevision` and are
     /// rejected when the document has moved on.

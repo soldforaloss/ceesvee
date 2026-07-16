@@ -8,6 +8,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Follow / tail mode** (palette → "Open in follow mode…"): watch a
+  growing CSV log inside CEESVEE. The document opens read-only; a watcher
+  appends complete records as the file grows, holding partial trailing
+  records — including open quoted fields spanning chunks — until they
+  complete. Pause/resume (nothing is lost while paused), a new-row
+  counter, jump-to-newest, and a one-click "only new rows" filter;
+  truncation, replacement, rotation, wider records, and encoding changes
+  raise an alert (with restart-or-stop options) instead of ever silently
+  combining old and new content. Closing the tab stops the watcher and
+  releases the file handle.
 - **Advanced dialect import** (palette → "Advanced import…"): open
   real-world "CSV" files with metadata preambles, comment lines, custom
   quote/escape characters (or quoting disabled entirely), multi-row
