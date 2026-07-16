@@ -319,6 +319,9 @@ export interface ClusterState {
   processed: number;
   total: number | null;
   report: ClusterReport | null;
+  /** The scope the CURRENT report was scanned with — applies use this, not
+   * whatever the dialog's scope controls say now. */
+  scanScope: ExportScope | null;
   error: string | null;
 }
 
@@ -327,6 +330,7 @@ const initialCluster: ClusterState = {
   processed: 0,
   total: null,
   report: null,
+  scanScope: null,
   error: null,
 };
 
@@ -574,6 +578,8 @@ interface Store {
   resetColumnWidths: () => void;
   setScrollPosition: (row: number, column: number) => void;
   loadSummaries: () => void;
+  /** Invalidate the grid's row cache (e.g. after an out-of-grid cell save). */
+  invalidateGrid: () => void;
 
   // documents
   openDialog: () => Promise<void>;
@@ -882,6 +888,8 @@ export const useStore = create<Store>((set, get) => {
         error: null,
       },
       dedup: initialDedup,
+      // Cluster reports are per-document; never let one leak across tabs.
+      cluster: initialCluster,
       // Per-doc reports; the dialogs re-adopt the backend cache on open.
       semantic: initialSemantic,
       crossval: initialCrossVal,
@@ -1235,6 +1243,8 @@ export const useStore = create<Store>((set, get) => {
 
     resetColumnWidths: () => set({ columnWidths: {} }),
 
+    invalidateGrid: () => set((s) => ({ dataVersion: s.dataVersion + 1 })),
+
     setScrollPosition: (row, column) => {
       // Trailing debounce: visible-region events fire on every scroll frame.
       pendingScroll = { row, column };
@@ -1434,7 +1444,14 @@ export const useStore = create<Store>((set, get) => {
       try {
         const jobId = await api.startClusterScan(meta.id, spec, meta.revision);
         set((s) => ({
-          cluster: { ...s.cluster, scanJobId: jobId, processed: 0, total: null, error: null },
+          cluster: {
+            ...s.cluster,
+            scanJobId: jobId,
+            processed: 0,
+            total: null,
+            scanScope: spec.scope,
+            error: null,
+          },
         }));
         consumeEarlyFinish(jobId);
       } catch (e) {
@@ -1623,6 +1640,10 @@ export const useStore = create<Store>((set, get) => {
             processed: 0,
             total: null,
             spec,
+            // The old report pairs with the PREVIOUS spec; if this scan
+            // fails or is cancelled, actions must not re-enable against a
+            // report whose rows the new spec never selected.
+            report: null,
             error: null,
           },
         }));
@@ -1987,6 +2008,25 @@ export const useStore = create<Store>((set, get) => {
     // ----- background-job events -------------------------------------------
 
     handleJobProgress: (progress) => {
+      // Archive extraction (F17) runs before any document exists, so its
+      // job carries no docId — route it by job id BEFORE the docId gate.
+      if (
+        progress.kind === "openIndexed" ||
+        progress.kind === "convertEditable" ||
+        progress.kind === "reindex" ||
+        progress.kind === "archiveExtract"
+      ) {
+        if (get().indexing?.jobId !== progress.jobId) return;
+        set((s) => ({
+          indexing: s.indexing && {
+            ...s.indexing,
+            processed: progress.processed,
+            total: progress.total ?? s.indexing.total,
+          },
+        }));
+        return;
+      }
+
       if (progress.docId == null) return;
       const docId = progress.docId;
 
@@ -2078,23 +2118,9 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
-      if (
-        progress.kind === "openIndexed" ||
-        progress.kind === "convertEditable" ||
-        progress.kind === "reindex" ||
-        progress.kind === "archiveExtract"
-      ) {
-        if (get().indexing?.jobId !== progress.jobId) return;
-        set((s) => ({
-          indexing: s.indexing && {
-            ...s.indexing,
-            processed: progress.processed,
-            total: progress.total,
-          },
-        }));
-        return;
-      }
-
+      // The indexing-family branch (openIndexed / convertEditable / reindex /
+      // archiveExtract) is handled at the TOP of this handler, before the
+      // docId gate — extraction jobs have no document yet.
       if (progress.kind !== "diagnostics") return;
       // Only track the scan we started (guards against reused ids after e.g.
       // an app-side restart of the job system).
@@ -2312,6 +2338,13 @@ export const useStore = create<Store>((set, get) => {
       if (finished.kind === "cluster") {
         if (get().cluster.scanJobId !== finished.jobId) return;
         if (finished.status === "done") {
+          // A report belongs to the document it was scanned on; if the user
+          // switched tabs meanwhile, drop it rather than install it against
+          // a different document (values could coincidentally match).
+          if (finished.docId !== get().activeId) {
+            set((s) => ({ cluster: { ...s.cluster, scanJobId: null } }));
+            return;
+          }
           const report = finished.docId
             ? await api.getClusterReport(finished.docId).catch(() => null)
             : null;

@@ -150,5 +150,21 @@ describe("cell references (F11 go-to)", () => {
     expect(parseCellRef("4 : 2")).toEqual({ row: 3, col: 1 });
     expect(parseCellRef("")).toBeNull();
     expect(parseCellRef("nope")).toBeNull();
+    // References are 1-based: zero must be rejected, never mapped to -1.
+    expect(parseCellRef("0")).toBeNull();
+    expect(parseCellRef("A0")).toBeNull();
+    expect(parseCellRef("0,5")).toBeNull();
+    expect(parseCellRef("5,0")).toBeNull();
+  });
+
+  it("hides shortcut-only aliases from search but keeps them registered", () => {
+    const reg = new CommandRegistry();
+    reg.register([
+      cmd("edit.redo", "Redo", { defaultShortcut: "mod+y" }),
+      cmd("edit.redoAlt", "Redo", { defaultShortcut: "mod+shift+z", hidden: true }),
+    ]);
+    expect(reg.search("").map((r) => r.command.id)).toEqual(["edit.redo"]);
+    expect(reg.defaultBindings().get("edit.redoAlt")).toBe("mod+shift+z");
+    expect(reg.byId("edit.redoAlt")).toBeDefined();
   });
 });
