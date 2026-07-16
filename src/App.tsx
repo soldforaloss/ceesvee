@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { ArchiveEntryDialog } from "./components/ArchiveEntryDialog";
 import { CellEditorDialog } from "./components/CellEditorDialog";
+import { ClusterDialog } from "./components/ClusterDialog";
 import { ColumnExplorerPanel } from "./components/ColumnExplorerPanel";
 import { CommandPalette } from "./components/CommandPalette";
 import { CompareDialog } from "./components/CompareDialog";
@@ -261,6 +262,7 @@ export default function App() {
       {activeModal === "compare" && <CompareDialog onClose={() => setModal(null)} />}
       {activeModal === "shortcuts" && <ShortcutsDialog onClose={() => setModal(null)} />}
       {activeModal === "copyAs" && <CopyAsDialog onClose={() => setModal(null)} />}
+      {activeModal === "cluster" && <ClusterDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       <CommandPalette />
       <CellEditorDialog />

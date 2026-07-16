@@ -282,6 +282,14 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("dedup"),
     },
     {
+      id: "data.cluster",
+      title: "Cluster values…",
+      keywords: ["fuzzy", "normalize", "variants", "misspelling", "merge values", "openrefine"],
+      category: "Data",
+      unavailableReason: needsDoc,
+      run: () => openModal("cluster"),
+    },
+    {
       id: "data.compare",
       title: "Compare…",
       keywords: ["diff", "changes", "versus"],
