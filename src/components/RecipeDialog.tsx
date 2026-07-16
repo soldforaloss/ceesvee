@@ -65,6 +65,7 @@ export function RecipeDialog({ onClose }: { onClose: () => void }) {
   const [profileId, setProfileId] = useState("");
   const [selectCols, setSelectCols] = useState("");
   const [sortColumn, setSortColumn] = useState("");
+  const [dedupeKeys, setDedupeKeys] = useState("");
   const [files, setFiles] = useState<string[]>([]);
   const [outputDir, setOutputDir] = useState("");
   const [template, setTemplate] = useState("{name}_clean.{ext}");
@@ -135,11 +136,22 @@ export function RecipeDialog({ onClose }: { onClose: () => void }) {
         }
         step = { type: "sort", keys: [{ column: sortColumn.trim(), descending: false }] };
         break;
-      case "deduplicate":
+      case "deduplicate": {
+        // The dedupe engine rejects empty key lists — a step without keys
+        // would fail on every input at run time. Keys are 1-based column
+        // NUMBERS (recipes apply positionally across many files).
+        const keyColumns = dedupeKeys
+          .split(",")
+          .map((c) => Number(c.trim()) - 1)
+          .filter((n) => Number.isInteger(n) && n >= 0);
+        if (keyColumns.length === 0) {
+          setError("list the dedupe key column numbers (1-based, comma-separated)");
+          return;
+        }
         step = {
           type: "deduplicate",
           spec: {
-            keyColumns: [],
+            keyColumns,
             trim: true,
             caseInsensitive: false,
             collapseWhitespace: false,
@@ -149,6 +161,7 @@ export function RecipeDialog({ onClose }: { onClose: () => void }) {
           keep: "first",
         };
         break;
+      }
       case "reparse":
         step = { type: "reparse", delimiter: null, encoding: null, hasHeaderRow: true };
         break;
@@ -360,6 +373,14 @@ export function RecipeDialog({ onClose }: { onClose: () => void }) {
                 value={sortColumn}
                 onChange={(e) => setSortColumn(e.target.value)}
                 placeholder="sort column"
+                className={inputCls}
+              />
+            )}
+            {stepKind === "deduplicate" && (
+              <input
+                value={dedupeKeys}
+                onChange={(e) => setDedupeKeys(e.target.value)}
+                placeholder="dedupe key column numbers (1-based), e.g. 1,3"
                 className={inputCls}
               />
             )}

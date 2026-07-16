@@ -306,27 +306,32 @@ pub fn compute(doc: &Document, spec: &RepairSpec) -> AppResult<RepairComputed> {
         }
         RepairOp::Interpolate { extrapolate } => {
             for (ci, &col) in cols.iter().enumerate() {
-                // Known points: (position in scope, value). Invalid numerics
-                // are neither targets nor anchors; they are counted only.
+                // Known points: (ABSOLUTE row, value) — scoped views can skip
+                // rows, and interpolation is documented as using absolute row
+                // distance, so gaps from filtered-out rows must not compress.
+                // Invalid numerics are neither targets nor anchors.
                 let mut known: Vec<(usize, f64)> = Vec::new();
-                for (pos, (_, row_cells)) in cells.iter().enumerate() {
+                for (abs, row_cells) in cells.iter() {
                     let cell = row_cells[ci].trim();
                     if cell.is_empty() {
                         continue;
                     }
                     match analyze::as_number(cell) {
-                        Some(n) => known.push((pos, n)),
+                        Some(n) => known.push((*abs, n)),
                         None => invalid_numeric += 1,
                     }
                 }
                 if known.is_empty() {
                     continue;
                 }
-                for (pos, (abs, row_cells)) in cells.iter().enumerate() {
+                // Scope rows arrive in ascending order, but sort defensively:
+                // partition_point requires it.
+                known.sort_unstable_by_key(|a| a.0);
+                for (abs, row_cells) in cells.iter() {
                     if !is_blank(&row_cells[ci]) {
                         continue;
                     }
-                    let next = known.partition_point(|&(p, _)| p < pos);
+                    let next = known.partition_point(|&(p, _)| p < *abs);
                     let value = if next == 0 {
                         // Before the first known value.
                         if *extrapolate {
@@ -344,7 +349,7 @@ pub fn compute(doc: &Document, spec: &RepairSpec) -> AppResult<RepairComputed> {
                     } else {
                         let (x0, y0) = known[next - 1];
                         let (x1, y1) = known[next];
-                        let t = (pos - x0) as f64 / (x1 - x0) as f64;
+                        let t = (*abs - x0) as f64 / (x1 - x0) as f64;
                         Some(y0 + (y1 - y0) * t)
                     };
                     if let Some(v) = value {
@@ -370,6 +375,15 @@ pub fn compute(doc: &Document, spec: &RepairSpec) -> AppResult<RepairComputed> {
                         remove_columns.push(col);
                     }
                 }
+            }
+            // A preview that would strip the whole document must fail HERE,
+            // not at apply time (delete_columns refuses to delete every
+            // column, which would turn a confirmed preview into an error).
+            if remove_columns.len() == doc.n_cols() {
+                return Err(AppError::invalid(
+                    "every column meets the threshold — removing them all would empty the \
+                     document; lower the threshold or narrow the scope",
+                ));
             }
         }
     }
@@ -426,6 +440,47 @@ mod tests {
             columns,
             scope: ExportScope::All,
         }
+    }
+
+    #[test]
+    fn interpolation_uses_absolute_row_distance_in_scoped_views() {
+        // Anchors at absolute rows 0 (=0) and 10 (=100); the blank sits at
+        // absolute row 1. A filter hides rows 2..=9, so a position-based
+        // interpolation would see the blank halfway (=50); absolute-row
+        // interpolation puts it at 10.
+        let mut csv = String::from("n,x\n0,1\n,1\n");
+        for i in 2..10 {
+            csv.push_str(&format!("{i},1\n"));
+        }
+        csv.push_str("100,1\n");
+        let mut d = doc(&csv);
+        d.set_filter(vec![0, 1, 10]).unwrap();
+        let computed = compute(
+            &d,
+            &RepairSpec {
+                op: RepairOp::Interpolate { extrapolate: false },
+                columns: vec![0],
+                scope: ExportScope::VisibleRows,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            computed.changes,
+            vec![(1, 0, "10".into())],
+            "absolute row distance, not scope position"
+        );
+    }
+
+    #[test]
+    fn remove_columns_refuses_to_empty_the_document() {
+        // Every column is fully blank in the scoped rows, so the threshold
+        // catches them all — the PREVIEW must fail, not the later apply.
+        let d = doc("a,b\n,\n,\n");
+        let err = compute(
+            &d,
+            &spec(RepairOp::RemoveColumns { threshold: 0.5 }, vec![0, 1]),
+        );
+        assert!(err.is_err(), "all-column removal must fail at preview time");
     }
 
     #[test]

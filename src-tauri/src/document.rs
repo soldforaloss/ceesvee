@@ -280,6 +280,11 @@ pub struct Document {
     journal: Option<crate::journal::JournalWriter>,
     /// Read-only follow/tail mode (F19).
     follow: bool,
+    /// F19 "only new rows": when set, the filter view is a LIVE range from
+    /// this absolute row onward — `append_follow_rows` extends it so newly
+    /// appended records stay visible while filtered. Cleared by an ordinary
+    /// filter or clear-filter.
+    follow_range_from: Option<usize>,
     /// `undo_stack.len()` at the last save; the document is dirty when it differs.
     saved_marker: usize,
     /// Stable logical column IDs (F12), in lockstep with `headers`. Assigned
@@ -385,6 +390,7 @@ impl Document {
             next_op_id: 0,
             journal: None,
             follow: false,
+            follow_range_from: None,
             saved_marker: 0,
             column_ids: positional_column_ids(n_cols_final),
             next_column_id: n_cols_final as u64,
@@ -429,6 +435,7 @@ impl Document {
             next_op_id: 0,
             journal: None,
             follow: false,
+            follow_range_from: None,
             saved_marker: 0,
             column_ids: positional_column_ids(cols),
             next_column_id: cols as u64,
@@ -480,6 +487,7 @@ impl Document {
             next_op_id: 0,
             journal: None,
             follow: false,
+            follow_range_from: None,
             saved_marker: 0,
             column_ids: positional_column_ids(n_cols),
             next_column_id: n_cols as u64,
@@ -560,6 +568,22 @@ impl Document {
         }
         self.revision += 1;
         self.touch_all_columns();
+        // A live "only new rows" range keeps following the file: extend the
+        // view to include what was just appended. Follow documents are
+        // memory-backed, so recomposition cannot fail in practice — if it
+        // ever did, dropping the whole view beats leaving a stale one.
+        if let Some(from) = self.follow_range_from {
+            let rows: Vec<usize> = (from.min(self.rows.len())..self.rows.len()).collect();
+            if self.set_filter(rows).is_err() {
+                self.clear_row_view();
+            }
+        }
+    }
+
+    /// Mark (or clear) the F19 live "only new rows" range. The caller still
+    /// applies the initial filter; appends keep it extended.
+    pub fn set_follow_range(&mut self, from: Option<usize>) {
+        self.follow_range_from = from;
     }
 
     /// Wire name of the backing, carried on [`DocumentMeta`].
@@ -760,6 +784,8 @@ impl Document {
 
     /// Drop the filter ingredient (a view sort, if any, stays applied).
     pub fn clear_filter(&mut self) -> AppResult<()> {
+        // A cleared filter also ends the F19 live "only new rows" range.
+        self.follow_range_from = None;
         if self.filter_rows.take().is_some() {
             self.recompose_row_view()?;
         }
@@ -789,6 +815,8 @@ impl Document {
     /// mutations call this from the command layer: they shift the absolute
     /// indices a snapshot view refers to.
     pub fn clear_row_view(&mut self) {
+        // Ending the whole row view also ends the F19 live range.
+        self.follow_range_from = None;
         let had_view = self.filter_rows.is_some() || !self.view_sort.is_empty();
         self.filter_rows = None;
         self.view_sort.clear();
@@ -1485,6 +1513,14 @@ impl Document {
         }
     }
 
+    /// True when the user undid PAST the last save: the document is dirty,
+    /// but the saved state lives ahead in the REDO branch (redo returns to
+    /// it) — there are no "changes since save" to list, and the panel must
+    /// say so instead of showing an empty, misleading list.
+    pub fn saved_in_redo_branch(&self) -> bool {
+        self.saved_marker != usize::MAX && self.saved_marker > self.undo_stack.len()
+    }
+
     /// Whether an op touches only cell VALUES (never structure). Reverting
     /// anything is only safe while every LATER op is cell-only, because
     /// cell ops never move rows or columns.
@@ -1501,6 +1537,98 @@ impl Document {
         self.undo_stack[index + 1..]
             .iter()
             .all(Self::op_is_cell_only)
+    }
+
+    /// Rows/columns whose EXISTENCE is created by APPLYING `op` (recursing
+    /// composites; an `Inverse` flips direction, so reverting a delete also
+    /// counts as inserting). Coordinates are in the op's own final layout —
+    /// valid against the current document while every later op is cell-only.
+    fn op_inserted_coords(
+        op: &EditOp,
+        rows: &mut std::collections::HashSet<usize>,
+        cols: &mut std::collections::HashSet<usize>,
+        reverted: bool,
+    ) {
+        match op {
+            EditOp::InsertRows { at, count } if !reverted => rows.extend(*at..*at + *count),
+            EditOp::InsertColumn { at, .. } if !reverted => {
+                cols.insert(*at);
+            }
+            EditOp::DeleteRows { removed } if reverted => {
+                rows.extend(removed.iter().map(|(i, _)| *i));
+            }
+            EditOp::DeleteColumns { removed } if reverted => {
+                cols.extend(removed.iter().map(|c| c.index));
+            }
+            EditOp::Composite(ops) => {
+                for sub in ops {
+                    Self::op_inserted_coords(sub, rows, cols, reverted);
+                }
+            }
+            EditOp::Inverse(inner) => Self::op_inserted_coords(inner, rows, cols, !reverted),
+            _ => {}
+        }
+    }
+
+    /// Why reverting the op at `index` is not allowed right now (`None` =
+    /// allowed). Beyond the later-structural gate, an op that INSERTED
+    /// structure cannot be inverse-reverted while the CURRENT contents of
+    /// that structure differ from what the op itself left there — undoing
+    /// the revert re-applies the op, which restores the op's own values and
+    /// would silently lose the later edits. (Plain single inserts are
+    /// exempt: they revert as capturing deletes instead.) The check is
+    /// state-based on purpose: an edit made and then reverted back leaves
+    /// matching contents, so it never blocks.
+    fn revert_block_reason(&self, index: usize) -> Option<String> {
+        if !self.ops_after_are_cell_only(index) {
+            return Some(
+                "later structural changes depend on this one — use Revert all".to_string(),
+            );
+        }
+        if matches!(
+            self.undo_stack[index],
+            EditOp::InsertRows { .. } | EditOp::InsertColumn { .. }
+        ) {
+            return None; // capture-as-delete keeps later edits recoverable
+        }
+        let mut ins_rows = std::collections::HashSet::new();
+        let mut ins_cols = std::collections::HashSet::new();
+        Self::op_inserted_coords(&self.undo_stack[index], &mut ins_rows, &mut ins_cols, false);
+        if ins_rows.is_empty() && ins_cols.is_empty() {
+            return None;
+        }
+        // What the op's own re-apply would put inside the inserted
+        // structure: its trailing cell edits, blank otherwise.
+        let mut own_edits = Vec::new();
+        Self::collect_cell_edits(&self.undo_stack[index], false, &mut own_edits);
+        let mut own: std::collections::HashMap<(usize, usize), &str> =
+            std::collections::HashMap::new();
+        for e in &own_edits {
+            own.insert((e.row, e.col), e.new.as_str()); // in-order: last wins
+        }
+        let cell = |r: usize, c: usize| -> &str {
+            self.rows
+                .get(r)
+                .and_then(|row| row.get(c))
+                .map(String::as_str)
+                .unwrap_or("")
+        };
+        let matches_own =
+            |r: usize, c: usize| -> bool { cell(r, c) == own.get(&(r, c)).copied().unwrap_or("") };
+        let clean = ins_rows
+            .iter()
+            .all(|&r| (0..self.headers.len()).all(|c| matches_own(r, c)))
+            && ins_cols
+                .iter()
+                .all(|&c| (0..self.rows.len()).all(|r| matches_own(r, c)));
+        if !clean {
+            return Some(
+                "the content inside the structure this change added was edited \
+                 afterwards — revert those cells first, or use Revert all"
+                    .to_string(),
+            );
+        }
+        None
     }
 
     /// Collect an op's cell edits (recursing into composites; an Inverse
@@ -1562,7 +1690,7 @@ impl Document {
                 let mut cells = Vec::new();
                 Self::collect_cell_edits(op, false, &mut cells);
                 let structural = !Self::op_is_cell_only(op);
-                let revertible = self.ops_after_are_cell_only(index);
+                let blocked_reason = self.revert_block_reason(index);
                 ChangeSummary {
                     id: meta.id,
                     epoch_secs: meta.epoch_secs,
@@ -1570,10 +1698,8 @@ impl Document {
                     cells_affected: cells.len(),
                     sample: cells.into_iter().take(SAMPLE).collect(),
                     structural,
-                    revertible,
-                    blocked_reason: (!revertible).then(|| {
-                        "later structural changes depend on this one — use Revert all".to_string()
-                    }),
+                    revertible: blocked_reason.is_none(),
+                    blocked_reason,
                 }
             })
             .collect()
@@ -1590,19 +1716,34 @@ impl Document {
 
     /// Revert ONE whole operation as a NEW, undoable operation. Allowed only
     /// while every later operation is cell-only (so the inverse's row and
-    /// column coordinates are still valid).
+    /// column coordinates are still valid) and never at the cost of later
+    /// edits living inside inserted structure (see `revert_block_reason`).
     pub fn revert_stack_op(&mut self, op_id: u64) -> AppResult<()> {
         self.ensure_editable()?;
         let index = self.unsaved_index_of(op_id)?;
-        if !self.ops_after_are_cell_only(index) {
-            return Err(AppError::invalid(
-                "later structural changes depend on this one — revert those \
-                 first or use Revert all",
-            ));
+        if let Some(reason) = self.revert_block_reason(index) {
+            return Err(AppError::invalid(reason));
         }
-        let inverse = EditOp::Inverse(Box::new(self.undo_stack[index].clone()));
-        self.apply(&inverse);
-        self.register(inverse);
+        match self.undo_stack[index].clone() {
+            // Reverting a plain insert REMOVES structure that later cell
+            // edits may have filled. Register the revert as an ordinary
+            // DELETE op: it captures the CURRENT contents, so undoing the
+            // revert restores the later edits exactly instead of blank rows.
+            EditOp::InsertRows { at, count } => {
+                let rows: Vec<usize> = (at..at + count).collect();
+                let op = self.op_delete_rows(&rows);
+                self.register(op);
+            }
+            EditOp::InsertColumn { at, .. } => {
+                let op = self.op_delete_columns(&[at]);
+                self.register(op);
+            }
+            target => {
+                let inverse = EditOp::Inverse(Box::new(target));
+                self.apply(&inverse);
+                self.register(inverse);
+            }
+        }
         Ok(())
     }
 
@@ -1776,6 +1917,14 @@ impl Document {
                 true
             }
             EditOp::DeleteRows { removed } => {
+                // The captured rows must still FIT the document: replaying
+                // (or undoing) a delete whose rows have a different width
+                // would re-insert ragged rows and break the rectangular
+                // invariant — e.g. a journal recovered against a source
+                // whose column count changed.
+                if removed.iter().any(|(_, row)| row.len() != *cols) {
+                    return false;
+                }
                 if inverse {
                     if removed.iter().any(|(i, _)| *i > *rows) {
                         return false;
@@ -2553,6 +2702,26 @@ mod tests {
     }
 
     #[test]
+    fn follow_range_filter_extends_on_append() {
+        // F19 "only new rows": the range is LIVE — records appended by the
+        // watcher become visible without reapplying the filter.
+        let mut d = doc_from("a\n1\n2", true);
+        d.set_follow(true);
+        d.set_follow_range(Some(2));
+        d.set_filter(Vec::new()).unwrap(); // rows 0..2 are old; nothing new yet
+        assert_eq!(d.visible_len(), 0);
+
+        d.append_follow_rows(vec![vec!["3".into()]]);
+        assert_eq!(d.visible_len(), 1, "the appended row entered the range");
+        assert_eq!(d.get_rows(0, 10).unwrap().rows[0][0], "3");
+
+        // Clearing the filter ends the live range.
+        d.clear_filter().unwrap();
+        d.append_follow_rows(vec![vec!["4".into()]]);
+        assert_eq!(d.visible_len(), 4);
+    }
+
+    #[test]
     fn revision_unchanged_by_noops_and_saves() {
         let mut d = doc_from("a\n1", true);
         let r = d.revision();
@@ -3104,6 +3273,69 @@ mod f15_tests {
     }
 
     #[test]
+    fn reverting_an_insert_keeps_later_edits_recoverable() {
+        // Insert a row, edit INSIDE it, revert the insert, then undo the
+        // revert: the edit must come back — the revert is a capturing
+        // delete, never a blank re-insert.
+        let mut d = doc("a\n1\n");
+        d.insert_rows(1, 1).unwrap();
+        d.set_cells(vec![(1, 0, "typed later".into())]).unwrap();
+        let insert_id = d.changes_since_save()[0].id;
+
+        let changes = d.changes_since_save();
+        assert!(changes[0].revertible, "plain inserts stay revertible");
+        d.revert_stack_op(insert_id).unwrap();
+        assert_eq!(d.n_rows(), 1, "the inserted row is gone");
+
+        d.undo().unwrap();
+        assert_eq!(
+            d.cell(1, 0),
+            "typed later",
+            "undoing the revert restores the later edit, not a blank row"
+        );
+    }
+
+    #[test]
+    fn composite_insert_revert_is_blocked_while_edits_live_inside() {
+        // A paste that GREW the grid is a composite containing an insert;
+        // a later edit inside the added column blocks the inverse revert
+        // (which could not restore that edit on undo).
+        let mut d = doc("a\n1\n");
+        d.paste(0, 0, vec![vec!["p1".into(), "p2".into()]]).unwrap();
+        d.set_cells(vec![(0, 1, "later".into())]).unwrap();
+
+        let changes = d.changes_since_save();
+        assert_eq!(changes[0].kind, "composite");
+        assert!(!changes[0].revertible);
+        assert!(d.revert_stack_op(changes[0].id).is_err());
+
+        // Reverting the inner edit first unblocks the composite.
+        let edit_id = changes[1].id;
+        d.revert_cells_of_op(edit_id, &[(0, 1)]).unwrap();
+        let refreshed = d.changes_since_save();
+        assert!(refreshed[0].revertible, "no live edits inside any more");
+        d.revert_stack_op(refreshed[0].id).unwrap();
+        assert_eq!(d.n_cols(), 1);
+    }
+
+    #[test]
+    fn undoing_past_the_save_reports_the_redo_branch_state() {
+        let mut d = doc("a\n1\n");
+        d.set_cells(vec![(0, 0, "X".into())]).unwrap();
+        d.mark_saved(None);
+        assert!(!d.saved_in_redo_branch());
+
+        d.undo().unwrap();
+        assert!(d.is_dirty(), "current state differs from the saved file");
+        assert!(d.changes_since_save().is_empty(), "nothing to list");
+        assert!(d.saved_in_redo_branch(), "the save is ahead, in redo");
+
+        d.redo().unwrap();
+        assert!(!d.is_dirty());
+        assert!(!d.saved_in_redo_branch());
+    }
+
+    #[test]
     fn revert_one_cell_leaves_unrelated_edits_alone() {
         let mut d = doc("a,b\n1,2\n");
         d.set_cells(vec![(0, 0, "X".into()), (0, 1, "Y".into())])
@@ -3188,6 +3420,35 @@ mod f16_tests {
     fn doc(csv: &str) -> Document {
         let parsed = parse(csv.as_bytes(), &ParseSettings::default()).unwrap();
         Document::from_parsed(1, None, parsed, true)
+    }
+
+    #[test]
+    fn replay_rejects_delete_rows_with_a_different_width() {
+        // A journal recovered against a source whose COLUMN COUNT changed:
+        // the captured DeleteRows rows are 3 wide, the document is 2 wide.
+        // Accepting it would let a later Undo re-insert ragged rows.
+        let mut d = doc("a,b\n1,2\n3,4\n");
+        let op = EditOp::DeleteRows {
+            removed: vec![(0, vec!["x".into(), "y".into(), "z".into()])],
+        };
+        let record = crate::journal::JournalRecord::Op {
+            op: serde_json::to_value(&op).unwrap(),
+        };
+        let err = d.replay_journal_records(&[record]);
+        assert!(err.is_err(), "width mismatch must fail replay");
+        assert_eq!(d.n_rows(), 2, "nothing was applied");
+
+        // The same shape with the CORRECT width replays fine.
+        let ok_op = EditOp::DeleteRows {
+            removed: vec![(0, vec!["1".into(), "2".into()])],
+        };
+        let record = crate::journal::JournalRecord::Op {
+            op: serde_json::to_value(&ok_op).unwrap(),
+        };
+        assert_eq!(d.replay_journal_records(&[record]).unwrap(), 1);
+        assert_eq!(d.n_rows(), 1);
+        d.undo().unwrap();
+        assert_eq!(d.n_rows(), 2, "undo re-inserts a rectangular row");
     }
 
     #[test]

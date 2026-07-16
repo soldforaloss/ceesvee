@@ -63,19 +63,15 @@ pub struct FollowAlert {
 /// delimiter, `"` quoting with doubling). Bytes may arrive in arbitrary
 /// chunks; an incomplete trailing record — including an open quoted field —
 /// is carried until it completes.
+#[derive(Default)]
 pub struct IncrementalCsv {
-    delimiter: u8,
     carry: Vec<u8>,
     in_quotes: bool,
 }
 
 impl IncrementalCsv {
-    pub fn new(delimiter: u8) -> IncrementalCsv {
-        IncrementalCsv {
-            delimiter,
-            carry: Vec::new(),
-            in_quotes: false,
-        }
+    pub fn new() -> IncrementalCsv {
+        IncrementalCsv::default()
     }
 
     /// How many carried bytes are waiting for their record to complete.
@@ -84,9 +80,12 @@ impl IncrementalCsv {
         self.carry.len()
     }
 
-    /// Feed appended bytes; returns the COMPLETE records they finished.
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<String>> {
-        let mut records = Vec::new();
+    /// Feed appended bytes; returns the COMPLETE record LINES they finished
+    /// (raw bytes, so the caller can validate the encoding per record —
+    /// record boundaries are newlines, which never split a multibyte
+    /// character — before splitting fields).
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut lines = Vec::new();
         for &b in bytes {
             if b == b'"' {
                 // Toggling on every quote handles doubling too: "" flips
@@ -100,13 +99,13 @@ impl IncrementalCsv {
                     line.pop();
                 }
                 if !line.is_empty() {
-                    records.push(split_record(&line, self.delimiter));
+                    lines.push(line);
                 }
                 continue;
             }
             self.carry.push(b);
         }
-        records
+        lines
     }
 }
 
@@ -181,6 +180,32 @@ impl FollowRegistry {
     }
 }
 
+/// Identity of the followed file, captured when the watch starts. A rotation
+/// that replaces the file can leave the new size EQUAL OR LARGER than the
+/// old offset, so size alone cannot detect it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileIdentity {
+    /// Unix: the inode number — changes whenever the path points at a new
+    /// file.
+    #[cfg(unix)]
+    ino: u64,
+    /// Windows has no inode in std; the creation time changes when the path
+    /// is replaced (best-effort: some filesystems don't report it, and NTFS
+    /// "tunneling" can briefly preserve it — the size-shrink check still
+    /// backstops those cases).
+    created: Option<std::time::SystemTime>,
+}
+
+impl FileIdentity {
+    pub fn of(metadata: &std::fs::Metadata) -> FileIdentity {
+        FileIdentity {
+            #[cfg(unix)]
+            ino: std::os::unix::fs::MetadataExt::ino(metadata),
+            created: metadata.created().ok(),
+        }
+    }
+}
+
 /// Everything the watcher thread needs (no Tauri types, so it is testable).
 pub struct WatcherConfig {
     pub doc_id: u64,
@@ -190,6 +215,10 @@ pub struct WatcherConfig {
     pub start_offset: u64,
     pub delimiter: u8,
     pub n_cols: usize,
+    /// Identity at open; a mismatch on any poll means the file was replaced.
+    pub identity: FileIdentity,
+    /// Validate appended records as UTF-8 (the document's opened encoding).
+    pub require_utf8: bool,
 }
 
 /// One poll step: check the file and drain any complete appended records.
@@ -204,6 +233,11 @@ pub fn poll_step(
         Ok(m) => m,
         Err(_) => return Ok(Err(FollowAlertKind::Missing)),
     };
+    if FileIdentity::of(&metadata) != config.identity {
+        // The path points at a DIFFERENT file now (rotation/replacement) —
+        // even if its size grew past our offset. Never silently mix content.
+        return Ok(Err(FollowAlertKind::TruncatedOrRotated));
+    }
     let len = metadata.len();
     if len < *offset {
         // The file shrank: truncation, replacement, or rotation. Never
@@ -225,12 +259,19 @@ pub fn poll_step(
         if n == 0 {
             break;
         }
-        // The follow path expects text in the opened encoding (UTF-8);
-        // an invalid sequence means the producer changed encodings.
-        if std::str::from_utf8(&buf[..n]).is_err() && buf[..n].contains(&0) {
-            return Ok(Err(FollowAlertKind::EncodingChanged));
-        }
-        for record in parser.feed(&buf[..n]) {
+        for line in parser.feed(&buf[..n]) {
+            // Validate per COMPLETE record (newline boundaries never split
+            // a multibyte character, so chunk edges can't false-positive):
+            // any invalid sequence means the producer changed encodings.
+            if config.require_utf8 && std::str::from_utf8(&line).is_err() {
+                return Ok(Err(FollowAlertKind::EncodingChanged));
+            }
+            // Catch-all for non-UTF-8-followed files: NUL bytes mean the
+            // appended data is not delimited text any more.
+            if line.contains(&0) {
+                return Ok(Err(FollowAlertKind::EncodingChanged));
+            }
+            let record = split_record(&line, config.delimiter);
             if record.len() > config.n_cols {
                 return Ok(Err(FollowAlertKind::WidthChanged));
             }
@@ -259,7 +300,7 @@ pub fn spawn_watcher(
 
     std::thread::spawn(move || {
         let mut offset = config.start_offset;
-        let mut parser = IncrementalCsv::new(config.delimiter);
+        let mut parser = IncrementalCsv::new();
         let mut alerted = false;
         while !stop.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
@@ -317,33 +358,45 @@ pub fn spawn_watcher(
 mod tests {
     use super::*;
 
+    /// Test shorthand: feed bytes and split the finished lines into fields.
+    fn feed_records(p: &mut IncrementalCsv, bytes: &[u8]) -> Vec<Vec<String>> {
+        p.feed(bytes)
+            .into_iter()
+            .map(|line| split_record(&line, b','))
+            .collect()
+    }
+
+    fn identity_of(path: &std::path::Path) -> FileIdentity {
+        FileIdentity::of(&std::fs::metadata(path).unwrap())
+    }
+
     #[test]
     fn incremental_parser_holds_partial_records_until_complete() {
-        let mut p = IncrementalCsv::new(b',');
+        let mut p = IncrementalCsv::new();
         // A record arriving in three fragments.
         assert!(p.feed(b"1,al").is_empty());
         assert!(p.feed(b"pha").is_empty());
-        let records = p.feed(b"\n2,beta\n3,");
+        let records = feed_records(&mut p, b"\n2,beta\n3,");
         assert_eq!(records, vec![vec!["1", "alpha"], vec!["2", "beta"]]);
         assert!(p.pending_bytes() > 0, "the partial third record is carried");
-        let records = p.feed(b"gamma\n");
+        let records = feed_records(&mut p, b"gamma\n");
         assert_eq!(records, vec![vec!["3", "gamma"]]);
     }
 
     #[test]
     fn open_quoted_fields_stay_hidden_until_closed() {
-        let mut p = IncrementalCsv::new(b',');
+        let mut p = IncrementalCsv::new();
         // A newline INSIDE an open quote does not complete the record.
         assert!(p.feed(b"1,\"multi\nline").is_empty());
-        let records = p.feed(b" still\"\n");
+        let records = feed_records(&mut p, b" still\"\n");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0][1], "multi\nline still");
     }
 
     #[test]
     fn quotes_unescape_and_crlf_is_handled() {
-        let mut p = IncrementalCsv::new(b',');
-        let records = p.feed(b"a,\"he said \"\"hi\"\"\"\r\nb,2\r\n");
+        let mut p = IncrementalCsv::new();
+        let records = feed_records(&mut p, b"a,\"he said \"\"hi\"\"\"\r\nb,2\r\n");
         assert_eq!(records[0][1], "he said \"hi\"");
         assert_eq!(records[1], vec!["b", "2"]);
     }
@@ -360,9 +413,11 @@ mod tests {
             start_offset: start,
             delimiter: b',',
             n_cols: 2,
+            identity: identity_of(&path),
+            require_utf8: true,
         };
         let mut offset = start;
-        let mut parser = IncrementalCsv::new(b',');
+        let mut parser = IncrementalCsv::new();
 
         // Nothing appended yet.
         assert!(poll_step(&config, &mut offset, &mut parser)
@@ -416,9 +471,11 @@ mod tests {
             start_offset: start,
             delimiter: b',',
             n_cols: 2,
+            identity: identity_of(&path),
+            require_utf8: true,
         };
         let mut offset = start;
-        let mut parser = IncrementalCsv::new(b',');
+        let mut parser = IncrementalCsv::new();
         {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new()
@@ -434,5 +491,68 @@ mod tests {
         let mut offset2 = 0;
         let alert = poll_step(&config, &mut offset2, &mut parser).unwrap();
         assert_eq!(alert.unwrap_err(), FollowAlertKind::Missing);
+    }
+
+    #[test]
+    fn invalid_utf8_records_raise_encoding_alerts_without_nul() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.csv");
+        std::fs::write(&path, "a,b\n").unwrap();
+        let start = std::fs::metadata(&path).unwrap().len();
+        let config = WatcherConfig {
+            doc_id: 1,
+            path: path.clone(),
+            start_offset: start,
+            delimiter: b',',
+            n_cols: 2,
+            identity: identity_of(&path),
+            require_utf8: true,
+        };
+        let mut offset = start;
+        let mut parser = IncrementalCsv::new();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            // 0xFF is invalid UTF-8 but contains no NUL byte.
+            f.write_all(b"1,\xFFbad\n").unwrap();
+        }
+        let alert = poll_step(&config, &mut offset, &mut parser).unwrap();
+        assert_eq!(alert.unwrap_err(), FollowAlertKind::EncodingChanged);
+    }
+
+    // NTFS creation-time "tunneling" can preserve the created stamp when a
+    // same-named file is recreated quickly, so the identity check is
+    // best-effort on Windows (backstopped by the size check); the inode
+    // comparison is exact — assert it where it exists.
+    #[cfg(unix)]
+    #[test]
+    fn rotation_with_equal_or_larger_size_is_detected_by_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.csv");
+        std::fs::write(&path, "a,b\n1,2\n").unwrap();
+        let start = std::fs::metadata(&path).unwrap().len();
+        let config = WatcherConfig {
+            doc_id: 1,
+            path: path.clone(),
+            start_offset: start,
+            delimiter: b',',
+            n_cols: 2,
+            identity: identity_of(&path),
+            require_utf8: true,
+        };
+        let mut offset = start;
+        let mut parser = IncrementalCsv::new();
+
+        // Rotate: replace the file with a NEW one that is already LARGER
+        // than the old offset — the size check alone would read through it.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "a,b\nfresh,rows\nfresh,rows\nfresh,rows\n").unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() >= start);
+
+        let alert = poll_step(&config, &mut offset, &mut parser).unwrap();
+        assert_eq!(alert.unwrap_err(), FollowAlertKind::TruncatedOrRotated);
     }
 }

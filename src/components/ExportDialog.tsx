@@ -54,7 +54,17 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
     () => scopeChoices(filtered, selectionRect, selectedRows, selectedCols, viewSorted),
     [filtered, selectionRect, selectedRows, selectedCols, viewSorted],
   );
-  const [scopeIdx, setScopeIdx] = useState(0);
+  const [scopeIdx, setScopeIdx] = useState(() => {
+    // A flow that prepared a specific scope (F28's "Export non-PII
+    // columns") preselects it — the all-columns default would defeat it.
+    const preferred = useStore.getState().exportPreferredScope;
+    if (preferred) {
+      useStore.getState().setExportPreferredScope(null);
+      const at = choices.findIndex((c) => c.scope.type === preferred);
+      if (at >= 0) return at;
+    }
+    return 0;
+  });
   const rowScope = (choices[scopeIdx] ?? choices[0]).scope;
   // "Visible columns in view order" composes with the whole-document row
   // scopes; explicit selections already carry their own columns.

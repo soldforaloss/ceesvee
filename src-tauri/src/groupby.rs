@@ -388,17 +388,21 @@ fn group(doc: &Document, spec: &GroupBySpec, ctx: Option<&JobCtx>) -> AppResult<
                 ctx.advance(4096)?;
             }
         }
+        // Keys keep the EXACT cell values: trimming is part of normalized
+        // grouping, so a raw group-by must not silently merge "East" with
+        // "East " (blank detection still trims — a whitespace-only key is
+        // blank for the policy either way).
         let raw: Vec<String> = spec
             .group_columns
             .iter()
-            .map(|&c| row.get(c).map(|v| v.trim().to_string()).unwrap_or_default())
+            .map(|&c| row.get(c).cloned().unwrap_or_default())
             .collect();
-        if raw.iter().any(String::is_empty) && spec.blank_keys == BlankKeys::Exclude {
+        if raw.iter().any(|v| v.trim().is_empty()) && spec.blank_keys == BlankKeys::Exclude {
             blank_key_rows += 1;
             return Ok(true);
         }
         let key: Vec<String> = if spec.normalized_grouping {
-            raw.iter().map(|v| v.to_lowercase()).collect()
+            raw.iter().map(|v| v.trim().to_lowercase()).collect()
         } else {
             raw.clone()
         };
@@ -660,6 +664,24 @@ mod tests {
         let out = run_group(&d, &s);
         assert_eq!(out.rows()[0], vec!["a", "2"]); // odd: middle of 1,2,3
         assert_eq!(out.rows()[1], vec!["b", "15"]); // even: (10+20)/2
+    }
+
+    #[test]
+    fn raw_grouping_preserves_key_whitespace() {
+        // "East" and "East " are DIFFERENT raw keys (trimming is part of
+        // normalized grouping); normalized grouping merges them.
+        let d = doc("g,n\nEast,1\nEast ,2\n");
+        let s = spec(vec![0], vec![agg(Aggregate::Count, None)]);
+        let out = run_group(&d, &s);
+        assert_eq!(out.n_rows(), 2, "raw keys keep exact whitespace");
+        assert_eq!(out.rows()[0][0], "East");
+        assert_eq!(out.rows()[1][0], "East ", "display keeps the raw spaces");
+
+        let mut s2 = spec(vec![0], vec![agg(Aggregate::Count, None)]);
+        s2.normalized_grouping = true;
+        let out2 = run_group(&d, &s2);
+        assert_eq!(out2.n_rows(), 1, "normalized grouping trims");
+        assert_eq!(out2.rows()[0][1], "2");
     }
 
     #[test]

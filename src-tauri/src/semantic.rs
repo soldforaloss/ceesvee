@@ -78,9 +78,11 @@ fn regexes() -> &'static HashMap<SemanticType, Regex> {
         add(SemanticType::Email, r"^[^@\s]+@[^@\s]+\.[^@\s.]+$");
         add(SemanticType::Url, r"^(https?|ftp)://[^\s/$.?#].[^\s]*$");
         add(SemanticType::Percentage, r"^[+-]?\d+(\.\d+)?\s?%$");
+        // Amounts are either correctly comma-grouped OR plain digit runs —
+        // export-style values like "$1234.56" / "1234 USD" are currency too.
         add(
             SemanticType::Currency,
-            r"^[+-]?[$€£¥]\s?\d{1,3}(,\d{3})*(\.\d{1,2})?$|^[+-]?\d{1,3}(,\d{3})*(\.\d{1,2})?\s?(USD|EUR|GBP|JPY|CAD|AUD)$",
+            r"^[+-]?[$€£¥]\s?(\d{1,3}(,\d{3})+|\d+)(\.\d{1,2})?$|^[+-]?(\d{1,3}(,\d{3})+|\d+)(\.\d{1,2})?\s?(USD|EUR|GBP|JPY|CAD|AUD)$",
         );
         // Phone: optional +country, 7-15 digits with common separators.
         // Detection only — phone values are NEVER converted to numbers.
@@ -313,7 +315,15 @@ fn url_host(value: &str) -> Option<String> {
     let rest = value.trim().split("://").nth(1)?;
     let host = rest.split(['/', '?', '#']).next()?;
     let host = host.split('@').next_back()?; // strip userinfo
-    let host = host.split(':').next()?; // strip port
+                                             // Bracketed IPv6 literals ("[2001:db8::1]:8080") contain colons inside
+                                             // the address, so the bracket pair is the host — only strip a port
+                                             // AFTER the closing bracket.
+    let host = if let Some(v6) = host.strip_prefix('[') {
+        let end = v6.find(']')?;
+        &v6[..end]
+    } else {
+        host.split(':').next()?
+    };
     (!host.is_empty()).then(|| host.to_string())
 }
 
@@ -510,6 +520,39 @@ mod tests {
             assert!(matches_type(good, *t), "{t:?} should match {good}");
             assert!(!matches_type(bad, *t), "{t:?} should reject {bad}");
         }
+    }
+
+    #[test]
+    fn currency_accepts_ungrouped_amounts_and_rejects_bad_grouping() {
+        for good in ["$1234.56", "1234 USD", "$12345", "€1234567.89", "$1,234.56"] {
+            assert!(
+                matches_type(good, SemanticType::Currency),
+                "should match {good}"
+            );
+        }
+        for bad in ["$12,34.56", "$1,23", "12,34 USD"] {
+            assert!(
+                !matches_type(bad, SemanticType::Currency),
+                "should reject {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_host_handles_bracketed_ipv6_and_ports() {
+        assert_eq!(
+            url_host("http://[2001:db8::1]/x").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert_eq!(
+            url_host("https://[2001:db8::1]:8443/x").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert_eq!(
+            url_host("https://user@example.com:8080/p").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(url_host("http://[unclosed"), None);
     }
 
     #[test]

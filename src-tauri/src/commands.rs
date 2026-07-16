@@ -619,6 +619,7 @@ pub async fn apply_reparse(
     doc_id: u64,
     options: OpenOptions,
     expected_revision: u64,
+    app: tauri::AppHandle,
     state: Db<'_>,
 ) -> AppResult<DocumentMeta> {
     let (path, current_header) = read_doc(&state, doc_id, |doc| {
@@ -642,11 +643,20 @@ pub async fn apply_reparse(
         // Re-check under the write lock: an edit may have landed while the
         // file was being parsed.
         doc.check_revision(expected_revision)?;
+        // A journal against the OLD interpretation must not survive (its
+        // replay would target coordinates that no longer exist), and merely
+        // dropping the writer would leave the file to be offered as a
+        // recovery on the next startup.
+        if let Some(journal) = doc.take_journal() {
+            journal.delete();
+        }
         let mut fresh = Document::from_parsed(doc_id, Some(path), parsed, has_header);
         // Continue the revision sequence so anything captured against the old
         // incarnation can never accidentally match the new one.
         fresh.set_revision(doc.revision() + 1);
         fresh.set_fingerprint(fingerprint);
+        // Journaling continues against the NEW interpretation.
+        attach_journal_if_enabled(&app, &mut fresh);
         let meta = fresh.meta();
         *doc = fresh;
         Ok(meta)
@@ -668,7 +678,9 @@ pub async fn start_follow(
     if !source.is_file() {
         return Err(AppError::invalid("not a file"));
     }
-    let start_offset = std::fs::metadata(&source)?.len();
+    let start_metadata = std::fs::metadata(&source)?;
+    let start_offset = start_metadata.len();
+    let identity = follow::FileIdentity::of(&start_metadata);
     let (parsed, fingerprint) = parse_file(source.clone(), None, None).await?;
     let delimiter = parsed.delimiter;
     let has_header = looks_like_header(&parsed.records);
@@ -676,6 +688,10 @@ pub async fn start_follow(
     let mut guard = lock(&state)?;
     let id = guard.alloc_id();
     let mut doc = Document::from_parsed(id, Some(source.clone()), parsed, has_header);
+    // Appended records are validated against the OPENED encoding; only the
+    // UTF-8 family can be checked byte-exactly (ASCII appends to a legacy
+    // single-byte file pass the NUL catch-all instead).
+    let require_utf8 = doc.encoding_name().eq_ignore_ascii_case("UTF-8");
     doc.set_fingerprint(fingerprint);
     doc.set_follow(true);
     let n_cols = doc.n_cols();
@@ -693,6 +709,8 @@ pub async fn start_follow(
             start_offset,
             delimiter,
             n_cols,
+            identity,
+            require_utf8,
         },
     );
     follows.insert(id, control);
@@ -715,7 +733,8 @@ pub fn set_follow_paused(
 }
 
 /// Filter the grid to rows from `from_row` onward (F19: "only newly added
-/// rows"). Clearing uses the ordinary clear_filter.
+/// rows"). The range is LIVE — records appended by the watcher extend it —
+/// and clearing uses the ordinary clear_filter.
 #[tauri::command]
 pub fn set_row_range_filter(
     doc_id: u64,
@@ -724,6 +743,7 @@ pub fn set_row_range_filter(
 ) -> AppResult<DocumentMeta> {
     write_doc(&state, doc_id, |doc| {
         let rows: Vec<usize> = (from_row.min(doc.n_rows())..doc.n_rows()).collect();
+        doc.set_follow_range(Some(from_row));
         doc.set_filter(rows)?;
         Ok(doc.meta())
     })
@@ -1334,6 +1354,9 @@ pub async fn apply_outlier_action(
         doc.check_revision(expected_revision)?;
         let computed = outlier::action_changes(&doc, &spec, action)?;
         if !computed.remove_rows.is_empty() {
+            // Row removal shifts the absolute indices an active row view
+            // refers to — drop it first, like every structural delete path.
+            doc.clear_row_view();
             doc.delete_rows(computed.remove_rows)?;
         } else {
             doc.set_cells(computed.changes)?;
@@ -1619,10 +1642,25 @@ pub fn delete_all_recovery(app: tauri::AppHandle) -> AppResult<usize> {
 
 // ----- change inspector / selective revert (F15) ---------------------------------
 
+/// Unsaved operations plus whether the saved state sits in the REDO branch
+/// (the user undid past the last save — nothing to list, but the document
+/// is dirty and Redo returns to the saved state).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangesReport {
+    pub saved_in_redo: bool,
+    pub changes: Vec<ChangeSummary>,
+}
+
 /// Every unsaved operation, oldest first, with cell-level samples.
 #[tauri::command]
-pub fn get_changes(doc_id: u64, state: Db<'_>) -> AppResult<Vec<ChangeSummary>> {
-    read_doc(&state, doc_id, |doc| Ok(doc.changes_since_save()))
+pub fn get_changes(doc_id: u64, state: Db<'_>) -> AppResult<ChangesReport> {
+    read_doc(&state, doc_id, |doc| {
+        Ok(ChangesReport {
+            saved_in_redo: doc.saved_in_redo_branch(),
+            changes: doc.changes_since_save(),
+        })
+    })
 }
 
 /// Revert one whole operation (as a NEW, undoable operation).
@@ -2698,7 +2736,7 @@ pub fn set_cells(
 #[tauri::command]
 pub async fn copy_as(
     doc_id: u64,
-    rows: Vec<usize>,
+    rows: Option<Vec<usize>>,
     cols: Vec<usize>,
     include_headers: bool,
     format: CopyFormat,
@@ -2707,11 +2745,19 @@ pub async fn copy_as(
     let handle = doc_handle(&state, doc_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let doc = handle.read().map_err(poisoned)?;
-        // Display rows -> absolute rows (honours an active filter).
-        let abs: Vec<usize> = rows
-            .iter()
-            .map(|&d| abs_row(&doc, d))
-            .collect::<AppResult<_>>()?;
+        // Display rows -> absolute rows (honours an active filter). `None`
+        // means every visible row — kept off the IPC wire so a million-row
+        // copy doesn't ship a million-entry array.
+        let abs: Vec<usize> = match rows {
+            Some(rows) => rows
+                .iter()
+                .map(|&d| abs_row(&doc, d))
+                .collect::<AppResult<_>>()?,
+            None => match doc.filter_view() {
+                Some(view) => view.to_vec(),
+                None => (0..doc.n_rows()).collect(),
+            },
+        };
         clipboard::serialize_selection(&doc, &abs, &cols, include_headers, &format)
     })
     .await
@@ -2932,6 +2978,8 @@ pub fn replace_all(
 #[tauri::command]
 pub fn set_filter(doc_id: u64, spec: FilterGroup, state: Db<'_>) -> AppResult<DocumentMeta> {
     write_doc(&state, doc_id, |doc| {
+        // An ordinary filter replaces the F19 live "only new rows" range.
+        doc.set_follow_range(None);
         let view = filter_mod::matching_rows(doc, &spec)?;
         // A filter that excludes nothing isn't an active filter — avoids reporting
         // "N of N rows · filtered" for a match-all or empty spec. An active view
