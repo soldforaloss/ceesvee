@@ -11,20 +11,61 @@ import { Modal } from "./Modal";
 export function OpenModeDialog() {
   const decision = useStore((s) => s.openDecision);
   const indexing = useStore((s) => s.indexing);
+  const largeConfirm = useStore((s) => s.archiveLargeConfirm);
   const dismiss = useStore((s) => s.dismissOpenDecision);
   const openEditable = useStore((s) => s.confirmOpenEditable);
   const openIndexed = useStore((s) => s.confirmOpenIndexed);
   const cancelIndexing = useStore((s) => s.cancelIndexing);
+  const confirmLarge = useStore((s) => s.confirmArchiveLarge);
+  const dismissLarge = useStore((s) => s.dismissArchiveLarge);
 
-  // Progress phase: an indexed open (or an indexed reload) is running.
-  if (indexing?.kind === "openIndexed" || indexing?.kind === "reindex") {
+  // F17: the ratio guard tripped during extraction; ask explicitly.
+  if (largeConfirm) {
+    return (
+      <Modal
+        title="Suspicious compression ratio"
+        onClose={dismissLarge}
+        footer={
+          <>
+            <button onClick={dismissLarge} className={btnGhost}>
+              Cancel
+            </button>
+            <button
+              onClick={() => void confirmLarge()}
+              className="rounded bg-amber-600 px-3 py-1.5 text-sm text-white hover:bg-amber-500"
+            >
+              Extract anyway
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm">
+          This entry expands more than 200× its compressed size, which can indicate a decompression
+          bomb. Extraction stays capped at 8 GiB either way. Continue?
+        </p>
+      </Modal>
+    );
+  }
+
+  // Progress phase: an indexed open, reload, or archive extraction.
+  if (
+    indexing?.kind === "openIndexed" ||
+    indexing?.kind === "reindex" ||
+    indexing?.kind === "archiveExtract"
+  ) {
     const pct =
       indexing.total && indexing.total > 0
         ? Math.min(100, Math.round((indexing.processed / indexing.total) * 100))
         : null;
     return (
       <Modal
-        title={indexing.kind === "reindex" ? "Reloading (re-indexing)…" : "Building index…"}
+        title={
+          indexing.kind === "reindex"
+            ? "Reloading (re-indexing)…"
+            : indexing.kind === "archiveExtract"
+              ? "Extracting…"
+              : "Building index…"
+        }
         onClose={() => void cancelIndexing()}
         footer={
           <button onClick={() => void cancelIndexing()} className={btnGhost}>

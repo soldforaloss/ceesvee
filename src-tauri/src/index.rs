@@ -240,8 +240,9 @@ pub struct IndexDirGuard {
 
 impl IndexDirGuard {
     /// Create a fresh, uniquely named cache directory under `root` and take
-    /// its lock.
-    fn create(root: &Path) -> AppResult<IndexDirGuard> {
+    /// its lock. Also used by F17 archive extraction, which shares the cache
+    /// root, the lock protocol, and the startup sweep.
+    pub(crate) fn create(root: &Path) -> AppResult<IndexDirGuard> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         fs::create_dir_all(root)?;
         let nanos = std::time::SystemTime::now()
@@ -269,6 +270,12 @@ impl IndexDirGuard {
 
     fn cache_file(&self) -> PathBuf {
         self.dir.join("cache.csv")
+    }
+
+    /// The directory this guard owns (F17 places extracted archive entries
+    /// inside it).
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
     }
 }
 

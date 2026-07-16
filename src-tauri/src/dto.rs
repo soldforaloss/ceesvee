@@ -41,6 +41,8 @@ pub struct DocumentMeta {
     pub revision: u64,
     /// Row storage: "editable" (in memory) or "indexedReadOnly" (F10).
     pub backing: String,
+    /// Where the document came from when opened out of an archive (F17).
+    pub archive: Option<crate::archive::ArchiveOrigin>,
 }
 
 /// Overrides supplied when (re)opening a file. Any `None` field is auto-detected.

@@ -12,6 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use tauri::State;
 
+use crate::archive::{self, ArchiveCache, ZipEntryInfo};
 use crate::clipboard::{self, CopyFormat};
 use crate::compare::{self, CompareCache, CompareInfo, ComparePage, CompareSpec, DiffStatus};
 use crate::dedup::{self, DedupCache, DedupSpec, DuplicateKeepStrategy, DuplicateReport};
@@ -171,6 +172,173 @@ pub async fn open_file(
     let meta = doc.meta();
     guard.insert(doc);
     Ok(meta)
+}
+
+/// Handles returned by `start_archive_extract` (F17).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveExtractStart {
+    pub job_id: u64,
+    pub token: u64,
+}
+
+/// List the entries of a ZIP archive for the chooser dialog (F17).
+#[tauri::command]
+pub async fn list_archive_entries(path: String) -> AppResult<Vec<ZipEntryInfo>> {
+    tauri::async_runtime::spawn_blocking(move || archive::list_zip_entries(Path::new(&path)))
+        .await
+        .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Extract a gzip member or a chosen ZIP entry into a guarded cache dir as a
+/// cancellable job (progress = decompressed bytes). The result parks under
+/// the returned token until `open_archive_document` consumes it or
+/// `discard_archive` drops it. `allow_large` overrides the compression-ratio
+/// guard after an explicit confirmation.
+#[tauri::command]
+pub async fn start_archive_extract(
+    path: String,
+    entry: Option<String>,
+    allow_large: bool,
+    app: tauri::AppHandle,
+    jobs: State<'_, JobRegistry>,
+    archives: State<'_, ArchiveCache>,
+) -> AppResult<ArchiveExtractStart> {
+    let cache_root = index_cache_root(&app)?;
+    let token = archives.reserve();
+    let sink = (*archives).clone();
+    let ctx = jobs.begin_for_app(&app, "archiveExtract", None);
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let pending = archive::extract_to_pending(
+                Path::new(&path),
+                entry.as_deref(),
+                &cache_root,
+                allow_large,
+                &mut |delta| ctx.advance(delta),
+            )?;
+            sink.fulfill(token, pending);
+            Ok(())
+        })
+        .await;
+    });
+    Ok(ArchiveExtractStart { job_id, token })
+}
+
+/// Estimate the in-memory cost of the extracted entry, so the UI can offer
+/// indexed mode exactly like a plain-file open (F17).
+#[tauri::command]
+pub async fn pending_archive_estimate(
+    token: u64,
+    archives: State<'_, ArchiveCache>,
+) -> AppResult<index::OpenEstimate> {
+    let path = archives
+        .data_path(token)
+        .ok_or_else(|| AppError::invalid("the extracted file is no longer available"))?;
+    tauri::async_runtime::spawn_blocking(move || index::estimate(&path))
+        .await
+        .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Open a parked extraction as a document (F17). `mode` is "editable"
+/// (parse fully, temp released immediately) or "indexed" (background index
+/// job; the temp stays alive with the document). Never edits the archive.
+#[tauri::command]
+pub async fn open_archive_document(
+    token: u64,
+    mode: String,
+    options: Option<OpenOptions>,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    archives: State<'_, ArchiveCache>,
+) -> AppResult<IndexedOpenStart> {
+    let pending = archives
+        .take(token)
+        .ok_or_else(|| AppError::invalid("the extracted file is no longer available"))?;
+    let options = options.unwrap_or_default();
+    let doc_id = lock(&state)?.alloc_id();
+
+    match mode.as_str() {
+        "editable" => {
+            let opt_delim = options.delimiter.as_deref().map(util::delimiter_to_byte);
+            let opt_enc = options.encoding.as_deref().map(encoding::from_name);
+            let forced_header = options.has_header_row;
+            let app_for_job = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                use tauri::Manager;
+                let bytes = std::fs::read(&pending.data_path)?;
+                let parsed = parse(
+                    &bytes,
+                    &ParseSettings {
+                        delimiter: opt_delim,
+                        encoding: opt_enc,
+                    },
+                )?;
+                let has_header =
+                    forced_header.unwrap_or_else(|| looks_like_header(&parsed.records));
+                let mut doc = Document::from_parsed(doc_id, None, parsed, has_header);
+                doc.set_archive_origin(pending.origin.clone(), None);
+                let registry = app_for_job.state::<Mutex<AppState>>();
+                registry
+                    .lock()
+                    .map_err(|_| AppError::Other("internal state lock error".into()))?
+                    .insert(doc);
+                // `pending.guard` drops here: the temp file is gone, the
+                // rows live in memory.
+                Ok(IndexedOpenStart { job_id: 0, doc_id })
+            })
+            .await
+            .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+        }
+        _ => {
+            // Indexed: reuse the F10 job kind so the front end's existing
+            // openIndexed completion path adds the tab.
+            let cache_root = index_cache_root(&app)?;
+            let ctx = jobs.begin_for_app(&app, "openIndexed", Some(doc_id));
+            let job_id = ctx.id;
+            let app_for_job = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::job::run_blocking(ctx, move |ctx| {
+                    use tauri::Manager;
+                    let total = std::fs::metadata(&pending.data_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    ctx.set_total(total);
+                    let settings = index::IndexSettings {
+                        delimiter: options.delimiter.as_deref().map(util::delimiter_to_byte),
+                        encoding: options.encoding.as_deref().map(encoding::from_name),
+                        has_header_row: options.has_header_row,
+                        chunk_size: 0,
+                    };
+                    let indexed =
+                        index::build_index(&pending.data_path, &cache_root, &settings, &mut |d| {
+                            ctx.advance(d)
+                        })?;
+                    let mut doc = Document::from_index(doc_id, None, indexed);
+                    // The index may read the extracted temp directly (UTF-8
+                    // path): the guard moves into the document so the file
+                    // outlives it.
+                    doc.set_archive_origin(pending.origin.clone(), Some(pending.guard));
+                    let registry = app_for_job.state::<Mutex<AppState>>();
+                    registry
+                        .lock()
+                        .map_err(|_| AppError::Other("internal state lock error".into()))?
+                        .insert(doc);
+                    Ok(())
+                })
+                .await;
+            });
+            Ok(IndexedOpenStart { job_id, doc_id })
+        }
+    }
+}
+
+/// Drop a parked extraction and delete its cache directory (F17).
+#[tauri::command]
+pub fn discard_archive(token: u64, archives: State<'_, ArchiveCache>) {
+    archives.discard(token);
 }
 
 /// Sample a file and estimate the in-memory cost of opening it editable, so
@@ -1582,7 +1750,18 @@ pub async fn start_save(
                 doc.check_revision(expected_revision)?;
                 ctx.set_total(doc.n_rows() as u64);
                 save_mod::atomic_write(&dest, options.backup, |file| {
-                    export::write_document(&doc, &options, file, Some(ctx))
+                    if archive::is_gzip_path(&dest) {
+                        // F17: a *.gz destination streams through gzip inside
+                        // the same atomic pipeline.
+                        let mut encoder =
+                            flate2::write::GzEncoder::new(file, flate2::Compression::default());
+                        let bytes =
+                            export::write_document(&doc, &options, &mut encoder, Some(ctx))?;
+                        encoder.finish()?;
+                        Ok(bytes)
+                    } else {
+                        export::write_document(&doc, &options, file, Some(ctx))
+                    }
                 })?;
                 // Read lock is dropped here, before taking the write lock.
             }

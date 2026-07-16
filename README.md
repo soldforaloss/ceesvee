@@ -39,6 +39,8 @@ and faithful on large, real-world delimited files.**
 **Viewing**
 
 - Open CSV / TSV / and other delimited files in a virtualized, spreadsheet-style grid.
+- Open **compressed files** — `.csv.gz` and `.zip` archives (with an entry
+  chooser) — and export back to gzip. Decompression-bomb guards included.
 - Auto-detect the **delimiter** (comma, tab, semicolon, pipe) with a manual /
   custom override.
 - Auto-detect the **encoding** (UTF-8, UTF-16 LE/BE, Windows-1252 / Latin-1) with

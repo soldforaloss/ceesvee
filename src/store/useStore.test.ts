@@ -15,6 +15,11 @@ vi.mock("../lib/tauri", () => ({
   find: vi.fn().mockResolvedValue([]),
   cancelJob: vi.fn().mockResolvedValue(true),
   setSettings: vi.fn().mockResolvedValue(undefined),
+  listArchiveEntries: vi.fn(),
+  startArchiveExtract: vi.fn(),
+  pendingArchiveEstimate: vi.fn(),
+  openArchiveDocument: vi.fn(),
+  discardArchive: vi.fn(),
 }));
 
 import * as api from "../lib/tauri";
@@ -40,6 +45,7 @@ function meta(id: number, backing: DocumentMeta["backing"] = "editable"): Docume
     canRedo: false,
     revision: 1,
     backing,
+    archive: null,
   };
 }
 
@@ -321,5 +327,140 @@ describe("shortcut overrides and modals (F11)", () => {
     expect(useStore.getState().activeModal).toBe("export");
     useStore.getState().setModal(null);
     expect(useStore.getState().activeModal).toBeNull();
+  });
+});
+
+describe("compressed file open flow (F17)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useStore.setState({
+      tabs: [],
+      activeId: null,
+      uiStates: {},
+      openDecision: null,
+      indexing: null,
+      archivePick: null,
+      archiveLargeConfirm: null,
+      busy: false,
+      error: null,
+    });
+  });
+
+  it("routes .zip opens through the entry chooser when several entries exist", async () => {
+    const entries = [
+      {
+        name: "a.csv",
+        compressedSize: 10,
+        uncompressedSize: 100,
+        ratio: 10,
+        encrypted: false,
+        likelyDelimiter: ",",
+        likelyEncoding: "UTF-8",
+      },
+      {
+        name: "b.csv",
+        compressedSize: 10,
+        uncompressedSize: 100,
+        ratio: 10,
+        encrypted: false,
+        likelyDelimiter: ",",
+        likelyEncoding: "UTF-8",
+      },
+    ];
+    vi.mocked(api.listArchiveEntries).mockResolvedValue(entries);
+    await useStore.getState().openPath("C:/data/bundle.zip");
+    expect(useStore.getState().archivePick?.entries).toHaveLength(2);
+    expect(api.startArchiveExtract).not.toHaveBeenCalled();
+  });
+
+  it("extracts .gz directly and tracks the job", async () => {
+    vi.mocked(api.startArchiveExtract).mockResolvedValue({ jobId: 7, token: 3 });
+    await useStore.getState().openPath("C:/data/log.csv.gz");
+    const s = useStore.getState();
+    expect(s.indexing).toMatchObject({
+      jobId: 7,
+      kind: "archiveExtract",
+      archiveToken: 3,
+    });
+    expect(api.startArchiveExtract).toHaveBeenCalledWith("C:/data/log.csv.gz", null, false);
+  });
+
+  it("a suspicious-ratio failure surfaces the confirm instead of an error", async () => {
+    useStore.setState({
+      indexing: {
+        jobId: 9,
+        docId: 0,
+        kind: "archiveExtract",
+        path: "C:/x.zip",
+        processed: 0,
+        total: null,
+        archiveToken: 5,
+        archiveEntry: "big.csv",
+      },
+    });
+    await useStore.getState().handleJobFinished({
+      jobId: 9,
+      docId: null,
+      kind: "archiveExtract",
+      status: "failed",
+      error: "invalid argument: suspicious compression ratio (over 200:1)",
+    });
+    const s = useStore.getState();
+    expect(s.archiveLargeConfirm).toEqual({ path: "C:/x.zip", entry: "big.csv" });
+    expect(s.error).toBeNull();
+  });
+
+  it("a finished extraction below the threshold opens editable directly", async () => {
+    useStore.setState({
+      indexing: {
+        jobId: 11,
+        docId: 0,
+        kind: "archiveExtract",
+        path: "C:/data/log.csv.gz",
+        processed: 0,
+        total: null,
+        archiveToken: 8,
+        archiveEntry: null,
+      },
+    });
+    vi.mocked(api.pendingArchiveEstimate).mockResolvedValue({
+      fileSize: 1000,
+      estimatedRows: 10,
+      estimatedMemory: 4000,
+      needsDecision: false,
+      encoding: "UTF-8",
+    });
+    vi.mocked(api.openArchiveDocument).mockResolvedValue({ jobId: 0, docId: 4 });
+    vi.mocked(api.getMeta).mockResolvedValue(meta(4));
+    await useStore.getState().handleJobFinished({
+      jobId: 11,
+      docId: null,
+      kind: "archiveExtract",
+      status: "done",
+      error: null,
+    });
+    const s = useStore.getState();
+    expect(api.openArchiveDocument).toHaveBeenCalledWith(8, "editable");
+    expect(s.tabs.map((t) => t.id)).toEqual([4]);
+  });
+
+  it("dismissing an archive decision discards the pending extraction", async () => {
+    vi.mocked(api.discardArchive).mockResolvedValue(undefined);
+    useStore.setState({
+      openDecision: {
+        path: "C:/x.zip",
+        estimate: {
+          fileSize: 1,
+          estimatedRows: 1,
+          estimatedMemory: 1,
+          needsDecision: true,
+          encoding: "UTF-8",
+        },
+        archiveToken: 12,
+      },
+    });
+    useStore.getState().dismissOpenDecision();
+    expect(api.discardArchive).toHaveBeenCalledWith(12);
+    expect(useStore.getState().openDecision).toBeNull();
   });
 });

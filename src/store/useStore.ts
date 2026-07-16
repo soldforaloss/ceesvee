@@ -39,6 +39,7 @@ import type {
   SplitOptions,
   TransformErrorPolicy,
   TransformSpec,
+  ZipEntryInfo,
 } from "../types";
 
 export type ThemePref = "light" | "dark" | "system";
@@ -71,6 +72,7 @@ export type ModalName =
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
+  { name: "Compressed (F17)", extensions: ["gz", "zip"] },
   { name: "All files", extensions: ["*"] },
 ];
 
@@ -274,21 +276,38 @@ const initialCompare: CompareState = {
   error: null,
 };
 
-/** A large-file open awaiting the user's mode choice (F10). */
+/** A large-file open awaiting the user's mode choice (F10/F17). */
 export interface OpenDecisionState {
   path: string;
   estimate: OpenEstimate;
+  /** Set when the decision is about an extracted archive entry (F17). */
+  archiveToken?: number;
 }
 
-/** A running index-related job (open, convert, or reload; F10). */
+/** A running index-related job (open, convert, reload, or extract). */
 export interface IndexingState {
   jobId: number;
   docId: number;
-  kind: "openIndexed" | "convertEditable" | "reindex";
+  kind: "openIndexed" | "convertEditable" | "reindex" | "archiveExtract";
   path: string | null;
-  /** Bytes scanned (open/reindex) or rows materialised (convert). */
+  /** Bytes scanned (open/reindex/extract) or rows materialised (convert). */
   processed: number;
   total: number | null;
+  /** Extraction bookkeeping (F17). */
+  archiveToken?: number;
+  archiveEntry?: string | null;
+}
+
+/** ZIP entry chooser state (F17). */
+export interface ArchivePickState {
+  path: string;
+  entries: ZipEntryInfo[];
+}
+
+/** A blocked suspicious-ratio extraction awaiting confirmation (F17). */
+export interface ArchiveLargeConfirmState {
+  path: string;
+  entry: string | null;
 }
 
 /** Duplicate-finder state (F07), for the ACTIVE document. */
@@ -404,8 +423,12 @@ interface Store {
   compare: CompareState;
   /** Large-file open awaiting a mode choice (F10). */
   openDecision: OpenDecisionState | null;
-  /** Running index build / conversion / re-index job (F10). */
+  /** Running index build / conversion / re-index / extraction job. */
   indexing: IndexingState | null;
+  /** ZIP entry chooser (F17). */
+  archivePick: ArchivePickState | null;
+  /** Suspicious-ratio extraction awaiting confirmation (F17). */
+  archiveLargeConfirm: ArchiveLargeConfirmState | null;
 
   /** The one open modal dialog, if any (F11: commands open dialogs). */
   activeModal: ModalName | null;
@@ -460,6 +483,14 @@ interface Store {
   /** Materialise the active indexed document into an editable one. */
   convertActiveToEditable: (force: boolean) => Promise<void>;
   cancelIndexing: () => Promise<void>;
+
+  // compressed files (F17)
+  /** Start extracting an archive (gzip member or chosen ZIP entry). */
+  startArchiveExtract: (path: string, entry: string | null, allowLarge: boolean) => Promise<void>;
+  pickArchiveEntry: (entry: string) => Promise<void>;
+  dismissArchivePick: () => void;
+  confirmArchiveLarge: () => Promise<void>;
+  dismissArchiveLarge: () => void;
 
   // reopen with settings (F02)
   openReopenDialog: (initial?: OpenOptions) => void;
@@ -930,6 +961,8 @@ export const useStore = create<Store>((set, get) => {
     reopen: initialReopen,
     openDecision: null,
     indexing: null,
+    archivePick: null,
+    archiveLargeConfirm: null,
     externalPrompt: null,
     ignoredFingerprints: {},
     quitPromptOpen: false,
@@ -1074,6 +1107,28 @@ export const useStore = create<Store>((set, get) => {
         set((s) => switchPatch(s, existing.id));
         return;
       }
+      // F17: compressed files route through extraction first.
+      const lower = path.toLowerCase();
+      if (lower.endsWith(".zip")) {
+        set({ busy: true, error: null });
+        try {
+          const entries = await api.listArchiveEntries(path);
+          const openable = entries.filter((e) => !e.encrypted);
+          if (openable.length === 1 && entries.length === 1) {
+            set({ busy: false });
+            await get().startArchiveExtract(path, openable[0].name, false);
+          } else {
+            set({ busy: false, archivePick: { path, entries } });
+          }
+        } catch (e) {
+          set({ error: String(e), busy: false });
+        }
+        return;
+      }
+      if (lower.endsWith(".gz")) {
+        await get().startArchiveExtract(path, null, false);
+        return;
+      }
       set({ busy: true, error: null });
       try {
         // F10: estimate the in-memory cost first. Large files pause here and
@@ -1103,6 +1158,14 @@ export const useStore = create<Store>((set, get) => {
       if (!decision) return;
       set({ openDecision: null, busy: true, error: null });
       try {
+        if (decision.archiveToken != null) {
+          // F17: consume the parked extraction as a fully in-memory doc.
+          const started = await api.openArchiveDocument(decision.archiveToken, "editable");
+          const meta = await api.getMeta(started.docId);
+          set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta], busy: false }));
+          pushRecent(decision.path);
+          return;
+        }
         const meta = await api.openFile(decision.path, { forceInMemory: true });
         set((s) => ({
           ...switchPatch(s, meta.id),
@@ -1121,6 +1184,23 @@ export const useStore = create<Store>((set, get) => {
       if (!decision) return;
       set({ openDecision: null, error: null });
       try {
+        if (decision.archiveToken != null) {
+          // F17: index the extracted entry; the job reuses the openIndexed
+          // completion path, which adds the tab.
+          const started = await api.openArchiveDocument(decision.archiveToken, "indexed");
+          set({
+            indexing: {
+              jobId: started.jobId,
+              docId: started.docId,
+              kind: "openIndexed",
+              path: decision.path,
+              processed: 0,
+              total: decision.estimate.fileSize,
+            },
+          });
+          consumeEarlyFinish(started.jobId);
+          return;
+        }
         const started = await api.startOpenIndexed(decision.path);
         set({
           indexing: {
@@ -1138,7 +1218,11 @@ export const useStore = create<Store>((set, get) => {
       }
     },
 
-    dismissOpenDecision: () => set({ openDecision: null }),
+    dismissOpenDecision: () => {
+      const token = get().openDecision?.archiveToken;
+      if (token != null) void api.discardArchive(token).catch(() => undefined);
+      set({ openDecision: null });
+    },
 
     convertActiveToEditable: async (force) => {
       const id = get().activeId;
@@ -1167,6 +1251,49 @@ export const useStore = create<Store>((set, get) => {
       const indexing = get().indexing;
       if (indexing) await api.cancelJob(indexing.jobId).catch(() => undefined);
     },
+
+    // ----- compressed files (F17) --------------------------------------------
+
+    startArchiveExtract: async (path, entry, allowLarge) => {
+      if (get().indexing) return;
+      try {
+        const started = await api.startArchiveExtract(path, entry, allowLarge);
+        set({
+          indexing: {
+            jobId: started.jobId,
+            docId: 0,
+            kind: "archiveExtract",
+            path,
+            processed: 0,
+            total: null, // decompressed size is unknown up front
+            archiveToken: started.token,
+            archiveEntry: entry,
+          },
+          error: null,
+        });
+        consumeEarlyFinish(started.jobId);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    pickArchiveEntry: async (entry) => {
+      const pick = get().archivePick;
+      if (!pick) return;
+      set({ archivePick: null });
+      await get().startArchiveExtract(pick.path, entry, false);
+    },
+
+    dismissArchivePick: () => set({ archivePick: null }),
+
+    confirmArchiveLarge: async () => {
+      const confirm = get().archiveLargeConfirm;
+      if (!confirm) return;
+      set({ archiveLargeConfirm: null });
+      await get().startArchiveExtract(confirm.path, confirm.entry, true);
+    },
+
+    dismissArchiveLarge: () => set({ archiveLargeConfirm: null }),
 
     refreshActiveDoc: async () => {
       const id = get().activeId;
@@ -1449,6 +1576,25 @@ export const useStore = create<Store>((set, get) => {
     // ----- background-job events -------------------------------------------
 
     handleJobProgress: (progress) => {
+      // Archive extraction (F17) runs before any document exists, so its
+      // job carries no docId — route it by job id BEFORE the docId gate.
+      if (
+        progress.kind === "openIndexed" ||
+        progress.kind === "convertEditable" ||
+        progress.kind === "reindex" ||
+        progress.kind === "archiveExtract"
+      ) {
+        if (get().indexing?.jobId !== progress.jobId) return;
+        set((s) => ({
+          indexing: s.indexing && {
+            ...s.indexing,
+            processed: progress.processed,
+            total: progress.total ?? s.indexing.total,
+          },
+        }));
+        return;
+      }
+
       if (progress.docId == null) return;
       const docId = progress.docId;
 
@@ -1494,22 +1640,6 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
-      if (
-        progress.kind === "openIndexed" ||
-        progress.kind === "convertEditable" ||
-        progress.kind === "reindex"
-      ) {
-        if (get().indexing?.jobId !== progress.jobId) return;
-        set((s) => ({
-          indexing: s.indexing && {
-            ...s.indexing,
-            processed: progress.processed,
-            total: progress.total,
-          },
-        }));
-        return;
-      }
-
       if (progress.kind !== "diagnostics") return;
       // Only track the scan we started (guards against reused ids after e.g.
       // an app-side restart of the job system).
@@ -1534,6 +1664,43 @@ export const useStore = create<Store>((set, get) => {
           delete fileJobs[finished.jobId];
           return { fileJobs };
         });
+        return;
+      }
+
+      if (finished.kind === "archiveExtract") {
+        const indexing = get().indexing;
+        if (indexing?.jobId !== finished.jobId) return;
+        const token = indexing.archiveToken;
+        const path = indexing.path ?? "";
+        const entry = indexing.archiveEntry ?? null;
+        set({ indexing: null });
+        if (finished.status !== "done") {
+          if (finished.status === "failed") {
+            const message = finished.error ?? "extraction failed";
+            if (message.includes("suspicious compression ratio")) {
+              // The ratio guard tripped: offer an explicit confirmation.
+              set({ archiveLargeConfirm: { path, entry } });
+            } else {
+              set({ error: message });
+            }
+          }
+          return;
+        }
+        if (token == null) return;
+        try {
+          // Same decision flow as a plain-file open, over the extracted file.
+          const estimate = await api.pendingArchiveEstimate(token);
+          if (estimate.needsDecision) {
+            set({ openDecision: { path, estimate, archiveToken: token } });
+            return;
+          }
+          const started = await api.openArchiveDocument(token, "editable");
+          const meta = await api.getMeta(started.docId);
+          set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] }));
+          pushRecent(path);
+        } catch (e) {
+          set({ error: String(e) });
+        }
         return;
       }
 

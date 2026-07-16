@@ -2,6 +2,7 @@
 //! exposed to the web front end through a small Tauri command surface.
 
 mod analyze;
+mod archive;
 mod clipboard;
 mod commands;
 mod compare;
@@ -90,6 +91,7 @@ pub fn run() {
         .manage(ProfileCache::default())
         .manage(DedupCache::default())
         .manage(CompareCache::default())
+        .manage(crate::archive::ArchiveCache::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -102,6 +104,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
+            commands::list_archive_entries,
+            commands::start_archive_extract,
+            commands::pending_archive_estimate,
+            commands::open_archive_document,
+            commands::discard_archive,
             commands::probe_open,
             commands::start_open_indexed,
             commands::start_convert_to_editable,
