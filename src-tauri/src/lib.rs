@@ -118,6 +118,7 @@ pub fn run() {
             commands::start_diagnostics_scan,
             commands::apply_diagnostic_filter,
             commands::get_rows,
+            commands::get_cell,
             commands::selection_stats,
             commands::column_summaries,
             commands::set_cell,

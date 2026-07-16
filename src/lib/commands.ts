@@ -27,6 +27,13 @@ export interface AppCommand {
   /** Normalized default binding ("mod+shift+s"), if any. */
   defaultShortcut?: string;
   /**
+   * Fixed alias chords that also trigger the command (e.g. the cell editor
+   * answers to both F2 and mod+enter). Not rebindable and never shown in the
+   * shortcut editor; a user override of the PRIMARY binding on another
+   * command takes precedence over an alias.
+   */
+  extraShortcuts?: string[];
+  /**
    * Why the command is currently unavailable, or null when it can run.
    * Unavailable commands stay visible in the palette with this explanation.
    */

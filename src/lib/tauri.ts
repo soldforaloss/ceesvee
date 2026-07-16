@@ -46,6 +46,10 @@ import type {
 export const openFile = (path: string, options?: OpenOptions) =>
   invoke<DocumentMeta>("open_file", { path, options });
 
+/** The complete content of one cell, in display coordinates (F13). */
+export const getCell = (docId: number, row: number, col: number) =>
+  invoke<string>("get_cell", { docId, row, col });
+
 /** Estimate the in-memory cost of opening a file editable (F10). */
 export const probeOpen = (path: string) => invoke<OpenEstimate>("probe_open", { path });
 

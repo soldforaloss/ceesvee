@@ -1115,6 +1115,31 @@ pub fn get_rows(doc_id: u64, start: usize, count: usize, state: Db<'_>) -> AppRe
     read_doc(&state, doc_id, |doc| doc.get_rows(start, count))
 }
 
+/// The COMPLETE content of one cell (display coordinates), read through the
+/// backing-aware path so the F13 cell editor never operates on truncated
+/// grid text. Works for indexed documents (inspection is read-only there).
+#[tauri::command]
+pub fn get_cell(doc_id: u64, row: usize, col: usize, state: Db<'_>) -> AppResult<String> {
+    read_doc(&state, doc_id, |doc| {
+        let abs = abs_row(doc, row)?;
+        if col >= doc.n_cols() {
+            return Err(AppError::invalid("cell index out of range"));
+        }
+        let rows = doc.fetch_rows(&[abs])?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|mut r| {
+                if col < r.len() {
+                    Some(r.swap_remove(col))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default())
+    })
+}
+
 #[tauri::command]
 pub fn selection_stats(doc_id: u64, rect: CellRect, state: Db<'_>) -> AppResult<SelectionStats> {
     read_doc(&state, doc_id, |doc| doc.selection_stats(rect))

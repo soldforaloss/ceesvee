@@ -51,6 +51,8 @@ and faithful on large, real-world delimited files.**
 **Editing**
 
 - Inline cell editing with Excel-like keyboard navigation.
+- **Multiline / raw cell editor** (`F2`) with an Escaped view that reveals
+  newlines, tabs, and invisible characters — safe to inspect and copy.
 - Insert / delete / reorder rows; insert / delete / rename / reorder columns.
 - Multi-cell selection and **Excel-compatible copy/paste** (TSV on the clipboard).
 - **Undo / redo** backed by a Rust undo stack (Ctrl+Z / Ctrl+Y).
