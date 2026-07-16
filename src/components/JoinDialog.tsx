@@ -47,7 +47,10 @@ export function JoinDialog({ onClose }: { onClose: () => void }) {
   const [confirmed, setConfirmed] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const running = derive?.kind === "join";
+  // ANY running derive job blocks: the store tracks a single derive slot,
+  // and overwriting a running append/group-by job would orphan its
+  // completion (the new document would never be adopted as a tab).
+  const running = derive != null;
   const right = tabs.find((t) => t.id === rightId);
 
   if (!meta) return null;

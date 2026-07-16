@@ -1179,6 +1179,9 @@ pub async fn apply_outlier_action(
         doc.check_revision(expected_revision)?;
         let computed = outlier::action_changes(&doc, &spec, action)?;
         if !computed.remove_rows.is_empty() {
+            // Row removal shifts the absolute indices an active filter view
+            // refers to — drop it first, like every structural delete path.
+            doc.clear_filter();
             doc.delete_rows(computed.remove_rows)?;
         } else {
             doc.set_cells(computed.changes)?;
@@ -1464,10 +1467,25 @@ pub fn delete_all_recovery(app: tauri::AppHandle) -> AppResult<usize> {
 
 // ----- change inspector / selective revert (F15) ---------------------------------
 
+/// Unsaved operations plus whether the saved state sits in the REDO branch
+/// (the user undid past the last save — nothing to list, but the document
+/// is dirty and Redo returns to the saved state).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangesReport {
+    pub saved_in_redo: bool,
+    pub changes: Vec<ChangeSummary>,
+}
+
 /// Every unsaved operation, oldest first, with cell-level samples.
 #[tauri::command]
-pub fn get_changes(doc_id: u64, state: Db<'_>) -> AppResult<Vec<ChangeSummary>> {
-    read_doc(&state, doc_id, |doc| Ok(doc.changes_since_save()))
+pub fn get_changes(doc_id: u64, state: Db<'_>) -> AppResult<ChangesReport> {
+    read_doc(&state, doc_id, |doc| {
+        Ok(ChangesReport {
+            saved_in_redo: doc.saved_in_redo_branch(),
+            changes: doc.changes_since_save(),
+        })
+    })
 }
 
 /// Revert one whole operation (as a NEW, undoable operation).
@@ -2543,7 +2561,7 @@ pub fn set_cells(
 #[tauri::command]
 pub async fn copy_as(
     doc_id: u64,
-    rows: Vec<usize>,
+    rows: Option<Vec<usize>>,
     cols: Vec<usize>,
     include_headers: bool,
     format: CopyFormat,
@@ -2552,11 +2570,19 @@ pub async fn copy_as(
     let handle = doc_handle(&state, doc_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let doc = handle.read().map_err(poisoned)?;
-        // Display rows -> absolute rows (honours an active filter).
-        let abs: Vec<usize> = rows
-            .iter()
-            .map(|&d| abs_row(&doc, d))
-            .collect::<AppResult<_>>()?;
+        // Display rows -> absolute rows (honours an active filter). `None`
+        // means every visible row — kept off the IPC wire so a million-row
+        // copy doesn't ship a million-entry array.
+        let abs: Vec<usize> = match rows {
+            Some(rows) => rows
+                .iter()
+                .map(|&d| abs_row(&doc, d))
+                .collect::<AppResult<_>>()?,
+            None => match doc.filter_view() {
+                Some(view) => view.to_vec(),
+                None => (0..doc.n_rows()).collect(),
+            },
+        };
         clipboard::serialize_selection(&doc, &abs, &cols, include_headers, &format)
     })
     .await

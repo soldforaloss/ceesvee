@@ -328,10 +328,8 @@ pub fn preview(doc: &Document, spec: &ReshapeSpec) -> AppResult<ReshapePreview> 
             let mut keys: HashSet<Vec<String>> = HashSet::new();
             let mut coords: HashMap<(Vec<String>, String), u64> = HashMap::new();
             doc.visit_rows(0..doc.n_rows(), &mut |_, row| {
-                let header = row
-                    .get(*header_column)
-                    .map(|v| v.trim().to_string())
-                    .unwrap_or_default();
+                // Exact values — see `row_key`.
+                let header = row.get(*header_column).cloned().unwrap_or_default();
                 if seen.insert(header.clone()) {
                     header_values.push(header.clone());
                 }
@@ -380,10 +378,14 @@ fn header_name(doc: &Document, c: usize) -> String {
         .unwrap_or_else(|| format!("Column {}", c + 1))
 }
 
+// Pivot coordinates use EXACT cell values: trimming here would silently
+// merge rows/columns keyed by "A" and " A " and rewrite otherwise valid
+// data. (There is deliberately no normalization option — reshape must be
+// faithful; clean the data first if variants should merge.)
 fn row_key(row: &[String], columns: &[usize]) -> Vec<String> {
     columns
         .iter()
-        .map(|&c| row.get(c).map(|v| v.trim().to_string()).unwrap_or_default())
+        .map(|&c| row.get(c).cloned().unwrap_or_default())
         .collect()
 }
 
@@ -467,10 +469,8 @@ pub fn run(
             ctx.set_total(doc.n_rows() as u64 * 2);
             doc.visit_rows(0..doc.n_rows(), &mut |_, row| {
                 ctx.advance(1)?;
-                let header = row
-                    .get(*header_column)
-                    .map(|v| v.trim().to_string())
-                    .unwrap_or_default();
+                // Exact values — see `row_key`.
+                let header = row.get(*header_column).cloned().unwrap_or_default();
                 if !seen.contains_key(&header) {
                     seen.insert(header.clone(), 0);
                     header_values.push(header);
@@ -509,10 +509,7 @@ pub fn run(
                         i
                     }
                 };
-                let header = row
-                    .get(*header_column)
-                    .map(|v| v.trim().to_string())
-                    .unwrap_or_default();
+                let header = row.get(*header_column).cloned().unwrap_or_default();
                 let col = seen[&header];
                 let value = row.get(*value_column).cloned().unwrap_or_default();
                 if groups[idx].1[col].feed(&value).is_err() && duplicate.is_none() {
@@ -731,6 +728,17 @@ mod tests {
         assert_eq!(out.rows()[2], vec!["c", "3", "6"]);
 
         assert!(run_reshape(&d, &ReshapeSpec::Transpose { max_columns: 2 }).is_err());
+    }
+
+    #[test]
+    fn pivot_coordinates_preserve_exact_whitespace() {
+        // "a" and " a " are DIFFERENT row keys; "x" and " x " are DIFFERENT
+        // pivot columns — trimming would merge them and rewrite valid data.
+        let d = doc("k,h,v\na,x,1\n a ,x,2\na, x ,3\n");
+        let out = run_reshape(&d, &pivot_spec(PivotAgg::None)).unwrap();
+        assert_eq!(out.n_rows(), 2, "exact row keys stay distinct");
+        assert_eq!(out.headers().len(), 3, "k + two exact header columns");
+        assert!(out.headers().iter().any(|h| h == " x "));
     }
 
     #[test]
