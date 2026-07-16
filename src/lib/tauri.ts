@@ -11,6 +11,9 @@ import type {
   CompareInfo,
   ComparePage,
   CompareSpec,
+  CopyFormat,
+  PastePreview,
+  PasteSpecialOptions,
   DedupSpec,
   DiagnosticsReport,
   DiffStatus,
@@ -49,6 +52,60 @@ export const openFile = (path: string, options?: OpenOptions) =>
 /** The complete content of one cell, in display coordinates (F13). */
 export const getCell = (docId: number, row: number, col: number) =>
   invoke<string>("get_cell", { docId, row, col });
+
+/**
+ * Serialize a selection into a structured clipboard format (F14). `rows` are
+ * display indices; `null` copies every visible row.
+ */
+export const copyAs = (
+  docId: number,
+  rows: number[] | null,
+  cols: number[],
+  includeHeaders: boolean,
+  format: CopyFormat,
+) => invoke<string>("copy_as", { docId, rows, cols, includeHeaders, format });
+
+/** Preview a Paste Special without mutating (F14). */
+export const previewPasteSpecial = (
+  docId: number,
+  text: string,
+  options: PasteSpecialOptions,
+  anchorRow: number,
+  anchorCol: number,
+  selectionRows: number,
+  selectionCols: number,
+) =>
+  invoke<PastePreview>("preview_paste_special", {
+    docId,
+    text,
+    options,
+    anchorRow,
+    anchorCol,
+    selectionRows,
+    selectionCols,
+  });
+
+/** Apply a previewed Paste Special as one undo step (F14). */
+export const applyPasteSpecial = (
+  docId: number,
+  text: string,
+  options: PasteSpecialOptions,
+  anchorRow: number,
+  anchorCol: number,
+  selectionRows: number,
+  selectionCols: number,
+  expectedRevision: number,
+) =>
+  invoke<DocumentMeta>("apply_paste_special", {
+    docId,
+    text,
+    options,
+    anchorRow,
+    anchorCol,
+    selectionRows,
+    selectionCols,
+    expectedRevision,
+  });
 
 /** Estimate the in-memory cost of opening a file editable (F10). */
 export const probeOpen = (path: string) => invoke<OpenEstimate>("probe_open", { path });

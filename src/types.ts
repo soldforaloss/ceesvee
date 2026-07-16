@@ -145,6 +145,40 @@ export interface ExternalChange {
   stored: FileFingerprint | null;
 }
 
+/** Copy As output format (F14). */
+export type CopyFormat =
+  | { type: "tsv" }
+  | { type: "csvCurrent" }
+  | { type: "csvCustom"; delimiter: string; quoteStyle: string; lineEnding: string }
+  | { type: "jsonObjects" }
+  | { type: "jsonArrays" }
+  | { type: "jsonLines" }
+  | { type: "markdown" }
+  | { type: "sqlValues" };
+
+/** Paste Special options (F14) — a closed, validated set. */
+export interface PasteSpecialOptions {
+  mode: "overwrite" | "insertRows";
+  transpose?: boolean;
+  skipBlanks?: boolean;
+  trim?: boolean;
+  repeatToFill?: boolean;
+  firstRowHeaders?: boolean;
+}
+
+/** What a Paste Special preview reports before anything mutates (F14). */
+export interface PastePreview {
+  rows: number;
+  cols: number;
+  targetRow: number;
+  targetCol: number;
+  addedRows: number;
+  addedCols: number;
+  headerChanges: string[];
+  sample: string[][];
+  warnings: string[];
+}
+
 export interface RowsResponse {
   start: number;
   rows: string[][];

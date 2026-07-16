@@ -65,7 +65,9 @@ export type ModalName =
   | "transform"
   | "dedup"
   | "compare"
-  | "shortcuts";
+  | "shortcuts"
+  | "copyAs"
+  | "pasteSpecial";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
@@ -446,6 +448,8 @@ interface Store {
   newDoc: () => Promise<void>;
   closeTab: (id: number) => Promise<void>;
   setHeaderMode: (hasHeader: boolean) => Promise<void>;
+  /** Re-fetch the active document's meta and invalidate the grid cache. */
+  refreshActiveDoc: () => Promise<void>;
 
   // indexed read-only mode (F10)
   /** "Open editable" in the open-mode dialog: load fully despite the estimate. */
@@ -1162,6 +1166,16 @@ export const useStore = create<Store>((set, get) => {
     cancelIndexing: async () => {
       const indexing = get().indexing;
       if (indexing) await api.cancelJob(indexing.jobId).catch(() => undefined);
+    },
+
+    refreshActiveDoc: async () => {
+      const id = get().activeId;
+      if (id == null) return;
+      try {
+        reloadDoc(await api.getMeta(id));
+      } catch (e) {
+        set({ error: String(e) });
+      }
     },
 
     newDoc: async () => {

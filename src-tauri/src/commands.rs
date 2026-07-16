@@ -12,6 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use tauri::State;
 
+use crate::clipboard::{self, CopyFormat};
 use crate::compare::{self, CompareCache, CompareInfo, ComparePage, CompareSpec, DiffStatus};
 use crate::dedup::{self, DedupCache, DedupSpec, DuplicateKeepStrategy, DuplicateReport};
 use crate::diagnostics::{self, DiagnosticsCache, DiagnosticsReport};
@@ -25,6 +26,7 @@ use crate::dto::{
 use crate::error::{AppError, AppResult};
 use crate::job::JobRegistry;
 use crate::parse::{parse, ParseSettings, ParsedFile};
+use crate::paste::{self, PasteOptions, PastePreview};
 use crate::profile::{self, ColumnProfile, ProfileCache, ProfileOptions, ProfileScope};
 use crate::reopen::{self, CurrentInterpretation};
 use crate::settings::{self, AppSettings, FileProfile, ProfileValidation};
@@ -1179,6 +1181,101 @@ pub fn set_cells(
             translated.push((abs_row(doc, row)?, col, value));
         }
         doc.set_cells(translated)?;
+        Ok(doc.meta())
+    })
+}
+
+/// Copy As (F14): serialize a selection into a structured clipboard format.
+/// Runs on the blocking pool — a large off-screen selection reads through
+/// Rust's row-visit API, never the front-end cache.
+#[tauri::command]
+pub async fn copy_as(
+    doc_id: u64,
+    rows: Option<Vec<usize>>,
+    cols: Vec<usize>,
+    include_headers: bool,
+    format: CopyFormat,
+    state: Db<'_>,
+) -> AppResult<String> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let doc = handle.read().map_err(poisoned)?;
+        // Display rows -> absolute rows (honours an active filter). `None`
+        // means every visible row — kept off the IPC wire so a million-row
+        // copy doesn't ship a million-entry array.
+        let abs: Vec<usize> = match rows {
+            Some(rows) => rows
+                .iter()
+                .map(|&d| abs_row(&doc, d))
+                .collect::<AppResult<_>>()?,
+            None => match doc.filter_view() {
+                Some(view) => view.to_vec(),
+                None => (0..doc.n_rows()).collect(),
+            },
+        };
+        clipboard::serialize_selection(&doc, &abs, &cols, include_headers, &format)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Paste Special preview (F14): parse the clipboard text, apply the block
+/// transforms, and report exactly what would change — without mutating.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn preview_paste_special(
+    doc_id: u64,
+    text: String,
+    options: PasteOptions,
+    anchor_row: usize,
+    anchor_col: usize,
+    selection_rows: usize,
+    selection_cols: usize,
+    state: Db<'_>,
+) -> AppResult<PastePreview> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let doc = handle.read().map_err(poisoned)?;
+        let abs = abs_insert_row(&doc, anchor_row)?;
+        let block = paste::parse_clipboard(&text)?;
+        let block = paste::transform_block(block, &options, selection_rows, selection_cols);
+        Ok(paste::preview(&doc, &block, &options, abs, anchor_col))
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Apply a previewed Paste Special as ONE undoable operation, guarded by the
+/// preview's revision.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn apply_paste_special(
+    doc_id: u64,
+    text: String,
+    options: PasteOptions,
+    anchor_row: usize,
+    anchor_col: usize,
+    selection_rows: usize,
+    selection_cols: usize,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    write_doc(&state, doc_id, |doc| {
+        doc.ensure_editable()?;
+        doc.check_revision(expected_revision)?;
+        let abs = abs_insert_row(doc, anchor_row)?;
+        let block = paste::parse_clipboard(&text)?;
+        let block = paste::transform_block(block, &options, selection_rows, selection_cols);
+        // Pasting can grow/reshape the grid, so it drops any active filter.
+        doc.clear_filter();
+        doc.paste_special(
+            abs,
+            anchor_col,
+            block,
+            options.mode,
+            options.skip_blanks,
+            options.first_row_headers,
+        )?;
         Ok(doc.meta())
     })
 }

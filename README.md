@@ -55,6 +55,8 @@ and faithful on large, real-world delimited files.**
   newlines, tabs, and invisible characters — safe to inspect and copy.
 - Insert / delete / reorder rows; insert / delete / rename / reorder columns.
 - Multi-cell selection and **Excel-compatible copy/paste** (TSV on the clipboard).
+- **Copy As** JSON / Markdown / SQL / CSV variants, and **Paste Special** with
+  transpose, skip-blanks, pattern repeat, and insert-as-rows — all previewed.
 - **Undo / redo** backed by a Rust undo stack (Ctrl+Z / Ctrl+Y).
 - **Save / Save As** with explicit export options: delimiter, encoding, quoting
   style, line endings (LF/CRLF), and BOM.

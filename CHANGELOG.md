@@ -17,6 +17,18 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "Keyboard shortcuts…") records new bindings per command, warns before
   reassigning a chord that another command already uses, and persists
   overrides in the settings file. Changes apply immediately.
+- **Copy As** (`Ctrl/Cmd+Shift+C`): copy the selection or all visible rows as
+  TSV, CSV (current or custom settings), JSON (objects, arrays, or JSON
+  Lines), a Markdown table, or SQL `VALUES` rows — with or without headers.
+  Serialization runs in Rust (off-screen and indexed rows read correctly),
+  quotes/newlines/backslashes escape properly per format, blank cells become
+  SQL `NULL`, and very large payloads ask before hitting the clipboard.
+- **Paste Special** (`Ctrl/Cmd+Shift+V`): structured paste with an always-on
+  preview (dimensions, added rows/columns, header changes, first ten rows,
+  warnings). Modes: overwrite from the anchor or insert as new rows; options:
+  transpose, skip blank source cells, trim incoming cells, repeat a smaller
+  pattern over the selection, and treat the first pasted row as headers. The
+  whole paste is one undo step and nothing mutates until Apply.
 - **Multiline / raw cell editor** (`F2`, `Ctrl/Cmd+Enter`, or right-click →
   Edit cell): a resizable editor over the COMPLETE cell content with line,
   character, and UTF-8 byte counts, plus an **Escaped** view that makes
