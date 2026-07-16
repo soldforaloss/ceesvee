@@ -7,7 +7,7 @@ const CUSTOM = "__custom__";
 
 export function SourceBar() {
   const meta = useActiveMeta();
-  const reparse = useStore((s) => s.reparse);
+  const openReopenDialog = useStore((s) => s.openReopenDialog);
   const setHeaderMode = useStore((s) => s.setHeaderMode);
 
   const standard = DELIMITER_OPTIONS.some((o) => o.value === meta?.delimiter);
@@ -17,6 +17,9 @@ export function SourceBar() {
   if (!meta) return null;
   const canReparse = meta.path !== null;
 
+  // Source-setting changes re-read the file, so they never apply directly:
+  // they open the "Reopen with settings" preview (F02), which handles dirty
+  // documents explicitly.
   const onDelimiterSelect = (value: string) => {
     if (value === CUSTOM) {
       setCustomMode(true);
@@ -24,12 +27,21 @@ export function SourceBar() {
       return;
     }
     setCustomMode(false);
-    void reparse({ delimiter: value });
+    openReopenDialog({ delimiter: value });
   };
 
   const applyCustom = () => {
-    if (customValue) void reparse({ delimiter: customValue });
+    if (customValue) openReopenDialog({ delimiter: customValue });
     setCustomMode(false);
+  };
+
+  const onHeaderToggle = (checked: boolean) => {
+    if (canReparse) {
+      openReopenDialog({ hasHeaderRow: checked });
+    } else {
+      // Unsaved documents have no file to re-read; toggle in memory.
+      void setHeaderMode(checked);
+    }
   };
 
   return (
@@ -49,7 +61,7 @@ export function SourceBar() {
               onClick={applyCustom}
               className="rounded bg-violet-600 px-1.5 py-0.5 text-white hover:bg-violet-500"
             >
-              Apply
+              Preview…
             </button>
           </span>
         ) : (
@@ -69,7 +81,7 @@ export function SourceBar() {
         <Select
           value={meta.encoding}
           disabled={!canReparse}
-          onChange={(value) => void reparse({ encoding: value })}
+          onChange={(value) => openReopenDialog({ encoding: value })}
           options={
             ENCODING_OPTIONS.some((o) => o.value === meta.encoding)
               ? ENCODING_OPTIONS
@@ -82,7 +94,7 @@ export function SourceBar() {
         <input
           type="checkbox"
           checked={meta.hasHeaderRow}
-          onChange={(e) => void setHeaderMode(e.target.checked)}
+          onChange={(e) => onHeaderToggle(e.target.checked)}
           className="accent-violet-600"
         />
         First row is header

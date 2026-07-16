@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 use crate::analyze;
 use crate::dto::{
-    CellRect, ColumnKind, ColumnSummary, DocumentMeta, NumericSummary, RowsResponse,
-    SelectionStats, SortKey,
+    CellRect, ColumnKind, ColumnSummary, DocumentMeta, FileFingerprint, NumericSummary,
+    RowsResponse, SelectionStats, SortKey,
 };
 use crate::error::{AppError, AppResult};
 use crate::parse::{ImportInfo, ParsedFile};
@@ -130,6 +130,9 @@ pub struct Document {
     /// Fidelity information captured when the source file was parsed
     /// (decode damage, ragged records). Refreshed only by a reparse.
     import_info: ImportInfo,
+    /// Identity of the backing file as of the last open/reparse/save, used to
+    /// detect external modification. `None` for unsaved documents.
+    fingerprint: Option<FileFingerprint>,
 }
 
 impl Document {
@@ -183,6 +186,7 @@ impl Document {
             filter_view: None,
             revision: 1,
             import_info: import,
+            fingerprint: None,
         }
     }
 
@@ -212,6 +216,7 @@ impl Document {
             filter_view: None,
             revision: 1,
             import_info: ImportInfo::default(),
+            fingerprint: None,
         }
     }
 
@@ -245,6 +250,16 @@ impl Document {
     /// Import-time fidelity information (decode damage, ragged records).
     pub fn import_info(&self) -> &ImportInfo {
         &self.import_info
+    }
+
+    /// Identity of the backing file as of the last open/reparse/save.
+    pub fn fingerprint(&self) -> Option<FileFingerprint> {
+        self.fingerprint
+    }
+
+    /// Record the backing file's identity (after an open, reparse or save).
+    pub fn set_fingerprint(&mut self, fingerprint: Option<FileFingerprint>) {
+        self.fingerprint = fingerprint;
     }
 
     /// Current document revision (see the field docs for what bumps it).

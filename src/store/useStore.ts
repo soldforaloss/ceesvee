@@ -1,20 +1,24 @@
 import { create } from "zustand";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import * as api from "../lib/tauri";
 import { applyReplace } from "../lib/replace";
+import { currentOpenOptions, fingerprintKey } from "../lib/reopen";
 import type {
   CellRect,
   ColumnSummary,
   DiagnosticsReport,
   DocumentMeta,
   ExportOptions,
+  ExternalChange,
   FilterGroup,
   FindMatch,
   FindOptions,
   JobFinished,
   JobProgress,
   OpenOptions,
+  ReparsePreview,
   SortKey,
 } from "../types";
 
@@ -103,6 +107,30 @@ export interface JumpTarget {
 
 let jumpNonce = 0;
 
+/** State of the "Reopen with settings" dialog (active document only). */
+export interface ReopenState {
+  open: boolean;
+  /** Pending setting overrides; unset fields keep the current interpretation. */
+  options: OpenOptions;
+  preview: ReparsePreview | null;
+  loading: boolean;
+  error: string | null;
+}
+
+const initialReopen: ReopenState = {
+  open: false,
+  options: {},
+  preview: null,
+  loading: false,
+  error: null,
+};
+
+/** A detected on-disk change awaiting the user's decision. */
+export interface ExternalPrompt {
+  docId: number;
+  change: ExternalChange;
+}
+
 const initialFilter: FilterState = {
   open: false,
   spec: {
@@ -142,6 +170,14 @@ interface Store {
   diagnostics: Record<number, DiagnosticsDocState>;
   /** One-shot cell-jump request consumed by the grid. */
   jumpTarget: JumpTarget | null;
+  /** "Reopen with settings" dialog state (for the active document). */
+  reopen: ReopenState;
+  /** On-disk change currently awaiting a decision, if any. */
+  externalPrompt: ExternalPrompt | null;
+  /** Disk fingerprints the user chose to ignore, keyed by document id. */
+  ignoredFingerprints: Record<number, string>;
+  /** Whether the quit confirmation (dirty tabs) is showing. */
+  quitPromptOpen: boolean;
 
   // lifecycle / chrome
   init: () => void;
@@ -157,8 +193,23 @@ interface Store {
   openPath: (path: string) => Promise<void>;
   newDoc: () => Promise<void>;
   closeTab: (id: number) => Promise<void>;
-  reparse: (options: OpenOptions) => Promise<void>;
   setHeaderMode: (hasHeader: boolean) => Promise<void>;
+
+  // reopen with settings (F02)
+  openReopenDialog: (initial?: OpenOptions) => void;
+  closeReopenDialog: () => void;
+  setReopenOptions: (patch: OpenOptions) => void;
+  refreshReopenPreview: () => Promise<void>;
+  /** Apply the previewed settings; saves first unless `discard`. */
+  confirmReopen: (discard: boolean) => Promise<void>;
+
+  // external changes (F02)
+  checkExternalChanges: () => Promise<void>;
+  resolveExternalPrompt: (action: "reload" | "ignore" | "saveAs" | "openDisk") => Promise<void>;
+
+  // quit flow (F02)
+  setQuitPromptOpen: (open: boolean) => void;
+  confirmQuit: (mode: "save" | "discard") => Promise<void>;
 
   // editing
   setCell: (row: number, col: number, value: string) => Promise<void>;
@@ -272,6 +323,47 @@ export const useStore = create<Store>((set, get) => {
     }));
   };
 
+  /**
+   * Save one document (any tab, not just the active one). Returns whether the
+   * file was actually written — false when the user cancels the Save As
+   * dialog or the write fails, so callers (reopen, quit) can abort safely.
+   */
+  const saveDocById = async (
+    id: number,
+    saveAs: boolean,
+    exportOptions?: Partial<ExportOptions>,
+  ): Promise<boolean> => {
+    const meta = get().tabs.find((t) => t.id === id);
+    if (!meta) return false;
+    let path = meta.path;
+    if (saveAs || !path) {
+      const chosen = await saveFileDialog({
+        defaultPath: meta.fileName,
+        filters: FILE_FILTERS,
+      });
+      if (!chosen) return false;
+      path = chosen;
+    }
+    const options: ExportOptions = {
+      delimiter: meta.delimiter || ",",
+      encoding: meta.encoding || "UTF-8",
+      quoteStyle: "minimal",
+      lineEnding: meta.lineEnding,
+      bom: meta.hadBom,
+      includeHeaders: true,
+      ...exportOptions,
+    };
+    try {
+      const updated = await api.save(id, path, options);
+      refreshMeta(updated);
+      if (updated.path) pushRecent(updated.path);
+      return true;
+    } catch (e) {
+      set({ error: String(e) });
+      return false;
+    }
+  };
+
   return {
     tabs: [],
     activeId: null,
@@ -292,6 +384,10 @@ export const useStore = create<Store>((set, get) => {
     diagnosticsOpen: false,
     diagnostics: {},
     jumpTarget: null,
+    reopen: initialReopen,
+    externalPrompt: null,
+    ignoredFingerprints: {},
+    quitPromptOpen: false,
 
     init: () => {
       const theme = loadTheme();
@@ -324,6 +420,8 @@ export const useStore = create<Store>((set, get) => {
         summaries: null,
         summariesDocId: null,
         jumpTarget: null,
+        // The reopen dialog previews the active document only.
+        reopen: initialReopen,
       }),
 
     setSelection: (rect, rows, cols) => {
@@ -417,6 +515,8 @@ export const useStore = create<Store>((set, get) => {
         delete frozenCols[id];
         const diagnostics = { ...s.diagnostics };
         delete diagnostics[id];
+        const ignoredFingerprints = { ...s.ignoredFingerprints };
+        delete ignoredFingerprints[id];
         // Only invalidate the grid cache when the active document actually
         // changed; closing a background tab must not refetch the active grid.
         return {
@@ -424,22 +524,11 @@ export const useStore = create<Store>((set, get) => {
           activeId,
           frozenCols,
           diagnostics,
+          ignoredFingerprints,
+          externalPrompt: s.externalPrompt?.docId === id ? null : s.externalPrompt,
           dataVersion: closingActive ? s.dataVersion + 1 : s.dataVersion,
         };
       });
-    },
-
-    reparse: async (options) => {
-      const id = get().activeId;
-      if (id == null) return;
-      set({ busy: true, summaries: null, summariesDocId: null });
-      try {
-        const meta = await api.reparse(id, options);
-        reloadDoc(meta);
-        set({ busy: false });
-      } catch (e) {
-        set({ error: String(e), busy: false });
-      }
     },
 
     setHeaderMode: (hasHeader) => {
@@ -491,35 +580,11 @@ export const useStore = create<Store>((set, get) => {
     redo: () => mutate((id) => api.redo(id)),
 
     saveActive: async (saveAs, exportOptions) => {
-      const meta = activeMeta();
-      if (!meta) return;
-      let path = meta.path;
-      if (saveAs || !path) {
-        const chosen = await saveFileDialog({
-          defaultPath: meta.fileName,
-          filters: FILE_FILTERS,
-        });
-        if (!chosen) return;
-        path = chosen;
-      }
-      const options: ExportOptions = {
-        delimiter: meta.delimiter || ",",
-        encoding: meta.encoding || "UTF-8",
-        quoteStyle: "minimal",
-        lineEnding: meta.lineEnding,
-        bom: meta.hadBom,
-        includeHeaders: true,
-        ...exportOptions,
-      };
+      const id = get().activeId;
+      if (id == null) return;
       set({ busy: true });
-      try {
-        const updated = await api.save(meta.id, path, options);
-        refreshMeta(updated);
-        if (updated.path) pushRecent(updated.path);
-        set({ busy: false });
-      } catch (e) {
-        set({ error: String(e), busy: false });
-      }
+      await saveDocById(id, saveAs, exportOptions);
+      set({ busy: false });
     },
 
     // ----- find / replace -------------------------------------------------
@@ -708,6 +773,182 @@ export const useStore = create<Store>((set, get) => {
           scanError: finished.status === "failed" ? (finished.error ?? "scan failed") : null,
         });
       }
+    },
+
+    // ----- reopen with settings (F02) ---------------------------------------
+
+    openReopenDialog: (initial = {}) => {
+      const meta = activeMeta();
+      if (!meta?.path) return; // nothing on disk to reopen
+      set({
+        reopen: { ...initialReopen, open: true, options: initial, loading: true },
+      });
+      void get().refreshReopenPreview();
+    },
+
+    closeReopenDialog: () => set({ reopen: initialReopen }),
+
+    setReopenOptions: (patch) => {
+      set((s) => ({
+        reopen: { ...s.reopen, options: { ...s.reopen.options, ...patch } },
+      }));
+      void get().refreshReopenPreview();
+    },
+
+    refreshReopenPreview: async () => {
+      const meta = activeMeta();
+      const { reopen } = get();
+      if (!meta || !reopen.open) return;
+      const requested = reopen.options;
+      set((s) => ({ reopen: { ...s.reopen, loading: true, error: null } }));
+      try {
+        const preview = await api.previewReparse(meta.id, requested, 100);
+        // Discard if the options changed while this preview was in flight.
+        if (get().reopen.options === requested) {
+          set((s) => ({ reopen: { ...s.reopen, preview, loading: false } }));
+        }
+      } catch (e) {
+        if (get().reopen.options === requested) {
+          set((s) => ({ reopen: { ...s.reopen, error: String(e), loading: false } }));
+        }
+      }
+    },
+
+    confirmReopen: async (discard) => {
+      const meta = activeMeta();
+      const { reopen } = get();
+      const preview = reopen.preview;
+      if (!meta || !preview) return;
+
+      // A dirty document must be saved (or explicitly discarded) first.
+      if (meta.dirty && !discard) {
+        const saved = await saveDocById(meta.id, false);
+        if (!saved) return; // save cancelled or failed: abort, keep the dialog
+      }
+
+      try {
+        // Saving does not bump the revision, so the preview stays valid here.
+        const updated = await api.applyReparse(meta.id, reopen.options, preview.expectedRevision);
+        reloadDoc(updated);
+        set({
+          reopen: initialReopen,
+          // The reopened document has fresh contents; stale matches would
+          // point at cells that may no longer exist.
+          find: { ...get().find, matches: [], index: 0 },
+          summaries: null,
+          summariesDocId: null,
+        });
+      } catch (e) {
+        // Most likely a stale revision (an edit raced the dialog): surface it
+        // and refresh the preview so the next confirm can succeed.
+        set((s) => ({ reopen: { ...s.reopen, error: String(e) } }));
+        void get().refreshReopenPreview();
+      }
+    },
+
+    // ----- external changes (F02) -------------------------------------------
+
+    checkExternalChanges: async () => {
+      const { tabs, externalPrompt, ignoredFingerprints, reopen, quitPromptOpen } = get();
+      // One dialog at a time; don't stack prompts over other modal flows.
+      if (externalPrompt || reopen.open || quitPromptOpen) return;
+      for (const tab of tabs) {
+        if (!tab.path) continue;
+        try {
+          const change = await api.checkExternalChange(tab.id);
+          if (!change.changed) continue;
+          if (ignoredFingerprints[tab.id] === fingerprintKey(change.disk)) continue;
+          set({ externalPrompt: { docId: tab.id, change } });
+          return;
+        } catch {
+          // Stat failures are not worth interrupting the user for.
+        }
+      }
+    },
+
+    resolveExternalPrompt: async (action) => {
+      const prompt = get().externalPrompt;
+      if (!prompt) return;
+      const meta = get().tabs.find((t) => t.id === prompt.docId);
+      set({ externalPrompt: null });
+      if (!meta) return;
+
+      switch (action) {
+        case "reload": {
+          try {
+            // Reload keeps the current parse settings; never offered (or
+            // valid) for dirty documents.
+            const updated = await api.applyReparse(
+              meta.id,
+              currentOpenOptions(meta),
+              meta.revision,
+            );
+            reloadDoc(updated);
+          } catch (e) {
+            set({ error: String(e) });
+          }
+          break;
+        }
+        case "ignore":
+          set((s) => ({
+            ignoredFingerprints: {
+              ...s.ignoredFingerprints,
+              [meta.id]: fingerprintKey(prompt.change.disk),
+            },
+          }));
+          break;
+        case "saveAs": {
+          const saved = await saveDocById(meta.id, true);
+          if (!saved) {
+            // Nothing was written; re-surface the prompt on the next check.
+          }
+          break;
+        }
+        case "openDisk": {
+          // Minimal "compare with disk": open the on-disk version as its own
+          // tab next to the edited one (a structured diff arrives with F09).
+          if (meta.path) {
+            set((s) => ({
+              ignoredFingerprints: {
+                ...s.ignoredFingerprints,
+                [meta.id]: fingerprintKey(prompt.change.disk),
+              },
+            }));
+            try {
+              const opened = await api.openFile(meta.path);
+              set((s) => ({ tabs: [...s.tabs, opened], activeId: opened.id }));
+            } catch (e) {
+              set({ error: String(e) });
+            }
+          }
+          break;
+        }
+      }
+      // Surface the next pending change, if any.
+      void get().checkExternalChanges();
+    },
+
+    // ----- quit flow (F02) ----------------------------------------------------
+
+    setQuitPromptOpen: (open) => set({ quitPromptOpen: open }),
+
+    confirmQuit: async (mode) => {
+      if (mode === "save") {
+        const dirty = get().tabs.filter((t) => t.dirty);
+        for (const tab of dirty) {
+          const saved = await saveDocById(tab.id, false);
+          if (!saved) {
+            // Abort quitting: a save failed or was cancelled.
+            set({
+              quitPromptOpen: false,
+              error: `Quit cancelled — “${tab.fileName}” was not saved.`,
+            });
+            return;
+          }
+        }
+      }
+      set({ quitPromptOpen: false });
+      await getCurrentWindow().destroy();
     },
   };
 });

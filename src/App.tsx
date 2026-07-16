@@ -1,14 +1,18 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useState } from "react";
 
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { EmptyState } from "./components/EmptyState";
 import { ExportDialog } from "./components/ExportDialog";
+import { ExternalChangeDialog } from "./components/ExternalChangeDialog";
 import { FilterDialog } from "./components/FilterDialog";
 import { FindBar } from "./components/FindBar";
 import { Grid } from "./components/Grid";
 import { Close } from "./components/Icons";
+import { QuitDialog } from "./components/QuitDialog";
+import { ReopenDialog } from "./components/ReopenDialog";
 import { SortDialog } from "./components/SortDialog";
 import { SourceBar } from "./components/SourceBar";
 import { StatusBar } from "./components/StatusBar";
@@ -68,6 +72,32 @@ export default function App() {
       unProgress?.();
       unFinished?.();
     };
+  }, []);
+
+  // Intercept the window close: with unsaved edits, quitting must go through
+  // Save all / Discard all / Cancel (the QuitDialog destroys the window).
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    void getCurrentWindow()
+      .onCloseRequested((event) => {
+        const s = useStore.getState();
+        if (s.tabs.some((t) => t.dirty)) {
+          event.preventDefault();
+          s.setQuitPromptOpen(true);
+        }
+      })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => undefined);
+    return () => unlisten?.();
+  }, []);
+
+  // Detect files modified outside CEESVEE whenever the window regains focus.
+  useEffect(() => {
+    const onFocus = () => void useStore.getState().checkExternalChanges();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
   }, []);
 
   // Open files passed via "Open with CEESVEE": at launch (cold start, drained
@@ -208,6 +238,9 @@ export default function App() {
       {exportOpen && <ExportDialog onClose={() => setExportOpen(false)} />}
       {summariesOpen && <SummaryPanel onClose={() => setSummariesOpen(false)} />}
       {filterOpen && <FilterDialog onClose={() => setFilterOpen(false)} />}
+      <ReopenDialog />
+      <ExternalChangeDialog />
+      <QuitDialog />
 
       {error && (
         <div className="fixed bottom-10 right-4 z-50 flex max-w-md items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 shadow-lg dark:border-red-900/60 dark:bg-red-950/80 dark:text-red-300">
