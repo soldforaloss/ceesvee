@@ -39,6 +39,8 @@ import type {
   OpenOptions,
   ProfileScope,
   ProfileValidation,
+  RepairPreview,
+  RepairSpec,
   ReparsePreview,
   ReplaceResult,
   RowsResponse,
@@ -221,6 +223,14 @@ export const applySemanticAction = (
     action,
     expectedRevision,
   });
+
+/** Preview exactly what a missing-value repair would do (F29). */
+export const previewRepair = (docId: number, spec: RepairSpec, expectedRevision: number) =>
+  invoke<RepairPreview>("preview_repair", { docId, spec, expectedRevision });
+
+/** Apply a previewed repair as ONE undo step (F29). */
+export const applyRepair = (docId: number, spec: RepairSpec, expectedRevision: number) =>
+  invoke<DocumentMeta>("apply_repair", { docId, spec, expectedRevision });
 
 /** The last completed cross-validation report + the rules it ran (F27). */
 export const getCrossvalReport = (docId: number) =>

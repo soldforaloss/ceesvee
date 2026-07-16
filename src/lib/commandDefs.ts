@@ -298,6 +298,14 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("semantic"),
     },
     {
+      id: "data.repair",
+      title: "Repair missing values…",
+      keywords: ["fill", "blank", "null", "interpolate", "mean", "median", "mode", "ffill"],
+      category: "Data",
+      unavailableReason: needsEditable,
+      run: () => openModal("repair"),
+    },
+    {
       id: "data.crossval",
       title: "Validate across columns…",
       keywords: ["rules", "cross column", "relationship", "consistency", "sum", "conditional"],

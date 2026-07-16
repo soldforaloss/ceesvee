@@ -80,6 +80,10 @@ and faithful on large, real-world delimited files.**
   comparisons, date order, conditional required, sum equality with
   tolerance, allowed combinations, …) with violation samples, jump-to-row,
   filter-to-violations, and JSON reports. Rules persist in file profiles.
+- **Missing-value repair** — normalize null tokens, constant /
+  forward / backward / mean / median / mode fills, grouped fills that
+  never cross boundaries, linear interpolation, and thresholded row or
+  column removal — all previewed, scoped, and one undo step.
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 

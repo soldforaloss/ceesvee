@@ -268,6 +268,47 @@ export interface SemanticActionPreview {
   newColumn: string | null;
 }
 
+/** Missing-value repair operation (F29) — a closed, validated set. */
+export type RepairOp =
+  | { type: "normalizeNullTokens"; tokens: string[] }
+  | { type: "fillConstant"; value: string }
+  | { type: "fillForward"; groupColumns: number[] }
+  | { type: "fillBackward"; groupColumns: number[] }
+  | { type: "fillMean" }
+  | { type: "fillMedian" }
+  | { type: "fillMode" }
+  | { type: "interpolate"; extrapolate?: boolean }
+  | { type: "removeRows"; threshold: number }
+  | { type: "removeColumns"; threshold: number };
+
+export interface RepairSpec {
+  op: RepairOp;
+  /** Target columns (the cells examined and repaired). */
+  columns: number[];
+  /** Which rows participate; rows outside are never modified. */
+  scope: ExportScope;
+}
+
+export interface RepairExample {
+  row: number;
+  col: number;
+  before: string;
+  after: string;
+}
+
+/** What a repair would do, computed without mutating (F29). */
+export interface RepairPreview {
+  revision: number;
+  cellsAffected: number;
+  rowsRemoved: number;
+  columnsRemoved: number;
+  /** [column, computed fill value] for the statistical fills. */
+  fillValues: [number, string][];
+  /** Non-blank cells the statistics had to ignore as non-numeric. */
+  invalidNumeric: number;
+  examples: RepairExample[];
+}
+
 /** Numeric comparison operator for cross-column rules (F27). */
 export type CompareOp = "lt" | "le" | "gt" | "ge" | "eq" | "ne";
 
