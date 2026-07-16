@@ -163,6 +163,9 @@ pub struct NumericSummary {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ColumnSummary {
+    /// True when the statistics cover only a leading sample of the rows
+    /// (indexed documents over the sample limit), not the whole document.
+    pub sampled: bool,
     pub column: usize,
     pub kind: ColumnKind,
     /// Total data rows (equals the document's row count).

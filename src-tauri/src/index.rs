@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use encoding_rs::{Encoding, UTF_8};
 use serde::Serialize;
 
+use crate::dto::FileFingerprint;
 use crate::error::{AppError, AppResult};
 use crate::parse::{ImportInfo, RaggedSample};
 use crate::{delimiter, encoding, util};
@@ -450,6 +451,13 @@ pub fn build_index(
         .as_ref()
         .map(|g| g.cache_file())
         .unwrap_or_else(|| source.to_path_buf());
+    // Direct-read indexes remember the source's identity as of the scan so
+    // window reads can detect ANY later rewrite (see `source_check`).
+    let source_check = if guard.is_none() {
+        util::stat_fingerprint(source)
+    } else {
+        None
+    };
 
     let mut handle = IndexHandle {
         data_path,
@@ -458,6 +466,7 @@ pub fn build_index(
         delimiter: delim,
         n_cols,
         first_data: 0,
+        source_check,
         guard,
     };
 
@@ -535,6 +544,12 @@ pub struct IndexHandle {
     n_cols: usize,
     /// Index of the first DATA record (1 when a header row exists).
     first_data: usize,
+    /// Identity of `data_path` as of the scan, when the index reads the
+    /// SOURCE file directly (UTF-8 path). Every window read re-validates it,
+    /// so an in-place rewrite — even one that keeps the length — errors
+    /// instead of slicing stale offsets over new bytes. `None` for the cache
+    /// path (the cache file is private to this process).
+    source_check: Option<FileFingerprint>,
     /// Keeps the UTF-8 cache directory (when one exists) alive for the
     /// handle's lifetime; dropping the handle deletes it.
     #[allow(dead_code)] // held for its Drop effect
@@ -585,6 +600,17 @@ impl IndexHandle {
         } else {
             self.offsets[end]
         };
+
+        // A direct-read source must still be the file that was scanned: an
+        // in-place rewrite that kept the length would otherwise be sliced
+        // silently with stale offsets.
+        if let Some(expected) = self.source_check {
+            if util::stat_fingerprint(&self.data_path) != Some(expected) {
+                return Err(AppError::Other(
+                    "the source file changed on disk; reload the document".into(),
+                ));
+            }
+        }
 
         let mut file = File::open(&self.data_path)?;
         let file_len = file.metadata()?.len();
@@ -1048,6 +1074,32 @@ mod tests {
             .handle
             .visit_at(&[300], &mut |_, _| Ok(true))
             .is_err());
+        drop(indexed);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_length_rewrite_errors_instead_of_stale_slices() {
+        // An in-place rewrite that KEEPS the byte length must still be
+        // detected: stale offsets over new bytes would silently corrupt
+        // every window read.
+        let root = temp_root("rewrite");
+        let source = write_source(&root, b"a\n111\n222\n");
+        let indexed = build_index(
+            &source,
+            &root.join("indexes"),
+            &IndexSettings::default(),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(indexed.handle.read_records(0, 1).unwrap()[0], vec!["111"]);
+        // Ensure the rewrite lands in a different mtime millisecond.
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        fs::write(&source, b"a\n333\n444\n").unwrap();
+        assert!(
+            indexed.handle.read_records(0, 1).is_err(),
+            "reads must reject a rewritten source even at the same length"
+        );
         drop(indexed);
         let _ = fs::remove_dir_all(root);
     }

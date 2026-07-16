@@ -1649,9 +1649,11 @@ export const useStore = create<Store>((set, get) => {
     // ----- external changes (F02) -------------------------------------------
 
     checkExternalChanges: async () => {
-      const { tabs, externalPrompt, ignoredFingerprints, reopen, quitPromptOpen } = get();
+      const { tabs, externalPrompt, ignoredFingerprints, reopen, quitPromptOpen, indexing } = get();
       // One dialog at a time; don't stack prompts over other modal flows.
-      if (externalPrompt || reopen.open || quitPromptOpen) return;
+      // A running index job (open/convert/reload) also suppresses checks: a
+      // reindex refreshes the fingerprint only when it finishes.
+      if (externalPrompt || reopen.open || quitPromptOpen || indexing) return;
       for (const tab of tabs) {
         if (!tab.path) continue;
         try {
@@ -1691,7 +1693,10 @@ export const useStore = create<Store>((set, get) => {
                 },
               });
               consumeEarlyFinish(jobId);
-              break;
+              // Return (not break): the shared tail would immediately re-run
+              // checkExternalChanges, and the still-old fingerprint would
+              // re-surface this same prompt while the reload job runs.
+              return;
             }
             // Reload keeps the current parse settings; never offered (or
             // valid) for dirty documents.

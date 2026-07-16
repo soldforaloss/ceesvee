@@ -227,6 +227,11 @@ export interface NumericSummary {
 }
 
 export interface ColumnSummary {
+  /**
+   * True when the statistics cover only a leading sample of the rows
+   * (indexed documents over the sample limit), not the whole document.
+   */
+  sampled: boolean;
   column: number;
   kind: ColumnKind;
   count: number;

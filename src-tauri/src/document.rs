@@ -160,7 +160,7 @@ impl SummaryAccumulator {
         }
     }
 
-    fn into_summary(self, col: usize, count: usize) -> ColumnSummary {
+    fn into_summary(self, col: usize, count: usize, sampled: bool) -> ColumnSummary {
         // A column takes a non-text kind only when *every* non-empty cell
         // matches it; otherwise it is text (blanks never decide the kind).
         let non_empty = count - self.nulls;
@@ -183,6 +183,7 @@ impl SummaryAccumulator {
         });
 
         ColumnSummary {
+            sampled,
             column: col,
             kind,
             count,
@@ -720,6 +721,9 @@ impl Document {
             .map(|_| SummaryAccumulator::default())
             .collect();
         let scan_end = self.summary_scan_len();
+        // Flagged on every summary so the UI can say "first N rows" instead
+        // of presenting a sample as whole-document statistics.
+        let sampled = scan_end < self.n_rows();
         self.visit_rows(0..scan_end, &mut |_, row| {
             for (c, acc) in accs.iter_mut().enumerate() {
                 acc.record(row.get(c).map(String::as_str).unwrap_or(""));
@@ -729,7 +733,7 @@ impl Document {
         Ok(accs
             .into_iter()
             .enumerate()
-            .map(|(c, acc)| acc.into_summary(c, scan_end))
+            .map(|(c, acc)| acc.into_summary(c, scan_end, sampled))
             .collect())
     }
 
