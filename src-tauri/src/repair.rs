@@ -326,7 +326,7 @@ pub fn compute(doc: &Document, spec: &RepairSpec) -> AppResult<RepairComputed> {
                 }
                 // Scope rows arrive in ascending order, but sort defensively:
                 // partition_point requires it.
-                known.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                known.sort_unstable_by_key(|a| a.0);
                 for (abs, row_cells) in cells.iter() {
                     if !is_blank(&row_cells[ci]) {
                         continue;
