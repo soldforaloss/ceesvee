@@ -5,7 +5,19 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as api from "../lib/tauri";
 import { applyReplace } from "../lib/replace";
 import { rangeConditions, specOf, valueCondition, withAndConditions } from "../lib/explorer";
-import { matchingProfiles, profileSettingsDiffer } from "../lib/profiles";
+import { matchingProfiles, profileFromDocument, profileSettingsDiffer } from "../lib/profiles";
+import {
+  contiguousRuns,
+  emptyLayout,
+  layoutIsTrivial,
+  layoutOfView,
+  projectColumns,
+  remapFilterColumns,
+  resolveSortKeys,
+  widthsFromIds,
+  type ColumnLayout,
+} from "../lib/viewProjection";
+import { hydrateFilter, snapshotView, uniqueViewName, upsertView } from "../lib/views";
 import { currentOpenOptions, fingerprintKey } from "../lib/reopen";
 import { isLegacyEncoding } from "../lib/save";
 import type {
@@ -41,6 +53,7 @@ import type {
   FollowAlert,
   FollowAlertKind,
   FollowUpdate,
+  NamedView,
   RecoverableSession,
   CrossValReport,
   OutlierReport,
@@ -97,7 +110,8 @@ export type ModalName =
   | "recipes"
   | "pii"
   | "recovery"
-  | "dialect";
+  | "dialect"
+  | "views";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
@@ -179,6 +193,24 @@ export interface JumpTarget {
 }
 
 let jumpNonce = 0;
+let autoFitNonce = 0;
+
+/** Merge per-run selection statistics (F12: split by physical column runs). */
+function mergeStats(parts: SelectionInfo[]): SelectionInfo {
+  const count = parts.reduce((a, p) => a + p.count, 0);
+  const numericCount = parts.reduce((a, p) => a + p.numericCount, 0);
+  const sum = parts.reduce((a, p) => a + p.sum, 0);
+  const mins = parts.map((p) => p.min).filter((m): m is number => m !== null);
+  const maxs = parts.map((p) => p.max).filter((m): m is number => m !== null);
+  return {
+    count,
+    numericCount,
+    sum,
+    avg: numericCount > 0 ? sum / numericCount : null,
+    min: mins.length > 0 ? Math.min(...mins) : null,
+    max: maxs.length > 0 ? Math.max(...maxs) : null,
+  };
+}
 
 /** State of the "Reopen with settings" dialog (active document only). */
 export interface ReopenState {
@@ -278,6 +310,16 @@ export interface DocumentUiState {
   scrollPosition: { row: number; column: number };
   activeExplorerColumn: number | null;
   lastExportOptions?: ExportOptions;
+  /** F12: hidden/pinned/reordered columns, by stable column ID. */
+  columnLayout: ColumnLayout | null;
+  /** F12: wrap long cell text (taller rows). */
+  wrapText: boolean;
+  /** F12: the named view last applied to this document, if any. */
+  activeViewId: string | null;
+  /** F12: the applied non-destructive sort, in physical columns. */
+  viewSortKeys: SortKey[];
+  /** F12: dismissible missing-column warning from the last view apply. */
+  viewWarning: string | null;
 }
 
 /** A matched profile suggestion awaiting the user's decision. */
@@ -528,6 +570,18 @@ interface Store {
   activeExplorerColumn: number | null;
   /** Export options last used for the ACTIVE document, seeding the dialog. */
   lastExportOptions?: ExportOptions;
+  /** F12: the ACTIVE document's column layout (hidden/pinned/order, by ID). */
+  columnLayout: ColumnLayout | null;
+  /** F12: wrap long cell text in the ACTIVE document's grid. */
+  wrapText: boolean;
+  /** F12: named view last applied to the ACTIVE document, if any. */
+  activeViewId: string | null;
+  /** F12: the ACTIVE document's non-destructive sort (physical columns). */
+  viewSortKeys: SortKey[];
+  /** F12: dismissible missing-column warning from the last view apply. */
+  viewWarning: string | null;
+  /** F12: one-shot auto-fit request consumed by the grid. */
+  autoFitRequest: { cols: number[] | "all"; nonce: number } | null;
   /** Saved UI state of every non-active document, keyed by document id. */
   uiStates: Record<number, DocumentUiState>;
   /** Detected per-column type + summary for the active doc (null until loaded). */
@@ -641,9 +695,45 @@ interface Store {
   setSelection: (rect: CellRect | null, rows: number[], cols: number[]) => void;
   setFrozenCols: (count: number) => void;
   setColumnWidth: (col: number, width: number) => void;
+  setColumnWidthsBulk: (widths: Record<number, number>) => void;
   resetColumnWidths: () => void;
   setScrollPosition: (row: number, column: number) => void;
   loadSummaries: () => void;
+
+  // named views & column layout (F12)
+  /** Hide/unhide one physical column (at least one column stays visible). */
+  setColumnHidden: (physicalCol: number, hidden: boolean) => void;
+  unhideAllColumns: () => void;
+  /** Pin/unpin one physical column (pinned columns display first, frozen). */
+  pinColumn: (physicalCol: number, pin: boolean) => void;
+  /** Move a DISPLAY column to a new display position (from the grid drag). */
+  reorderColumns: (fromDisplay: number, toDisplay: number) => void;
+  setWrapText: (wrap: boolean) => void;
+  /** Apply (or clear, with empty keys) the non-destructive view sort. */
+  applyViewSort: (keys: SortKey[]) => Promise<void>;
+  /** Ask the grid to auto-fit the given physical columns (or all visible). */
+  requestAutoFit: (cols: number[] | "all") => void;
+  clearAutoFitRequest: () => void;
+  /** Apply a named view to the active document (never dirties it). */
+  applyNamedView: (view: NamedView) => Promise<void>;
+  /** Snapshot the current state as a new named view and persist it. */
+  saveCurrentViewAs: (name: string) => Promise<void>;
+  /** Overwrite an existing view with the current state. */
+  replaceNamedView: (viewId: string) => Promise<void>;
+  renameNamedView: (viewId: string, name: string) => Promise<void>;
+  duplicateNamedView: (viewId: string) => Promise<void>;
+  deleteNamedView: (viewId: string) => Promise<void>;
+  /** Reset filter, view sort, layout, widths and wrap — never touches data. */
+  resetView: () => Promise<void>;
+  dismissViewWarning: () => void;
+  /** The saved views (and owning profile) matching the active document. */
+  viewsForActive: () => { profile: FileProfile | null; views: NamedView[] };
+  /**
+   * The current selection rectangle in PHYSICAL columns, or null when the
+   * display selection maps to more than one physical run (reordered columns)
+   * — range-shaped operations (range export) are unavailable then.
+   */
+  selectionPhysicalRect: () => CellRect | null;
 
   // documents
   openDialog: () => Promise<void>;
@@ -901,6 +991,11 @@ export const useStore = create<Store>((set, get) => {
     scrollPosition: { row: 0, column: 0 },
     activeExplorerColumn: null,
     lastExportOptions: undefined,
+    columnLayout: null,
+    wrapText: false,
+    activeViewId: null,
+    viewSortKeys: [],
+    viewWarning: null,
   });
 
   /**
@@ -932,6 +1027,11 @@ export const useStore = create<Store>((set, get) => {
         scrollPosition: flushedScroll,
         activeExplorerColumn: s.activeExplorerColumn,
         lastExportOptions: s.lastExportOptions,
+        columnLayout: s.columnLayout,
+        wrapText: s.wrapText,
+        activeViewId: s.activeViewId,
+        viewSortKeys: s.viewSortKeys,
+        viewWarning: s.viewWarning,
       };
     }
     const next = (id != null ? uiStates[id] : undefined) ?? defaultUiState();
@@ -949,6 +1049,12 @@ export const useStore = create<Store>((set, get) => {
       scrollPosition: next.scrollPosition,
       activeExplorerColumn: next.activeExplorerColumn,
       lastExportOptions: next.lastExportOptions,
+      columnLayout: next.columnLayout,
+      wrapText: next.wrapText,
+      activeViewId: next.activeViewId,
+      viewSortKeys: next.viewSortKeys,
+      viewWarning: next.viewWarning,
+      autoFitRequest: null,
       summaries: null,
       summariesDocId: null,
       jumpTarget: null,
@@ -1010,6 +1116,164 @@ export const useStore = create<Store>((set, get) => {
     set({ profileSuggestion: { docId: meta.id, profile } });
   };
 
+  // ----- named views (F12) -------------------------------------------------
+
+  /**
+   * Map a DISPLAY-space selection rectangle onto PHYSICAL column runs. The
+   * identity layout returns the rect unchanged; a hidden/reordered layout may
+   * split it into several rectangles (columns adjacent on screen need not be
+   * adjacent in the file).
+   */
+  const selectionPhysicalRects = (rect: CellRect): CellRect[] => {
+    const meta = activeMeta();
+    const layout = get().columnLayout;
+    if (!meta || layoutIsTrivial(layout)) return [rect];
+    const proj = projectColumns(meta.columnIds, layout);
+    const phys = proj.physical.slice(rect.x, rect.x + rect.width).sort((a, b) => a - b);
+    return contiguousRuns(phys).map((run) => ({
+      x: run.start,
+      y: rect.y,
+      width: run.len,
+      height: rect.height,
+    }));
+  };
+
+  /**
+   * Selection scope for find/replace, translated to physical columns. The
+   * backend takes ONE rectangle; a display selection that maps to several
+   * physical runs (reordered columns) is reported as blocked rather than
+   * silently searching the wrong columns.
+   */
+  const findSelectionScope = (
+    inSelection: boolean,
+    rect: CellRect | null,
+  ): { rect?: CellRect; blocked: boolean } => {
+    if (!inSelection || !rect) return { blocked: false };
+    const rects = selectionPhysicalRects(rect);
+    if (rects.length !== 1) return { blocked: true };
+    return { rect: rects[0], blocked: false };
+  };
+
+  const FIND_SELECTION_BLOCKED =
+    "Find in selection isn't available while columns are reordered around the selection — search the whole file, or reset the column order.";
+
+  /** The profile owning the active doc's views (first path match), if any. */
+  const viewProfileFor = (meta: DocumentMeta): FileProfile | null => {
+    if (!meta.path) return null;
+    const profiles = get().settings?.profiles ?? [];
+    const matches = matchingProfiles(profiles, meta.path);
+    // Prefer a matching profile that already stores views.
+    return matches.find((p) => (p.namedViews?.length ?? 0) > 0) ?? matches[0] ?? null;
+  };
+
+  /** Persist a profile change (upserting the profile when it is new). */
+  const persistProfile = async (profile: FileProfile) => {
+    const current = get().settings ?? { version: 1, profiles: [] };
+    const exists = current.profiles.some((p) => p.id === profile.id);
+    const next = {
+      ...current,
+      profiles: exists
+        ? current.profiles.map((p) => (p.id === profile.id ? profile : p))
+        : [...current.profiles, profile],
+    };
+    await api.setSettings(next);
+    set({ settings: next });
+  };
+
+  /** Update the owning profile's views (creating a profile if needed). */
+  const persistViews = async (
+    meta: DocumentMeta,
+    update: (views: NamedView[]) => NamedView[],
+    lastViewId?: string | null,
+  ) => {
+    const owner = viewProfileFor(meta) ?? profileFromDocument(meta.fileName || "Views", meta);
+    const namedViews = update(owner.namedViews ?? []);
+    const next: FileProfile = {
+      ...owner,
+      namedViews,
+      lastViewId: lastViewId === undefined ? (owner.lastViewId ?? null) : lastViewId,
+    };
+    await persistProfile(next);
+  };
+
+  /**
+   * Apply a named view to the ACTIVE document. Row parts (filter + view
+   * sort) go through the backend — never entering the undo stack or marking
+   * the document dirty — and column parts resolve by stable ID. Columns that
+   * no longer exist produce a recoverable warning; the view itself is never
+   * modified.
+   */
+  const applyNamedViewInner = async (view: NamedView, persistLast: boolean) => {
+    const meta = activeMeta();
+    if (!meta) return;
+    const ids = meta.columnIds;
+    const missing: string[] = [];
+    const note = (more: string[]) => {
+      for (const id of more) if (!missing.includes(id)) missing.push(id);
+    };
+
+    const layout = layoutOfView(view);
+    note(projectColumns(ids, layout).missing);
+
+    let appliedSort: SortKey[] = [];
+    try {
+      // Row filter (all-or-nothing per filter; skipping a single condition
+      // could silently widen an AND group).
+      if (view.filter) {
+        const remapped = remapFilterColumns(view.filter, view.filterColumnIds, ids);
+        note(remapped.missing);
+        if (remapped.filter) {
+          const hydrated = hydrateFilter(remapped.filter);
+          set((s) => ({ filter: { ...s.filter, spec: hydrated } }));
+          reloadDoc(await api.setFilter(meta.id, hydrated));
+        }
+      } else if (meta.filtered) {
+        reloadDoc(await api.clearFilter(meta.id));
+      }
+
+      // Non-destructive view sort (missing keys are skipped — benign).
+      const resolved = resolveSortKeys(view.sortKeys, ids);
+      note(resolved.missing);
+      if (resolved.keys.length > 0 || meta.viewSorted) {
+        reloadDoc(await api.setViewSort(meta.id, resolved.keys));
+      }
+      appliedSort = resolved.keys;
+    } catch (e) {
+      set({ error: String(e) });
+      return;
+    }
+
+    set((s) => ({
+      columnLayout: layoutIsTrivial(layout) ? null : layout,
+      wrapText: view.wrapText,
+      columnWidths: { ...s.columnWidths, ...widthsFromIds(view.columnWidths, ids) },
+      activeViewId: view.id,
+      viewSortKeys: appliedSort,
+      viewWarning:
+        missing.length > 0
+          ? `This view references ${missing.length} column${missing.length === 1 ? "" : "s"} that no longer exist (deleted or from an older file layout). The rest of the view was applied; the view itself is unchanged.`
+          : null,
+    }));
+
+    if (persistLast && meta.path) {
+      await persistViews(meta, (views) => views, view.id).catch(() => undefined);
+    }
+  };
+
+  /** Restore a matching profile's last-selected view after a file opens. */
+  const restoreLastViewFor = async (meta: DocumentMeta) => {
+    if (!meta.path) return;
+    const owner = viewProfileFor(meta);
+    const view = owner?.lastViewId
+      ? (owner.namedViews ?? []).find((v) => v.id === owner.lastViewId)
+      : undefined;
+    if (!view) return;
+    // Only restore into the still-active document: layout state is applied
+    // to the active slots, and the user may have switched tabs meanwhile.
+    if (get().activeId !== meta.id) return;
+    await applyNamedViewInner(view, false).catch(() => undefined);
+  };
+
   /** Replace a tab's metadata (dirty/undo flags) without reloading the grid. */
   const refreshMeta = (meta: DocumentMeta) =>
     set((s) => ({ tabs: s.tabs.map((t) => (t.id === meta.id ? meta : t)) }));
@@ -1019,6 +1283,12 @@ export const useStore = create<Store>((set, get) => {
     set((s) => ({
       tabs: s.tabs.map((t) => (t.id === meta.id ? meta : t)),
       dataVersion: s.dataVersion + 1,
+      // Structural mutations drop the backend row view (filter + view sort);
+      // keep the front end's applied-sort mirror in sync with the truth.
+      viewSortKeys:
+        meta.id === s.activeId && !meta.viewSorted && s.viewSortKeys.length > 0
+          ? []
+          : s.viewSortKeys,
     }));
 
   const pushRecent = (path: string) => {
@@ -1206,6 +1476,12 @@ export const useStore = create<Store>((set, get) => {
     scrollPosition: { row: 0, column: 0 },
     activeExplorerColumn: null,
     lastExportOptions: undefined,
+    columnLayout: null,
+    wrapText: false,
+    activeViewId: null,
+    viewSortKeys: [],
+    viewWarning: null,
+    autoFitRequest: null,
     uiStates: {},
     summaries: null,
     summariesDocId: null,
@@ -1315,12 +1591,15 @@ export const useStore = create<Store>((set, get) => {
       }
       // Compute aggregates in Rust over the full range (the front-end cache only
       // holds the visible window, so client-side stats would be wrong for large
-      // selections). Debounced and guarded against stale results.
+      // selections). Debounced and guarded against stale results. Under a
+      // non-trivial column layout (F12) the display rectangle maps to one or
+      // more PHYSICAL column runs; stats are computed per run and merged, so
+      // they stay correct with hidden or reordered columns.
       statsTimer = setTimeout(() => {
-        void api
-          .selectionStats(id, rect)
-          .then((stats) => {
-            if (get().selectionRect === rect) set({ selection: stats });
+        const rects = selectionPhysicalRects(rect);
+        void Promise.all(rects.map((r) => api.selectionStats(id, r)))
+          .then((parts) => {
+            if (get().selectionRect === rect) set({ selection: mergeStats(parts) });
           })
           .catch(() => undefined);
       }, 120);
@@ -1331,7 +1610,241 @@ export const useStore = create<Store>((set, get) => {
     setColumnWidth: (col, width) =>
       set((s) => ({ columnWidths: { ...s.columnWidths, [col]: width } })),
 
+    setColumnWidthsBulk: (widths) =>
+      set((s) => ({ columnWidths: { ...s.columnWidths, ...widths } })),
+
     resetColumnWidths: () => set({ columnWidths: {} }),
+
+    // ----- named views & column layout (F12) --------------------------------
+
+    setColumnHidden: (physicalCol, hidden) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const id = meta.columnIds[physicalCol];
+      if (id === undefined) return;
+      const layout = get().columnLayout ?? emptyLayout();
+      const hiddenIds = hidden
+        ? layout.hiddenColumnIds.includes(id)
+          ? layout.hiddenColumnIds
+          : [...layout.hiddenColumnIds, id]
+        : layout.hiddenColumnIds.filter((h) => h !== id);
+      const next = { ...layout, hiddenColumnIds: hiddenIds };
+      if (hidden && projectColumns(meta.columnIds, next).physical.length === 0) {
+        set({ error: "At least one column must stay visible" });
+        return;
+      }
+      set({ columnLayout: layoutIsTrivial(next) ? null : next });
+    },
+
+    unhideAllColumns: () =>
+      set((s) => {
+        if (!s.columnLayout) return {};
+        const next = { ...s.columnLayout, hiddenColumnIds: [] };
+        return { columnLayout: layoutIsTrivial(next) ? null : next };
+      }),
+
+    pinColumn: (physicalCol, pin) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const id = meta.columnIds[physicalCol];
+      if (id === undefined) return;
+      const layout = get().columnLayout ?? emptyLayout();
+      const pinnedIds = pin
+        ? layout.pinnedColumnIds.includes(id)
+          ? layout.pinnedColumnIds
+          : [...layout.pinnedColumnIds, id]
+        : layout.pinnedColumnIds.filter((p) => p !== id);
+      const next = { ...layout, pinnedColumnIds: pinnedIds };
+      set({ columnLayout: layoutIsTrivial(next) ? null : next });
+    },
+
+    reorderColumns: (fromDisplay, toDisplay) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const s = get();
+      const proj = projectColumns(meta.columnIds, s.columnLayout);
+      const count = proj.physical.length;
+      if (fromDisplay < 0 || fromDisplay >= count || fromDisplay === toDisplay) return;
+      // Drags stay within their region: a pinned column reorders among the
+      // pins, an unpinned one among the rest (pin/unpin is its own action).
+      const inPins = fromDisplay < proj.frozen;
+      const lo = inPins ? 0 : proj.frozen;
+      const hi = inPins ? proj.frozen - 1 : count - 1;
+      const target = Math.min(Math.max(toDisplay, lo), hi);
+      if (target === fromDisplay) return;
+
+      const displayIds = proj.physical.map((p) => meta.columnIds[p]);
+      const [moved] = displayIds.splice(fromDisplay, 1);
+      displayIds.splice(target, 0, moved);
+
+      const layout = s.columnLayout ?? emptyLayout();
+      const next: ColumnLayout = {
+        ...layout,
+        pinnedColumnIds: displayIds.slice(0, proj.frozen),
+        columnOrder: displayIds.slice(proj.frozen),
+      };
+      set({ columnLayout: layoutIsTrivial(next) ? null : next });
+    },
+
+    setWrapText: (wrap) => set({ wrapText: wrap }),
+
+    applyViewSort: async (keys) => {
+      await mutate((id) => api.setViewSort(id, keys));
+      const meta = activeMeta();
+      set({ viewSortKeys: meta?.viewSorted ? keys : [] });
+    },
+
+    requestAutoFit: (cols) => {
+      autoFitNonce += 1;
+      set({ autoFitRequest: { cols, nonce: autoFitNonce } });
+    },
+
+    clearAutoFitRequest: () => set({ autoFitRequest: null }),
+
+    applyNamedView: (view) => applyNamedViewInner(view, true),
+
+    saveCurrentViewAs: async (name) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      if (!meta.path) {
+        set({ error: "Save the file first — named views are stored per source file" });
+        return;
+      }
+      const s = get();
+      const existing = get().viewsForActive().views;
+      const view = snapshotView({
+        name: uniqueViewName(
+          existing.map((v) => v.name),
+          name,
+        ),
+        meta,
+        filter: meta.filtered ? s.filter.spec : null,
+        viewSortKeys: s.viewSortKeys,
+        layout: s.columnLayout,
+        columnWidths: s.columnWidths,
+        wrapText: s.wrapText,
+      });
+      try {
+        await persistViews(meta, (views) => upsertView(views, view), view.id);
+        set({ activeViewId: view.id, viewWarning: null });
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    replaceNamedView: async (viewId) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const s = get();
+      const existing = get()
+        .viewsForActive()
+        .views.find((v) => v.id === viewId);
+      if (!existing) return;
+      const view = snapshotView({
+        id: viewId,
+        name: existing.name,
+        meta,
+        filter: meta.filtered ? s.filter.spec : null,
+        viewSortKeys: s.viewSortKeys,
+        layout: s.columnLayout,
+        columnWidths: s.columnWidths,
+        wrapText: s.wrapText,
+      });
+      try {
+        await persistViews(meta, (views) => upsertView(views, view), viewId);
+        set({ activeViewId: viewId });
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    renameNamedView: async (viewId, name) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const views = get().viewsForActive().views;
+      const target = views.find((v) => v.id === viewId);
+      if (!target) return;
+      const unique = uniqueViewName(
+        views.filter((v) => v.id !== viewId).map((v) => v.name),
+        name,
+      );
+      await persistViews(meta, (all) =>
+        all.map((v) => (v.id === viewId ? { ...v, name: unique } : v)),
+      ).catch((e) => set({ error: String(e) }));
+    },
+
+    duplicateNamedView: async (viewId) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const views = get().viewsForActive().views;
+      const target = views.find((v) => v.id === viewId);
+      if (!target) return;
+      const copy: NamedView = {
+        ...target,
+        id: `${viewId}-copy-${Date.now().toString(36)}`,
+        name: uniqueViewName(
+          views.map((v) => v.name),
+          target.name,
+        ),
+      };
+      await persistViews(meta, (all) => [...all, copy]).catch((e) => set({ error: String(e) }));
+    },
+
+    deleteNamedView: async (viewId) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const owner = viewProfileFor(meta);
+      if (!owner) return;
+      const nextLast = owner.lastViewId === viewId ? null : undefined;
+      try {
+        await persistViews(meta, (all) => all.filter((v) => v.id !== viewId), nextLast);
+        if (get().activeViewId === viewId) set({ activeViewId: null });
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    resetView: async () => {
+      const meta = activeMeta();
+      if (!meta) return;
+      try {
+        if (meta.filtered || meta.viewSorted) {
+          reloadDoc(await api.resetRowView(meta.id));
+        }
+      } catch (e) {
+        set({ error: String(e) });
+        return;
+      }
+      set((s) => ({
+        columnLayout: null,
+        wrapText: false,
+        columnWidths: {},
+        frozenColumnCount: 0,
+        activeViewId: null,
+        viewSortKeys: [],
+        viewWarning: null,
+        filter: { ...initialFilter, open: s.filter.open },
+      }));
+      if (meta.path) {
+        await persistViews(meta, (views) => views, null).catch(() => undefined);
+      }
+    },
+
+    dismissViewWarning: () => set({ viewWarning: null }),
+
+    viewsForActive: () => {
+      const meta = activeMeta();
+      if (!meta) return { profile: null, views: [] };
+      const profile = viewProfileFor(meta);
+      return { profile, views: profile?.namedViews ?? [] };
+    },
+
+    selectionPhysicalRect: () => {
+      const rect = get().selectionRect;
+      if (!rect) return null;
+      const rects = selectionPhysicalRects(rect);
+      return rects.length === 1 ? rects[0] : null;
+    },
 
     setScrollPosition: (row, column) => {
       // Trailing debounce: visible-region events fire on every scroll frame.
@@ -1417,7 +1930,9 @@ export const useStore = create<Store>((set, get) => {
           busy: false,
         }));
         pushRecent(path);
-        void suggestProfileFor(meta);
+        void suggestProfileFor(meta)
+          .then(() => restoreLastViewFor(meta))
+          .catch(() => undefined);
       } catch (e) {
         set({ error: String(e), busy: false });
       }
@@ -1445,7 +1960,9 @@ export const useStore = create<Store>((set, get) => {
           busy: false,
         }));
         pushRecent(decision.path);
-        void suggestProfileFor(meta);
+        void suggestProfileFor(meta)
+          .then(() => restoreLastViewFor(meta))
+          .catch(() => undefined);
       } catch (e) {
         set({ error: String(e), busy: false });
       }
@@ -2069,12 +2586,17 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
       const activeTab = tabs.find((t) => t.id === id);
+      const scope = findSelectionScope(find.inSelection, selectionRect);
+      if (scope.blocked) {
+        set({ error: FIND_SELECTION_BLOCKED });
+        return;
+      }
       const options: FindOptions = {
         query: find.query,
         regex: find.regex,
         caseSensitive: find.caseSensitive,
         wholeCell: find.wholeCell,
-        selection: find.inSelection && selectionRect ? selectionRect : undefined,
+        selection: scope.rect,
         // Indexed documents can be enormous: cap the match list so a broad
         // query cannot materialise millions of hits (F10).
         limit: activeTab?.backing === "indexedReadOnly" ? INDEXED_FIND_LIMIT : undefined,
@@ -2117,9 +2639,10 @@ export const useStore = create<Store>((set, get) => {
         // Recompute matches and advance to the first one AFTER the replaced cell,
         // so sequential Replace moves forward (and doesn't loop on a replacement
         // that still matches the query).
+        const scope = findSelectionScope(find.inSelection, selectionRect);
         const matches = await api.find(id, {
           ...options,
-          selection: find.inSelection && selectionRect ? selectionRect : undefined,
+          selection: scope.blocked ? undefined : scope.rect,
         });
         let index = matches.findIndex(
           (m) => m.row > match.row || (m.row === match.row && m.col > match.col),
@@ -2135,12 +2658,17 @@ export const useStore = create<Store>((set, get) => {
       const id = get().activeId;
       const { find, selectionRect } = get();
       if (id == null || find.query === "") return;
+      const scope = findSelectionScope(find.inSelection, selectionRect);
+      if (scope.blocked) {
+        set({ error: FIND_SELECTION_BLOCKED });
+        return;
+      }
       const options: FindOptions = {
         query: find.query,
         regex: find.regex,
         caseSensitive: find.caseSensitive,
         wholeCell: find.wholeCell,
-        selection: find.inSelection && selectionRect ? selectionRect : undefined,
+        selection: scope.rect,
       };
       try {
         const result = await api.replaceAll(id, options, find.replacement);
@@ -2225,11 +2753,11 @@ export const useStore = create<Store>((set, get) => {
       const meta = activeMeta();
       if (!meta) return;
       // Diagnostic samples use absolute row indices; a jump while filtered
-      // would land on the wrong (display) row and the target may be hidden
-      // anyway, so drop the filter first.
-      if (meta.filtered) {
+      // or view-sorted (F12) would land on the wrong (display) row and the
+      // target may be hidden anyway, so drop the whole row view first.
+      if (meta.filtered || meta.viewSorted) {
         try {
-          const updated = await api.clearFilter(meta.id);
+          const updated = await api.resetRowView(meta.id);
           reloadDoc(updated);
         } catch (e) {
           set({ error: String(e) });
@@ -2456,6 +2984,10 @@ export const useStore = create<Store>((set, get) => {
           if (finished.kind === "openIndexed") {
             set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] }));
             if (indexing.path) pushRecent(indexing.path);
+            // F12: restore the matching profile's last-selected view (works
+            // on indexed documents — layout, filter and view sort are all
+            // non-destructive).
+            void restoreLastViewFor(meta).catch(() => undefined);
           } else {
             // Conversion / re-index changed the document in place.
             reloadDoc(meta);

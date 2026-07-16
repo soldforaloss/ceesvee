@@ -789,7 +789,7 @@ mod tests {
     #[test]
     fn filtered_transforms_do_not_modify_hidden_rows() {
         let mut d = doc_from("v\n a \n b \n c ");
-        d.set_filter(vec![0, 2]); // rows " a " and " c " visible
+        d.set_filter(vec![0, 2]).unwrap(); // rows " a " and " c " visible
         let computed = run(&d, TransformSpec::Trim, ExportScope::VisibleRows);
         assert_eq!(computed.preview.affected_cells, 2);
         commit(&mut d, computed.changes).unwrap();
@@ -828,7 +828,7 @@ mod tests {
     #[test]
     fn split_keeps_document_rectangular_and_respects_row_scope() {
         let mut d = doc_from("name,age\nAda Lovelace,36\nBob,40\nCher X Y,50");
-        d.set_filter(vec![0, 2]); // Bob's row is hidden
+        d.set_filter(vec![0, 2]).unwrap(); // Bob's row is hidden
         let computed = run(
             &d,
             TransformSpec::SplitByDelimiter {

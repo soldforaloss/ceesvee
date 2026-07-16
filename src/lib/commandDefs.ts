@@ -222,9 +222,11 @@ function staticCommands(): AppCommand[] {
     {
       id: "data.sort",
       title: "Sort…",
-      keywords: ["order", "ascending", "descending"],
+      keywords: ["order", "ascending", "descending", "view sort", "non-destructive"],
       category: "Data",
-      unavailableReason: needsEditable,
+      // The dialog offers a non-destructive VIEW sort (F12), which works on
+      // read-only documents too; only the destructive apply needs editable.
+      unavailableReason: needsDoc,
       run: () => openModal("sort"),
     },
     {
@@ -472,6 +474,87 @@ function staticCommands(): AppCommand[] {
       allowInEditable: true,
       run: () => state().setTheme(state().theme === "dark" ? "light" : "dark"),
     },
+    {
+      id: "view.manageViews",
+      title: "Named views…",
+      keywords: ["view", "layout", "save view", "column layout", "perspective"],
+      category: "View",
+      unavailableReason: needsDoc,
+      run: () => openModal("views"),
+    },
+    {
+      id: "view.saveViewAs",
+      title: "Save current view as…",
+      keywords: ["named view", "layout", "snapshot"],
+      category: "View",
+      unavailableReason: needsDoc,
+      argPlaceholder: "View name",
+      run: () => state().openPaletteForArg("view.saveViewAs"),
+      runWith: (arg: string) => {
+        if (!arg.trim()) return "Enter a name for the view";
+        void state().saveCurrentViewAs(arg);
+        return null;
+      },
+    },
+    {
+      id: "view.reset",
+      title: "Reset view",
+      keywords: ["clear layout", "unhide", "unsort", "default view"],
+      category: "View",
+      unavailableReason: needsDoc,
+      run: () => void state().resetView(),
+    },
+    {
+      id: "view.autoFitAll",
+      title: "Auto-fit all column widths",
+      keywords: ["resize", "fit", "widths"],
+      category: "View",
+      unavailableReason: needsDoc,
+      run: () => state().requestAutoFit("all"),
+    },
+    {
+      id: "view.autoFitSelected",
+      title: "Auto-fit selected columns",
+      keywords: ["resize", "fit", "widths"],
+      category: "View",
+      unavailableReason: () => {
+        const gate = needsDoc();
+        if (gate) return gate;
+        return state().selectedCols.length === 0 ? "No columns are selected" : null;
+      },
+      run: () => state().requestAutoFit(state().selectedCols),
+    },
+    {
+      id: "view.toggleWrap",
+      title: "Toggle wrap text",
+      keywords: ["wrap", "multiline", "row height"],
+      category: "View",
+      unavailableReason: needsDoc,
+      run: () => state().setWrapText(!state().wrapText),
+    },
+    {
+      id: "view.hideSelectedColumns",
+      title: "Hide selected columns",
+      keywords: ["hide", "column", "layout"],
+      category: "View",
+      unavailableReason: () => {
+        const gate = needsDoc();
+        if (gate) return gate;
+        return state().selectedCols.length === 0 ? "No columns are selected" : null;
+      },
+      run: () => {
+        const s = state();
+        for (const col of s.selectedCols) s.setColumnHidden(col, true);
+      },
+    },
+    {
+      id: "view.unhideAll",
+      title: "Unhide all columns",
+      keywords: ["show", "hidden", "columns"],
+      category: "View",
+      unavailableReason: needsDoc,
+      run: () => state().unhideAllColumns(),
+    },
 
     // ----- Navigate ---------------------------------------------------------
     {
@@ -544,7 +627,7 @@ function cycleTab(delta: number): void {
   s.setActive(next.id);
 }
 
-/** Dynamic entries: open tabs and recent files, regenerated per palette open. */
+/** Dynamic entries: open tabs, recent files and named views (F12). */
 function dynamicCommands(): AppCommand[] {
   const s = state();
   const tabs: AppCommand[] = s.tabs
@@ -556,6 +639,16 @@ function dynamicCommands(): AppCommand[] {
       category: "Tabs" as const,
       run: () => s.setActive(t.id),
     }));
+  const views: AppCommand[] =
+    s.activeId != null
+      ? s.viewsForActive().views.map((view) => ({
+          id: `dynamic.view.${view.id}`,
+          title: `Apply view: ${view.name}`,
+          keywords: ["named view", "layout", view.name],
+          category: "View" as const,
+          run: () => void s.applyNamedView(view),
+        }))
+      : [];
   const recents: AppCommand[] = s.recent.slice(0, 10).map((path, i) => ({
     id: `dynamic.recent.${i}`,
     title: `Open recent: ${path.split(/[\\/]/).pop() ?? path}`,
@@ -563,7 +656,7 @@ function dynamicCommands(): AppCommand[] {
     category: "File" as const,
     run: () => void s.openPath(path),
   }));
-  return [...tabs, ...recents];
+  return [...tabs, ...views, ...recents];
 }
 
 let registered = false;

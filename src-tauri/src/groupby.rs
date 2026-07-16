@@ -682,7 +682,7 @@ mod tests {
     #[test]
     fn visible_scope_excludes_hidden_rows() {
         let mut d = fixture();
-        d.set_filter(vec![0, 1]); // only the first two sales rows visible
+        d.set_filter(vec![0, 1]).unwrap(); // only the first two sales rows visible
         let s = GroupBySpec {
             scope: ExportScope::VisibleRows,
             ..spec(vec![0], vec![agg(Aggregate::Sum, Some(1))])

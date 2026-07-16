@@ -25,6 +25,8 @@ import { ExternalChangeDialog } from "./components/ExternalChangeDialog";
 import { FilterDialog } from "./components/FilterDialog";
 import { FindBar } from "./components/FindBar";
 import { FollowBar } from "./components/FollowBar";
+import { ViewsDialog } from "./components/ViewsDialog";
+import { ViewWarningBar } from "./components/ViewWarningBar";
 import { Grid } from "./components/Grid";
 import { GroupByDialog } from "./components/GroupByDialog";
 import { Close } from "./components/Icons";
@@ -257,6 +259,7 @@ export default function App() {
       <Tabs />
       <SourceBar />
       <FollowBar />
+      <ViewWarningBar />
       <ProfileSuggestionBar />
       <FindBar />
 
@@ -309,6 +312,7 @@ export default function App() {
       {activeModal === "pii" && <PiiDialog onClose={() => setModal(null)} />}
       {activeModal === "recovery" && <RecoveryDialog onClose={() => setModal(null)} />}
       {activeModal === "dialect" && <DialectDialog onClose={() => setModal(null)} />}
+      {activeModal === "views" && <ViewsDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       <CommandPalette />
       <CellEditorDialog />

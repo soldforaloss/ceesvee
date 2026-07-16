@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn visible_rows_scope_respects_the_filter() {
         let mut d = doc_from("n\n1\n2\n3\n4", true);
-        d.set_filter(vec![1, 3]);
+        d.set_filter(vec![1, 3]).unwrap();
         let resolved = resolve_scope(&d, &ExportScope::VisibleRows).unwrap();
         assert_eq!(resolved.rows, vec![1, 3]);
         assert_eq!(resolved.cols, vec![0]);
@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn selected_rows_are_display_indices() {
         let mut d = doc_from("n\n10\n20\n30\n40", true);
-        d.set_filter(vec![2, 3]); // visible: rows "30", "40"
+        d.set_filter(vec![2, 3]).unwrap(); // visible: rows "30", "40"
         let resolved = resolve_scope(&d, &ExportScope::SelectedRows { rows: vec![0, 1] }).unwrap();
         assert_eq!(resolved.rows, vec![2, 3], "display -> absolute mapping");
         assert!(resolve_scope(&d, &ExportScope::SelectedRows { rows: vec![9] }).is_err());
@@ -640,7 +640,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("subset.csv");
         let mut d = doc_from("n,v\n0,a\n1,b\n2,c\n3,d\n4,e", true);
-        d.set_filter(vec![0, 2, 4]); // 3 visible rows
+        d.set_filter(vec![0, 2, 4]).unwrap(); // 3 visible rows
 
         let (_r, ctx) = ctx();
         let manifest = run_export(

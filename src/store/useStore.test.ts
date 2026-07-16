@@ -35,6 +35,8 @@ function meta(id: number, backing: DocumentMeta["backing"] = "editable"): Docume
     filtered: false,
     colCount: 3,
     headers: ["a", "b", "c"],
+    columnIds: ["c0", "c1", "c2"],
+    viewSorted: false,
     hasHeaderRow: true,
     delimiter: ",",
     encoding: "UTF-8",
@@ -62,6 +64,12 @@ describe("per-document UI state (F08)", () => {
       selectedRows: [],
       selectedCols: [],
       scrollPosition: { row: 0, column: 0 },
+      columnLayout: null,
+      wrapText: false,
+      activeViewId: null,
+      viewSortKeys: [],
+      viewWarning: null,
+      error: null,
     });
   });
 
@@ -160,6 +168,54 @@ describe("per-document UI state (F08)", () => {
     expect(now.activeId).toBe(1);
     expect(now.find.query).toBe("alpha");
     expect(now.uiStates[2]).toBeUndefined();
+  });
+
+  it("keeps the F12 column layout, wrap and view state per tab", async () => {
+    const s = useStore.getState();
+    // Hide column b, pin c, wrap text on document 1.
+    s.setColumnHidden(1, true);
+    s.pinColumn(2, true);
+    s.setWrapText(true);
+    useStore.setState({ activeViewId: "view-x", viewWarning: "missing" });
+
+    useStore.getState().setActive(2);
+    let now = useStore.getState();
+    expect(now.columnLayout).toBeNull();
+    expect(now.wrapText).toBe(false);
+    expect(now.activeViewId).toBeNull();
+    expect(now.viewWarning).toBeNull();
+
+    useStore.getState().setActive(1);
+    now = useStore.getState();
+    expect(now.columnLayout?.hiddenColumnIds).toEqual(["c1"]);
+    expect(now.columnLayout?.pinnedColumnIds).toEqual(["c2"]);
+    expect(now.wrapText).toBe(true);
+    expect(now.activeViewId).toBe("view-x");
+    expect(now.viewWarning).toBe("missing");
+
+    // Closing drops every trace, layout included.
+    useStore.getState().setActive(2);
+    await useStore.getState().closeTab(1);
+    expect(useStore.getState().uiStates[1]).toBeUndefined();
+  });
+
+  it("refuses to hide the last visible column", () => {
+    const s = useStore.getState();
+    s.setColumnHidden(0, true);
+    s.setColumnHidden(1, true);
+    s.setColumnHidden(2, true);
+    const now = useStore.getState();
+    expect(now.columnLayout?.hiddenColumnIds).toEqual(["c0", "c1"]);
+    expect(now.error).toContain("At least one column");
+  });
+
+  it("reorders display columns into an ID-based order", () => {
+    const s = useStore.getState();
+    // Natural display = [a, b, c]; move display 0 to display 2.
+    s.reorderColumns(0, 2);
+    const now = useStore.getState();
+    expect(now.columnLayout?.columnOrder).toEqual(["c1", "c2", "c0"]);
+    expect(now.columnLayout?.pinnedColumnIds).toEqual([]);
   });
 });
 

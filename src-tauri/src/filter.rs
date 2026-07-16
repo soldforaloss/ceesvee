@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn filtered_reads_map_display_to_absolute() {
         let mut d = doc("name,qty\na,1\nb,2\nc,3\nd,4");
-        d.set_filter(vec![1, 3]); // keep absolute data rows b,2 and d,4
+        d.set_filter(vec![1, 3]).unwrap(); // keep absolute data rows b,2 and d,4
         assert_eq!(d.visible_len(), 2);
         assert_eq!(d.display_to_abs(0), Some(1));
         assert_eq!(d.display_to_abs(1), Some(3));
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn filtered_selection_stats_use_visible_rows() {
         let mut d = doc("name,qty\na,1\nb,2\nc,3\nd,4");
-        d.set_filter(vec![1, 3]);
+        d.set_filter(vec![1, 3]).unwrap();
         let rect = crate::dto::CellRect {
             x: 1,
             y: 0,
@@ -275,7 +275,7 @@ mod tests {
         // the COMPLETE value (embedded newline included) must come back for
         // the row the filter actually shows.
         let mut d = doc("name,note\na,\"line1\nline2\"\nb,short");
-        d.set_filter(vec![0]);
+        d.set_filter(vec![0]).unwrap();
         let abs = d.display_to_abs(0).unwrap();
         let rows = d.fetch_rows(&[abs]).unwrap();
         assert_eq!(rows[0][1], "line1\nline2");
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn find_under_filter_is_display_coords_and_panic_free() {
         let mut d = doc("name,qty\nx,1\ny,2\nx,3");
-        d.set_filter(vec![2]); // only the third data row (x,3) visible -> display row 0
+        d.set_filter(vec![2]).unwrap(); // only the third data row (x,3) visible -> display row 0
         let opts = crate::dto::FindOptions {
             query: "x".into(),
             ..Default::default()

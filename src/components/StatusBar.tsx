@@ -11,6 +11,18 @@ export function StatusBar() {
   const fileJobs = useStore((s) => s.fileJobs);
   const tabs = useStore((s) => s.tabs);
   const cancelFileJob = useStore((s) => s.cancelFileJob);
+  // F12: named-view indicator (name, or "custom view" for ad-hoc layouts).
+  const activeViewId = useStore((s) => s.activeViewId);
+  const columnLayout = useStore((s) => s.columnLayout);
+  const viewsForActive = useStore((s) => s.viewsForActive);
+  const setModal = useStore((s) => s.setModal);
+  const applyViewSort = useStore((s) => s.applyViewSort);
+  // Subscribe so a rename in the views dialog refreshes the chip's label.
+  useStore((s) => s.settings);
+  const activeViewName = activeViewId
+    ? (viewsForActive().views.find((v) => v.id === activeViewId)?.name ?? null)
+    : null;
+  const viewChip = activeViewName ?? (columnLayout ? "custom view" : null);
 
   const fileJob = Object.values(fileJobs)[0] ?? null;
   const fileJobDoc = fileJob ? tabs.find((t) => t.id === fileJob.docId) : null;
@@ -43,6 +55,24 @@ export function StatusBar() {
               className="rounded px-1.5 text-violet-600 hover:bg-violet-100 dark:text-violet-400 dark:hover:bg-violet-500/15"
             >
               filtered ✕
+            </button>
+          )}
+          {meta.viewSorted && (
+            <button
+              onClick={() => void applyViewSort([])}
+              title="Clear the non-destructive view sort (source order is untouched)"
+              className="rounded px-1.5 text-violet-600 hover:bg-violet-100 dark:text-violet-400 dark:hover:bg-violet-500/15"
+            >
+              view-sorted ✕
+            </button>
+          )}
+          {viewChip && (
+            <button
+              onClick={() => setModal("views")}
+              title="Named views — manage, save, or reset"
+              className="rounded px-1.5 text-violet-600 hover:bg-violet-100 dark:text-violet-400 dark:hover:bg-violet-500/15"
+            >
+              ◫ {viewChip}
             </button>
           )}
           <Sep />

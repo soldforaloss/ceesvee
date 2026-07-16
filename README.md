@@ -71,6 +71,9 @@ and faithful on large, real-world delimited files.**
 - **Command palette** (`Ctrl/Cmd+K`) — fuzzy-search and run every action from
   the keyboard: commands, go to row/cell, recent files, tab switching. Every
   shortcut is customizable via the built-in shortcut editor.
+- **Named views** — save non-destructive combinations of filter, view-only
+  sort, hidden/pinned/reordered columns, widths, and wrap per file; views
+  survive renames via stable column IDs and restore when you reopen the file.
 - **Fuzzy value clustering** — group spelling/punctuation/case variants
   (fingerprint, n-gram, Levenshtein, Jaro-Winkler) and normalize them in one
   reviewed, undoable step.

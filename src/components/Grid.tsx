@@ -16,12 +16,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { indicesToRanges } from "../lib/gridSelection";
 import { darkGridTheme, dirtyCellOverride, lightGridTheme } from "../lib/gridTheme";
 import * as api from "../lib/tauri";
+import { physicalToDisplay, projectColumns } from "../lib/viewProjection";
 import { useStore } from "../store/useStore";
 import type { ColumnKind, DocumentMeta } from "../types";
 import { ColumnMenu, type ColumnMenuState } from "./ColumnMenu";
 
 const PAGE = 200;
 const DEFAULT_COL_WIDTH = 160;
+/** Grid row heights: default, and taller when wrap text (F12) is on. */
+const ROW_HEIGHT = 34;
+const WRAP_ROW_HEIGHT = 68;
+/** Auto-fit (F12) measures the cached sample and clamps to these bounds. */
+const AUTOFIT_MIN = 56;
+const AUTOFIT_MAX = 640;
+const AUTOFIT_PADDING = 26;
 
 // Header type-badge sprites (Feather-style), rendered by glide-data-grid next
 // to a column's title once its type has been detected. Text columns get none.
@@ -94,6 +102,10 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   const setScrollPosition = useStore((s) => s.setScrollPosition);
   const summaries = useStore((s) => (s.summariesDocId === docId ? s.summaries : null));
   const jumpTarget = useStore((s) => s.jumpTarget);
+  // F12: column layout (hidden/pinned/order by stable ID), wrap, auto-fit.
+  const columnLayout = useStore((s) => s.columnLayout);
+  const wrapText = useStore((s) => s.wrapText);
+  const autoFitRequest = useStore((s) => s.autoFitRequest);
 
   // Detected type per column (defaults to text until summaries load).
   const columnKinds = useMemo<ColumnKind[]>(() => {
@@ -104,18 +116,28 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     return kinds;
   }, [summaries, colCount]);
 
-  // ----- columns ----------------------------------------------------------
+  // ----- columns (through the F12 view projection) -------------------------
+
+  // DISPLAY position -> PHYSICAL column index. Everything the grid renders or
+  // reports is translated at this boundary; the store and backend always see
+  // physical columns (rows stay in display space — the backend maps those).
+  const projection = useMemo(
+    () => projectColumns(meta.columnIds, columnLayout),
+    [meta.columnIds, columnLayout],
+  );
+  const projectionRef = useRef(projection);
+  projectionRef.current = projection;
 
   const columns = useMemo<GridColumn[]>(
     () =>
-      meta.headers.map((title, i) => ({
-        title: title || `Column ${i + 1}`,
-        id: String(i),
-        width: colWidths[i] ?? DEFAULT_COL_WIDTH,
+      projection.physical.map((phys) => ({
+        title: meta.headers[phys] || `Column ${phys + 1}`,
+        id: meta.columnIds[phys] ?? String(phys),
+        width: colWidths[phys] ?? DEFAULT_COL_WIDTH,
         hasMenu: true,
-        icon: iconForKind(columnKinds[i] ?? "text"),
+        icon: iconForKind(columnKinds[phys] ?? "text"),
       })),
-    [meta.headers, colWidths, columnKinds],
+    [meta.headers, meta.columnIds, colWidths, columnKinds, projection],
   );
 
   // ----- windowed data fetching ------------------------------------------
@@ -135,7 +157,8 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         dirtyCache.current.set(resp.start + i, resp.dirty[i]);
       }
       const updates: { cell: Item }[] = [];
-      const cols = colCountRef.current;
+      // Repaints happen in DISPLAY coordinates (the projection's width).
+      const cols = projectionRef.current.physical.length;
       for (let i = 0; i < resp.rows.length; i++) {
         const r = resp.start + i;
         for (let c = 0; c < cols; c++) updates.push({ cell: [c, r] });
@@ -209,8 +232,13 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
 
     let rows = CompactSelection.empty();
     for (const [start, end] of indicesToRanges(s.selectedRows)) rows = rows.add([start, end]);
+    // Stored column selections are PHYSICAL; the grid needs display indices.
+    const displayCols = s.selectedCols
+      .map((c) => physicalToDisplay(projectionRef.current, c))
+      .filter((c): c is number => c !== null)
+      .sort((a, b) => a - b);
     let cols = CompactSelection.empty();
-    for (const [start, end] of indicesToRanges(s.selectedCols)) cols = cols.add([start, end]);
+    for (const [start, end] of indicesToRanges(displayCols)) cols = cols.add([start, end]);
     setSelectionState({
       columns: cols,
       rows,
@@ -235,16 +263,18 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
 
   // Copy/fill must read the FULL selected range from the backend, not the
   // windowed cache (off-screen rows aren't cached and would copy as blanks).
+  // Columns pass through the projection, so copies respect the view order.
   const getCellsForSelection = useCallback((sel: Rectangle) => {
     const id = docIdRef.current;
     return async (): Promise<readonly (readonly GridCell[])[]> => {
       const resp = await api.getRows(id, sel.y, sel.height);
+      const physical = projectionRef.current.physical;
       const out: GridCell[][] = [];
       for (let r = 0; r < sel.height; r++) {
         const rowData = resp.rows[r];
         const cells: GridCell[] = [];
         for (let c = sel.x; c < sel.x + sel.width; c++) {
-          const value = rowData?.[c] ?? "";
+          const value = rowData?.[physical[c] ?? c] ?? "";
           cells.push({
             kind: GridCellKind.Text,
             data: value,
@@ -270,21 +300,23 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
       if (!rowData) {
         return { kind: GridCellKind.Loading, allowOverlay: false };
       }
-      const value = rowData[col] ?? "";
-      const isDirty = dirtyCache.current.get(row)?.[col] ?? false;
+      const phys = projection.physical[col] ?? col;
+      const value = rowData[phys] ?? "";
+      const isDirty = dirtyCache.current.get(row)?.[phys] ?? false;
       return {
         kind: GridCellKind.Text,
         data: value,
         displayData: value,
         allowOverlay: !readOnly,
-        contentAlign: columnKinds[col] === "number" ? "right" : undefined,
+        allowWrapping: wrapText,
+        contentAlign: columnKinds[phys] === "number" ? "right" : undefined,
         themeOverride: isDirty ? dirtyCellOverride : undefined,
       };
     },
-    // Cell data is read from refs; recreated only when column types change so
-    // numeric columns re-render right-aligned. Structural refreshes still go
-    // through `updateCells`.
-    [columnKinds, readOnly],
+    // Cell data is read from refs; recreated when column types, wrap or the
+    // projection change so cells re-render correctly. Structural refreshes
+    // still go through `updateCells`.
+    [columnKinds, readOnly, wrapText, projection],
   );
 
   const onCellEdited = useCallback(
@@ -292,12 +324,16 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
       if (readOnly) return;
       if (newValue.kind !== GridCellKind.Text) return;
       const value = newValue.data;
+      // The backend expects the PHYSICAL column (rows are display-space and
+      // translate through the backend's row view) — so an edit made in a
+      // sorted/filtered, reordered view lands on the correct source cell.
+      const phys = projectionRef.current.physical[col] ?? col;
       const rowData = rowCache.current.get(row);
-      if (rowData) rowData[col] = value;
+      if (rowData) rowData[phys] = value;
       const dirtyRow = dirtyCache.current.get(row);
-      if (dirtyRow) dirtyRow[col] = true;
+      if (dirtyRow) dirtyRow[phys] = true;
       gridRef.current?.updateCells([{ cell: [col, row] }]);
-      void useStore.getState().setCell(row, col, value);
+      void useStore.getState().setCell(row, phys, value);
     },
     [readOnly],
   );
@@ -306,8 +342,9 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     (target: Item, values: readonly (readonly string[])[]) => {
       if (readOnly) return false;
       const [col, row] = target;
+      const phys = projectionRef.current.physical[col] ?? col;
       const block = values.map((line) => Array.from(line));
-      void useStore.getState().pasteBlock(row, col, block);
+      void useStore.getState().pasteBlock(row, phys, block);
       return false; // applied via the backend, which triggers a reload
     },
     [readOnly],
@@ -315,10 +352,17 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
 
   const onColumnResize = useCallback(
     (_col: GridColumn, newSize: number, colIndex: number) => {
-      setColumnWidth(colIndex, newSize);
+      // Widths are stored by PHYSICAL column so they survive reorders.
+      setColumnWidth(projectionRef.current.physical[colIndex] ?? colIndex, newSize);
     },
     [setColumnWidth],
   );
+
+  // F12: drag-reorder updates the layout (display-space move; the store
+  // translates it into the ID-based column order).
+  const onColumnMoved = useCallback((from: number, to: number) => {
+    useStore.getState().reorderColumns(from, to);
+  }, []);
 
   const onGridSelectionChange = useCallback((next: GridSelection) => {
     setSelectionState(next);
@@ -331,8 +375,12 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
       for (let r = range.y; r < range.y + range.height; r++) rowsSel.add(r);
       for (let c = range.x; c < range.x + range.width; c++) colsSel.add(c);
     }
+    const physical = projectionRef.current.physical;
     const rows = [...rowsSel].sort((a, b) => a - b);
-    const cols = [...colsSel].sort((a, b) => a - b);
+    // The store (and every consumer: transforms, exports, Copy As) sees
+    // PHYSICAL columns; the rect stays display-space for grid restore and is
+    // translated per consumer.
+    const cols = [...colsSel].map((c) => physical[c] ?? c).sort((a, b) => a - b);
 
     // Stats are computed in Rust over the full range (see the store).
     useStore.getState().setSelection(range ? rectOf(range) : null, rows, cols);
@@ -341,7 +389,9 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   // ----- header menu (column operations) ---------------------------------
 
   const onHeaderMenuClick = useCallback((col: number, bounds: Rectangle) => {
-    setMenu({ col, x: bounds.x, y: bounds.y + bounds.height });
+    // The menu operates on the PHYSICAL column.
+    const phys = projectionRef.current.physical[col] ?? col;
+    setMenu({ col: phys, x: bounds.x, y: bounds.y + bounds.height });
   }, []);
 
   const onCellContextMenu = useCallback((cell: Item, event: CellClickedEventArgs) => {
@@ -350,7 +400,7 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     event.preventDefault();
     setCellMenu({
       row,
-      col,
+      col: projectionRef.current.physical[col] ?? col,
       x: event.bounds.x + event.localEventX,
       y: event.bounds.y + event.localEventY,
     });
@@ -362,7 +412,10 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     if (findMatches.length === 0) return;
     const match = findMatches[findIndex];
     if (!match) return;
-    gridRef.current?.scrollTo(match.col, match.row, "both", 0, 0, {
+    // Matches carry PHYSICAL columns; scroll in display space. A match in a
+    // hidden column still scrolls its row into view (column 0).
+    const display = physicalToDisplay(projectionRef.current, match.col) ?? 0;
+    gridRef.current?.scrollTo(display, match.row, "both", 0, 0, {
       vAlign: "center",
       hAlign: "center",
     });
@@ -370,8 +423,8 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
       columns: CompactSelection.empty(),
       rows: CompactSelection.empty(),
       current: {
-        cell: [match.col, match.row],
-        range: { x: match.col, y: match.row, width: 1, height: 1 },
+        cell: [display, match.row],
+        range: { x: display, y: match.row, width: 1, height: 1 },
         rangeStack: [],
       },
     });
@@ -382,7 +435,9 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   useEffect(() => {
     if (!jumpTarget) return;
     const row = Math.min(jumpTarget.row, Math.max(0, meta.rowCount - 1));
-    const col = Math.min(jumpTarget.col, Math.max(0, colCount - 1));
+    const physCol = Math.min(jumpTarget.col, Math.max(0, colCount - 1));
+    // Jump targets carry PHYSICAL columns; translate for the display.
+    const col = physicalToDisplay(projectionRef.current, physCol) ?? 0;
     gridRef.current?.scrollTo(col, row, "both", 0, 0, {
       vAlign: "center",
       hAlign: "center",
@@ -400,6 +455,55 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jumpTarget?.nonce]);
 
+  // ----- auto-fit column widths (F12) -------------------------------------
+
+  useEffect(() => {
+    if (!autoFitRequest) return;
+    const state = useStore.getState();
+    const targets =
+      autoFitRequest.cols === "all" ? projectionRef.current.physical : autoFitRequest.cols;
+    if (targets.length === 0) {
+      state.clearAutoFitRequest();
+      return;
+    }
+    // Measure the header plus the CACHED sample (the rows around the visible
+    // window) — never the whole document. Consistent with the grid font.
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      state.clearAutoFitRequest();
+      return;
+    }
+    ctx.font = "13px Inter, ui-sans-serif, system-ui, sans-serif";
+    const widths: Record<number, number> = {};
+    for (const phys of targets) {
+      let max = ctx.measureText(meta.headers[phys] ?? "").width + 28; // menu chevron
+      let sampled = 0;
+      for (const rowData of rowCache.current.values()) {
+        const cell = rowData[phys];
+        if (cell) {
+          // Wrapped cells shouldn't force full single-line width.
+          const line = wrapText ? cell.slice(0, 80) : cell;
+          const w = ctx.measureText(line).width;
+          if (w > max) max = w;
+        }
+        if (++sampled >= 500) break;
+      }
+      widths[phys] = Math.min(AUTOFIT_MAX, Math.max(AUTOFIT_MIN, Math.ceil(max) + AUTOFIT_PADDING));
+    }
+    state.setColumnWidthsBulk(widths);
+    state.clearAutoFitRequest();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoFitRequest?.nonce]);
+
+  // Effective leading freeze: pinned view columns when any, else the manual
+  // "freeze up to here" count (both clamped below the display width).
+  const displayCount = projection.physical.length;
+  const effectiveFreeze = Math.min(
+    projection.frozen > 0 ? projection.frozen : frozenCols,
+    Math.max(0, displayCount - 1),
+  );
+
   return (
     <div className="gdg-wrapper">
       <DataEditor
@@ -408,11 +512,13 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         columns={columns}
         headerIcons={HEADER_ICONS}
         rows={meta.rowCount}
-        freezeColumns={Math.min(frozenCols, Math.max(0, colCount - 1))}
+        rowHeight={wrapText ? WRAP_ROW_HEIGHT : ROW_HEIGHT}
+        freezeColumns={effectiveFreeze}
         getCellContent={getCellContent}
         onCellEdited={onCellEdited}
         onPaste={onPaste}
         onColumnResize={onColumnResize}
+        onColumnMoved={onColumnMoved}
         onVisibleRegionChanged={onVisibleRegionChanged}
         onHeaderMenuClick={onHeaderMenuClick}
         onCellContextMenu={onCellContextMenu}
@@ -434,6 +540,7 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         <ColumnMenu
           state={menu}
           headers={meta.headers}
+          columnIds={meta.columnIds}
           readOnly={readOnly}
           onClose={() => setMenu(null)}
         />

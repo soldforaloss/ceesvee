@@ -60,6 +60,50 @@ pub struct RangeRule {
     pub max: Option<f64>,
 }
 
+/// One key of a named view's non-destructive sort (F12), by stable column ID
+/// so it survives renames AND reorders.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewSortKey {
+    pub column_id: String,
+    #[serde(default)]
+    pub descending: bool,
+}
+
+/// A named, reusable, NON-DESTRUCTIVE way of looking at a matching document
+/// (F12): row filter + view sort + column layout. Columns are referenced by
+/// stable logical IDs (`DocumentMeta::column_ids`); the filter keeps its
+/// column indices but carries the ID snapshot they were saved against, so the
+/// front end can remap (or warn recoverably) when the structure changed.
+/// Applying a view never mutates data and never marks a document dirty.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NamedView {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub filter: Option<crate::dto::FilterGroup>,
+    /// Column IDs at save time, positionally aligned with the document the
+    /// filter's indices refer to (used to remap after structural edits).
+    #[serde(default)]
+    pub filter_column_ids: Vec<String>,
+    #[serde(default)]
+    pub sort_keys: Vec<ViewSortKey>,
+    #[serde(default)]
+    pub hidden_column_ids: Vec<String>,
+    /// Arbitrary pinned columns (not just a leading count), in pin order.
+    #[serde(default)]
+    pub pinned_column_ids: Vec<String>,
+    /// Display order for unpinned columns; IDs not listed keep file order.
+    #[serde(default)]
+    pub column_order: Vec<String>,
+    /// Column widths in px, keyed by column ID.
+    #[serde(default)]
+    pub column_widths: std::collections::HashMap<String, f64>,
+    #[serde(default)]
+    pub wrap_text: bool,
+}
+
 /// A reusable description of a recurring file format.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +151,13 @@ pub struct FileProfile {
     /// F27: cross-column validation rules (closed DTO set, columns by name).
     #[serde(default)]
     pub cross_rules: Vec<crate::crossval::CrossRule>,
+
+    /// F12: named views saved for matching files.
+    #[serde(default)]
+    pub named_views: Vec<NamedView>,
+    /// F12: the view last applied to a matching file, restored on reopen.
+    #[serde(default)]
+    pub last_view_id: Option<String>,
 }
 
 /// The persisted settings document.
@@ -445,7 +496,52 @@ mod tests {
             }],
             semantic_types: Vec::new(),
             cross_rules: Vec::new(),
+            named_views: Vec::new(),
+            last_view_id: None,
         }
+    }
+
+    #[test]
+    fn named_views_round_trip_and_default_empty() {
+        use crate::dto::{Conjunction, FilterCondition, FilterGroup, FilterNode, FilterOp};
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = AppSettings::default();
+        let mut p = profile();
+        assert!(p.named_views.is_empty());
+        assert!(p.last_view_id.is_none());
+
+        p.named_views = vec![NamedView {
+            id: "v1".into(),
+            name: "QA slice".into(),
+            filter: Some(FilterGroup {
+                conjunction: Conjunction::And,
+                nodes: vec![FilterNode::Condition(FilterCondition {
+                    column: 1,
+                    op: FilterOp::NotEmpty,
+                    value: String::new(),
+                    case_sensitive: false,
+                })],
+            }),
+            filter_column_ids: vec!["c0".into(), "c1".into()],
+            sort_keys: vec![ViewSortKey {
+                column_id: "c1".into(),
+                descending: true,
+            }],
+            hidden_column_ids: vec!["c0".into()],
+            pinned_column_ids: vec!["c2".into()],
+            column_order: vec!["c2".into(), "c1".into()],
+            column_widths: std::collections::HashMap::from([("c1".to_string(), 240.0)]),
+            wrap_text: true,
+        }];
+        p.last_view_id = Some("v1".into());
+        settings.profiles.push(p);
+        save_settings(dir.path(), &settings).unwrap();
+        let loaded = load_settings(dir.path());
+        assert_eq!(
+            loaded.profiles[0].named_views,
+            settings.profiles[0].named_views
+        );
+        assert_eq!(loaded.profiles[0].last_view_id, Some("v1".to_string()));
     }
 
     #[test]
