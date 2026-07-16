@@ -437,6 +437,8 @@ interface Store {
   resetColumnWidths: () => void;
   setScrollPosition: (row: number, column: number) => void;
   loadSummaries: () => void;
+  /** Invalidate the grid's row cache (e.g. after an out-of-grid cell save). */
+  invalidateGrid: () => void;
 
   // documents
   openDialog: () => Promise<void>;
@@ -1019,6 +1021,8 @@ export const useStore = create<Store>((set, get) => {
       set((s) => ({ columnWidths: { ...s.columnWidths, [col]: width } })),
 
     resetColumnWidths: () => set({ columnWidths: {} }),
+
+    invalidateGrid: () => set((s) => ({ dataVersion: s.dataVersion + 1 })),
 
     setScrollPosition: (row, column) => {
       // Trailing debounce: visible-region events fire on every scroll frame.
