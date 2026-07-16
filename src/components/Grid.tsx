@@ -375,6 +375,9 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         rangeStack: [],
       },
     });
+    // Mirror into the store so selection-driven commands (F13 cell editor)
+    // target the cell that is actually highlighted.
+    useStore.getState().setSelection({ x: match.col, y: match.row, width: 1, height: 1 }, [], []);
   }, [findMatches, findIndex]);
 
   // ----- jump requests (e.g. a diagnostics sample) ------------------------
@@ -396,6 +399,9 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         rangeStack: [],
       },
     });
+    // Mirror into the store so selection-driven commands (F13 cell editor)
+    // target the cell that is actually highlighted.
+    useStore.getState().setSelection({ x: col, y: row, width: 1, height: 1 }, [], []);
     // Depend on the nonce so repeated jumps to the same cell still scroll.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jumpTarget?.nonce]);

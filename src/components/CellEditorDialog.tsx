@@ -85,6 +85,9 @@ export function CellEditorDialog() {
     try {
       // One undo step: the ordinary set_cell path.
       await setCell(target.row, target.col, value);
+      // The windowed grid cache still holds the old value (set_cell only
+      // refreshes metadata); invalidate it so the saved cell repaints.
+      useStore.getState().invalidateGrid();
       close();
     } catch (e) {
       setError(String(e));

@@ -488,6 +488,8 @@ interface Store {
   resetColumnWidths: () => void;
   setScrollPosition: (row: number, column: number) => void;
   loadSummaries: () => void;
+  /** Invalidate the grid's row cache (e.g. after an out-of-grid cell save). */
+  invalidateGrid: () => void;
 
   // documents
   openDialog: () => Promise<void>;
@@ -1098,6 +1100,8 @@ export const useStore = create<Store>((set, get) => {
 
     resetColumnWidths: () => set({ columnWidths: {} }),
 
+    invalidateGrid: () => set((s) => ({ dataVersion: s.dataVersion + 1 })),
+
     setScrollPosition: (row, column) => {
       // Trailing debounce: visible-region events fire on every scroll frame.
       pendingScroll = { row, column };
@@ -1664,6 +1668,25 @@ export const useStore = create<Store>((set, get) => {
     // ----- background-job events -------------------------------------------
 
     handleJobProgress: (progress) => {
+      // Archive extraction (F17) runs before any document exists, so its
+      // job carries no docId — route it by job id BEFORE the docId gate.
+      if (
+        progress.kind === "openIndexed" ||
+        progress.kind === "convertEditable" ||
+        progress.kind === "reindex" ||
+        progress.kind === "archiveExtract"
+      ) {
+        if (get().indexing?.jobId !== progress.jobId) return;
+        set((s) => ({
+          indexing: s.indexing && {
+            ...s.indexing,
+            processed: progress.processed,
+            total: progress.total ?? s.indexing.total,
+          },
+        }));
+        return;
+      }
+
       if (progress.docId == null) return;
       const docId = progress.docId;
 
@@ -1717,23 +1740,9 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
-      if (
-        progress.kind === "openIndexed" ||
-        progress.kind === "convertEditable" ||
-        progress.kind === "reindex" ||
-        progress.kind === "archiveExtract"
-      ) {
-        if (get().indexing?.jobId !== progress.jobId) return;
-        set((s) => ({
-          indexing: s.indexing && {
-            ...s.indexing,
-            processed: progress.processed,
-            total: progress.total,
-          },
-        }));
-        return;
-      }
-
+      // The indexing-family branch (openIndexed / convertEditable / reindex /
+      // archiveExtract) is handled at the TOP of this handler, before the
+      // docId gate — extraction jobs have no document yet.
       if (progress.kind !== "diagnostics") return;
       // Only track the scan we started (guards against reused ids after e.g.
       // an app-side restart of the job system).

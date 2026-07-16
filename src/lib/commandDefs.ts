@@ -4,6 +4,7 @@
 
 import { parseCellRef } from "./cellRef";
 import { registry, type AppCommand } from "./commands";
+import { IS_MAC } from "./shortcuts";
 import { checkForUpdates } from "./updater";
 import { useStore, type ModalName } from "../store/useStore";
 
@@ -126,6 +127,22 @@ function staticCommands(): AppCommand[] {
       title: "Redo",
       category: "Edit",
       defaultShortcut: "mod+y",
+      unavailableReason: () => {
+        const meta = activeMeta();
+        if (!meta) return NO_DOC;
+        return meta.canRedo ? null : "Nothing to redo";
+      },
+      run: () => void state().redo(),
+    },
+    {
+      // Shortcut alias only: keeps the long-standing Ctrl/Cmd+Shift+Z redo
+      // chord working alongside mod+y. Hidden from the palette so Redo is
+      // listed once; the binding stays independently rebindable.
+      id: "edit.redoAlt",
+      title: "Redo",
+      category: "Edit",
+      defaultShortcut: "mod+shift+z",
+      hidden: true,
       unavailableReason: () => {
         const meta = activeMeta();
         if (!meta) return NO_DOC;
@@ -378,7 +395,11 @@ function staticCommands(): AppCommand[] {
       id: "nav.nextTab",
       title: "Next tab",
       category: "Tabs",
-      defaultShortcut: "ctrl+tab",
+      // Physical Ctrl+Tab everywhere: on Windows/Linux `bindingFromEvent`
+      // reports the primary modifier as "mod", so the default must use the
+      // form key events actually emit; macOS keeps the literal "ctrl" chord
+      // (Cmd+Tab belongs to the OS app switcher).
+      defaultShortcut: IS_MAC ? "ctrl+tab" : "mod+tab",
       allowInEditable: true,
       unavailableReason: () => (state().tabs.length > 1 ? null : "Only one tab is open"),
       run: () => cycleTab(1),
@@ -387,7 +408,7 @@ function staticCommands(): AppCommand[] {
       id: "nav.prevTab",
       title: "Previous tab",
       category: "Tabs",
-      defaultShortcut: "ctrl+shift+tab",
+      defaultShortcut: IS_MAC ? "ctrl+shift+tab" : "mod+shift+tab",
       allowInEditable: true,
       unavailableReason: () => (state().tabs.length > 1 ? null : "Only one tab is open"),
       run: () => cycleTab(-1),
