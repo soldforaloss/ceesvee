@@ -12,6 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use tauri::State;
 
+use crate::dedup::{self, DedupCache, DedupSpec, DuplicateKeepStrategy, DuplicateReport};
 use crate::diagnostics::{self, DiagnosticsCache, DiagnosticsReport};
 use crate::document::Document;
 use crate::dto::{
@@ -266,10 +267,12 @@ pub fn close_document(
     state: Db<'_>,
     diagnostics_cache: State<'_, DiagnosticsCache>,
     profile_cache: State<'_, ProfileCache>,
+    dedup_cache: State<'_, DedupCache>,
 ) -> AppResult<()> {
     lock(&state)?.remove(doc_id);
     diagnostics_cache.remove(doc_id);
     profile_cache.remove_doc(doc_id);
+    dedup_cache.remove(doc_id);
     Ok(())
 }
 
@@ -407,6 +410,125 @@ pub fn validate_profile(
     read_doc(&state, doc_id, |doc| {
         settings::validate_profile(doc, &profile)
     })
+}
+
+// ----- duplicate finder (F07) --------------------------------------------------
+
+/// The last completed duplicate report for a document, if any (the report
+/// carries the revision it was computed against; the UI offers a rescan when
+/// the document moves on).
+#[tauri::command]
+pub fn get_duplicate_report(
+    doc_id: u64,
+    dedup_cache: State<'_, DedupCache>,
+) -> Option<DuplicateReport> {
+    dedup_cache.get(doc_id)
+}
+
+/// Start a background duplicate scan; returns the job id. On completion the
+/// report is cached and available via `get_duplicate_report`.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn start_duplicate_scan(
+    doc_id: u64,
+    spec: DedupSpec,
+    scope: ExportScope,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    dedup_cache: State<'_, DedupCache>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+    }
+    let ctx = jobs.begin_for_app(&app, "dedup", Some(doc_id));
+    let job_id = ctx.id;
+    let sink = dedup_cache.share();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            let report = dedup::find_duplicates(&doc, &spec, &scope, Some(ctx))?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, report);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// Filter the grid to every row belonging to a duplicate group.
+#[tauri::command]
+pub async fn apply_duplicate_filter(
+    doc_id: u64,
+    spec: DedupSpec,
+    scope: ExportScope,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        // Compute against a consistent read snapshot first…
+        let rows = {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            dedup::duplicate_row_indices(&doc, &spec, &scope)?
+        };
+        // …then swap the filter view in (re-checked: an edit may have raced).
+        let mut doc = handle.write().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+        doc.set_filter(rows);
+        Ok(doc.meta())
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Remove the non-kept rows of every duplicate group as ONE undoable
+/// operation, guarded by the report's revision. Runs as a job (the scan is
+/// cancellable; the commit itself is brief).
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn apply_deduplicate(
+    doc_id: u64,
+    spec: DedupSpec,
+    scope: ExportScope,
+    keep_strategy: DuplicateKeepStrategy,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+    }
+    let ctx = jobs.begin_for_app(&app, "dedup", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let removals = {
+                let doc = handle.read().map_err(poisoned)?;
+                doc.check_revision(expected_revision)?;
+                dedup::removal_rows(&doc, &spec, &scope, keep_strategy, Some(ctx))?
+            };
+            ctx.check()?; // last cancellation point before the commit
+            let mut doc = handle.write().map_err(poisoned)?;
+            // Results cannot be applied after the document revision changes.
+            doc.check_revision(expected_revision)?;
+            doc.clear_filter();
+            doc.delete_rows(removals)?;
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
 }
 
 // ----- data-cleaning transformations (F06) -----------------------------------

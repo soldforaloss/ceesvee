@@ -12,6 +12,7 @@ import {
   FilePlus,
   Filter,
   FolderOpen,
+  Layers,
   Moon,
   Pulse,
   Redo,
@@ -35,6 +36,7 @@ interface ToolbarProps {
   onFilter: () => void;
   onProfiles: () => void;
   onTransform: () => void;
+  onDedup: () => void;
 }
 
 interface ToolItem {
@@ -53,6 +55,7 @@ export function Toolbar({
   onFilter,
   onProfiles,
   onTransform,
+  onDedup,
 }: ToolbarProps) {
   const meta = useActiveMeta();
   const theme = useStore((s) => s.theme);
@@ -130,6 +133,13 @@ export function Toolbar({
       title: "Previewable cleanup transformations",
       icon: <Wand />,
       onClick: onTransform,
+      disabled: !hasDoc,
+    },
+    {
+      label: "Find duplicates…",
+      title: "Find and remove duplicate rows",
+      icon: <Layers />,
+      onClick: onDedup,
       disabled: !hasDoc,
     },
     { label: "Column summaries", icon: <Stats />, onClick: onSummaries, disabled: !hasDoc },

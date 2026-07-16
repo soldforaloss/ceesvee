@@ -8,8 +8,11 @@ import type {
   CellRect,
   ColumnProfile,
   ColumnSummary,
+  DedupSpec,
   DiagnosticsReport,
   DocumentMeta,
+  DuplicateKeepStrategy,
+  DuplicateReport,
   EncodingCompatibility,
   ExportOptions,
   ExportScope,
@@ -171,6 +174,35 @@ export const startSave = (
   options: ExportOptions,
   expectedRevision: number,
 ) => invoke<number>("start_save", { docId, path, options, expectedRevision });
+
+/** The last completed duplicate report, if any (F07). */
+export const getDuplicateReport = (docId: number) =>
+  invoke<DuplicateReport | null>("get_duplicate_report", { docId });
+
+/** Start a background duplicate scan; resolves with the job id (F07). */
+export const startDuplicateScan = (
+  docId: number,
+  spec: DedupSpec,
+  scope: ExportScope,
+  expectedRevision: number,
+) => invoke<number>("start_duplicate_scan", { docId, spec, scope, expectedRevision });
+
+/** Filter the grid to every row belonging to a duplicate group (F07). */
+export const applyDuplicateFilter = (
+  docId: number,
+  spec: DedupSpec,
+  scope: ExportScope,
+  expectedRevision: number,
+) => invoke<DocumentMeta>("apply_duplicate_filter", { docId, spec, scope, expectedRevision });
+
+/** Remove duplicate rows (one undo step); resolves with the job id (F07). */
+export const applyDeduplicate = (
+  docId: number,
+  spec: DedupSpec,
+  scope: ExportScope,
+  keepStrategy: DuplicateKeepStrategy,
+  expectedRevision: number,
+) => invoke<number>("apply_deduplicate", { docId, spec, scope, keepStrategy, expectedRevision });
 
 /** Compute a transform's full effect without mutating anything (F06). */
 export const previewTransform = (

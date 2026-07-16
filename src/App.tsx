@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useState } from "react";
 
 import { ColumnExplorerPanel } from "./components/ColumnExplorerPanel";
+import { DedupDialog } from "./components/DedupDialog";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { EmptyState } from "./components/EmptyState";
 import { EncodingIssuesDialog } from "./components/EncodingIssuesDialog";
@@ -42,6 +43,7 @@ export default function App() {
   const [filterOpen, setFilterOpen] = useState(false);
   const [profilesOpen, setProfilesOpen] = useState(false);
   const [transformOpen, setTransformOpen] = useState(false);
+  const [dedupOpen, setDedupOpen] = useState(false);
   const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const [dragOver, setDragOver] = useState(false);
@@ -222,6 +224,7 @@ export default function App() {
         onFilter={() => setFilterOpen(true)}
         onProfiles={() => setProfilesOpen(true)}
         onTransform={() => setTransformOpen(true)}
+        onDedup={() => setDedupOpen(true)}
       />
       <Tabs />
       <SourceBar />
@@ -251,6 +254,16 @@ export default function App() {
       {filterOpen && <FilterDialog onClose={() => setFilterOpen(false)} />}
       {profilesOpen && <ProfilesDialog onClose={() => setProfilesOpen(false)} />}
       {transformOpen && <TransformDialog onClose={() => setTransformOpen(false)} />}
+      {dedupOpen && (
+        <DedupDialog
+          onClose={() => setDedupOpen(false)}
+          onExportDuplicates={() => {
+            // The duplicate filter has been applied; export the visible rows.
+            setDedupOpen(false);
+            setExportOpen(true);
+          }}
+        />
+      )}
       <ReopenDialog />
       <ExternalChangeDialog />
       <QuitDialog />
