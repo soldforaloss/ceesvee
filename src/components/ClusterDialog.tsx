@@ -85,7 +85,15 @@ export function ClusterDialog({ onClose }: { onClose: () => void }) {
   const apply = async () => {
     if (!report || mapping.length === 0) return;
     setWorking(true);
-    const ok = await applyClusters(report.column, mapping, scope, report.revision);
+    // Apply with the scope the report was SCANNED with — toggling the scope
+    // control after a scan must not widen the rows the accepted clusters
+    // touch (rows outside the scan were never reviewed).
+    const ok = await applyClusters(
+      report.column,
+      mapping,
+      cluster.scanScope ?? scope,
+      report.revision,
+    );
     setWorking(false);
     if (ok) onClose();
   };
