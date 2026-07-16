@@ -6,6 +6,7 @@ import { useCallback, useEffect, useState } from "react";
 import { AppendDialog } from "./components/AppendDialog";
 import { ArchiveEntryDialog } from "./components/ArchiveEntryDialog";
 import { CellEditorDialog } from "./components/CellEditorDialog";
+import { ChangesPanel } from "./components/ChangesPanel";
 import { ClusterDialog } from "./components/ClusterDialog";
 import { ColumnExplorerPanel } from "./components/ColumnExplorerPanel";
 import { CommandPalette } from "./components/CommandPalette";
@@ -64,6 +65,7 @@ export default function App() {
   const activeModal = useStore((s) => s.activeModal);
   const setModal = useStore((s) => s.setModal);
   const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
+  const changesOpen = useStore((s) => s.changesOpen);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const [dragOver, setDragOver] = useState(false);
 
@@ -249,6 +251,7 @@ export default function App() {
           )}
         </div>
         {diagnosticsOpen && meta && <DiagnosticsPanel />}
+        {changesOpen && meta && <ChangesPanel />}
         {meta && <ColumnExplorerPanel />}
       </main>
 

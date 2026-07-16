@@ -20,7 +20,7 @@ use crate::compare::{self, CompareCache, CompareInfo, ComparePage, CompareSpec, 
 use crate::crossval::{self, CrossRule, CrossValCache, CrossValReport};
 use crate::dedup::{self, DedupCache, DedupSpec, DuplicateKeepStrategy, DuplicateReport};
 use crate::diagnostics::{self, DiagnosticsCache, DiagnosticsReport};
-use crate::document::Document;
+use crate::document::{ChangeSummary, Document};
 use crate::dto::{
     CellRect, ColumnSummary, DocumentMeta, EncodingCompatibility, EncodingIncompatibility,
     ExportOptions, ExportScope, ExternalChange, FileFingerprint, FilterGroup, FindMatch,
@@ -1290,6 +1290,74 @@ pub async fn start_group_by(
     Ok(IndexedOpenStart {
         job_id,
         doc_id: new_doc_id,
+    })
+}
+
+// ----- change inspector / selective revert (F15) ---------------------------------
+
+/// Every unsaved operation, oldest first, with cell-level samples.
+#[tauri::command]
+pub fn get_changes(doc_id: u64, state: Db<'_>) -> AppResult<Vec<ChangeSummary>> {
+    read_doc(&state, doc_id, |doc| Ok(doc.changes_since_save()))
+}
+
+/// Revert one whole operation (as a NEW, undoable operation).
+#[tauri::command]
+pub fn revert_change(
+    doc_id: u64,
+    op_id: u64,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    write_doc(&state, doc_id, |doc| {
+        doc.check_revision(expected_revision)?;
+        doc.revert_stack_op(op_id)?;
+        Ok(doc.meta())
+    })
+}
+
+/// Revert specific cells of one cell-edit operation.
+#[tauri::command]
+pub fn revert_change_cells(
+    doc_id: u64,
+    op_id: u64,
+    cells: Vec<(usize, usize)>,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    write_doc(&state, doc_id, |doc| {
+        doc.check_revision(expected_revision)?;
+        doc.revert_cells_of_op(op_id, &cells)?;
+        Ok(doc.meta())
+    })
+}
+
+/// Revert every unsaved edit in one column to its value at the last save.
+#[tauri::command]
+pub fn revert_column_changes(
+    doc_id: u64,
+    col: usize,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    write_doc(&state, doc_id, |doc| {
+        doc.check_revision(expected_revision)?;
+        doc.revert_column_edits(col)?;
+        Ok(doc.meta())
+    })
+}
+
+/// Revert EVERYTHING since the last save as one undoable operation.
+#[tauri::command]
+pub fn revert_all_changes(
+    doc_id: u64,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    write_doc(&state, doc_id, |doc| {
+        doc.check_revision(expected_revision)?;
+        doc.revert_all_changes()?;
+        Ok(doc.meta())
     })
 }
 

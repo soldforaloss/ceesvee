@@ -109,6 +109,9 @@ and faithful on large, real-world delimited files.**
   patterns, and Luhn-valid card numbers (masked samples only), then
   mask, pseudonymize (HMAC, never-stored secret), or remove them —
   previewed, undoable, audited locally, never leaving your device.
+- **Change inspector** — see every unsaved operation with before/after
+  values, jump to changes, and selectively revert cells, columns,
+  operations, or everything — each revert itself undoable.
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 
