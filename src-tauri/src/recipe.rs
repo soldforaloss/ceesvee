@@ -366,8 +366,19 @@ fn process_file(
                 output = Some(dest.clone());
                 if !options.dry_run {
                     // Stage-and-rename so a cancelled/failed write never
-                    // leaves a half-written output behind.
-                    let staging = dest.with_extension("ceesvee-partial");
+                    // leaves a half-written output behind. The staging name
+                    // APPENDS to the full output name ("a.csv.ceesvee-partial")
+                    // — with_extension would collapse "a.csv" and "a.tsv"
+                    // onto one staging path, letting parallel workers
+                    // truncate or steal each other's temp file.
+                    let staging = {
+                        let mut name = dest
+                            .file_name()
+                            .map(|n| n.to_os_string())
+                            .unwrap_or_default();
+                        name.push(".ceesvee-partial");
+                        dest.with_file_name(name)
+                    };
                     let result = (|| -> AppResult<()> {
                         let file = std::fs::File::create(&staging)?;
                         let mut writer = std::io::BufWriter::new(file);

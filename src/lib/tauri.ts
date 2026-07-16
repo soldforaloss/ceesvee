@@ -298,7 +298,8 @@ export const discardRecoverySession = (journalPath: string) =>
 export const deleteAllRecovery = () => invoke<number>("delete_all_recovery");
 
 /** Every unsaved operation, oldest first, with cell samples (F15). */
-export const getChanges = (docId: number) => invoke<ChangeSummary[]>("get_changes", { docId });
+export const getChanges = (docId: number) =>
+  invoke<{ savedInRedo: boolean; changes: ChangeSummary[] }>("get_changes", { docId });
 
 /** Revert one whole operation (a NEW, undoable operation) (F15). */
 export const revertChange = (docId: number, opId: number, expectedRevision: number) =>
