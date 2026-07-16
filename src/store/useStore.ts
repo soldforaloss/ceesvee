@@ -1813,6 +1813,23 @@ export const useStore = create<Store>((set, get) => {
       }));
       if (get().activeId === update.docId) {
         void get().refreshActiveDoc();
+      } else {
+        // Background tab: patch its metadata from the event so switching
+        // back shows the appended rows immediately (row counts + revision;
+        // the grid refetches on activation via the doc change). While a
+        // filter is active, the visible count is refreshed on activation.
+        set((s) => ({
+          tabs: s.tabs.map((t) =>
+            t.id === update.docId
+              ? {
+                  ...t,
+                  totalRowCount: update.totalRows,
+                  rowCount: t.filtered ? t.rowCount : update.totalRows,
+                  revision: update.revision,
+                }
+              : t,
+          ),
+        }));
       }
     },
 

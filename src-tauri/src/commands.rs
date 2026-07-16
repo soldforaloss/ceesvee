@@ -668,7 +668,9 @@ pub async fn start_follow(
     if !source.is_file() {
         return Err(AppError::invalid("not a file"));
     }
-    let start_offset = std::fs::metadata(&source)?.len();
+    let start_metadata = std::fs::metadata(&source)?;
+    let start_offset = start_metadata.len();
+    let identity = follow::FileIdentity::of(&start_metadata);
     let (parsed, fingerprint) = parse_file(source.clone(), None, None).await?;
     let delimiter = parsed.delimiter;
     let has_header = looks_like_header(&parsed.records);
@@ -676,6 +678,10 @@ pub async fn start_follow(
     let mut guard = lock(&state)?;
     let id = guard.alloc_id();
     let mut doc = Document::from_parsed(id, Some(source.clone()), parsed, has_header);
+    // Appended records are validated against the OPENED encoding; only the
+    // UTF-8 family can be checked byte-exactly (ASCII appends to a legacy
+    // single-byte file pass the NUL catch-all instead).
+    let require_utf8 = doc.encoding_name().eq_ignore_ascii_case("UTF-8");
     doc.set_fingerprint(fingerprint);
     doc.set_follow(true);
     let n_cols = doc.n_cols();
@@ -693,6 +699,8 @@ pub async fn start_follow(
             start_offset,
             delimiter,
             n_cols,
+            identity,
+            require_utf8,
         },
     );
     follows.insert(id, control);
@@ -715,7 +723,8 @@ pub fn set_follow_paused(
 }
 
 /// Filter the grid to rows from `from_row` onward (F19: "only newly added
-/// rows"). Clearing uses the ordinary clear_filter.
+/// rows"). The range is LIVE — records appended by the watcher extend it —
+/// and clearing uses the ordinary clear_filter.
 #[tauri::command]
 pub fn set_row_range_filter(
     doc_id: u64,
@@ -724,6 +733,7 @@ pub fn set_row_range_filter(
 ) -> AppResult<DocumentMeta> {
     write_doc(&state, doc_id, |doc| {
         let rows: Vec<usize> = (from_row.min(doc.n_rows())..doc.n_rows()).collect();
+        doc.set_follow_range(Some(from_row));
         doc.set_filter(rows);
         Ok(doc.meta())
     })
@@ -2932,6 +2942,8 @@ pub fn replace_all(
 #[tauri::command]
 pub fn set_filter(doc_id: u64, spec: FilterGroup, state: Db<'_>) -> AppResult<DocumentMeta> {
     write_doc(&state, doc_id, |doc| {
+        // An ordinary filter replaces the F19 live "only new rows" range.
+        doc.set_follow_range(None);
         let view = filter_mod::matching_rows(doc, &spec)?;
         // A filter that excludes nothing isn't an active filter — avoids reporting
         // "N of N rows · filtered" for a match-all or empty spec.
