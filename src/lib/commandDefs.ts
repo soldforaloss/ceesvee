@@ -298,6 +298,14 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("semantic"),
     },
     {
+      id: "data.outlier",
+      title: "Find outliers…",
+      keywords: ["anomaly", "iqr", "mad", "z-score", "suspicious", "statistics"],
+      category: "Data",
+      unavailableReason: needsDoc,
+      run: () => openModal("outlier"),
+    },
+    {
       id: "data.repair",
       title: "Repair missing values…",
       keywords: ["fill", "blank", "null", "interpolate", "mean", "median", "mode", "ffill"],

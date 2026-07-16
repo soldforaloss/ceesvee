@@ -38,6 +38,8 @@ import type {
   ProfileValidation,
   CrossRule,
   CrossValReport,
+  OutlierReport,
+  OutlierSpec,
   ReparsePreview,
   SemanticAction,
   SemanticReport,
@@ -79,7 +81,8 @@ export type ModalName =
   | "cluster"
   | "semantic"
   | "crossval"
-  | "repair";
+  | "repair"
+  | "outlier";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
@@ -367,6 +370,26 @@ const initialCrossVal: CrossValState = {
   error: null,
 };
 
+/** Outlier-finder state (F30), for the ACTIVE document. */
+export interface OutlierState {
+  scanJobId: number | null;
+  processed: number;
+  total: number | null;
+  /** The spec the report was computed with (needed for filter/actions). */
+  spec: OutlierSpec | null;
+  report: OutlierReport | null;
+  error: string | null;
+}
+
+const initialOutlier: OutlierState = {
+  scanJobId: null,
+  processed: 0,
+  total: null,
+  spec: null,
+  report: null,
+  error: null,
+};
+
 /** ZIP entry chooser state (F17). */
 export interface ArchivePickState {
   path: string;
@@ -500,6 +523,8 @@ interface Store {
   semantic: SemanticState;
   /** Cross-column validation state (F27). */
   crossval: CrossValState;
+  /** Outlier-finder state (F30). */
+  outlier: OutlierState;
   /** ZIP entry chooser (F17). */
   archivePick: ArchivePickState | null;
   /** Suspicious-ratio extraction awaiting confirmation (F17). */
@@ -600,6 +625,15 @@ interface Store {
   loadCachedCrossvalReport: () => Promise<void>;
   /** Filter to rows violating one rule (index) or any rule (null). */
   applyCrossvalFilter: (rule: number | null) => Promise<boolean>;
+
+  // outlier finder (F30)
+  startOutlierScan: (spec: OutlierSpec) => Promise<void>;
+  cancelOutlierScan: () => Promise<void>;
+  clearOutlierReport: () => void;
+  /** Re-adopt the backend-cached report (used when the dialog opens). */
+  loadCachedOutlierReport: () => Promise<void>;
+  /** Filter to the rows holding flagged values. */
+  applyOutlierFilter: () => Promise<boolean>;
 
   // compressed files (F17)
   /** Start extracting an archive (gzip member or chosen ZIP entry). */
@@ -838,6 +872,7 @@ export const useStore = create<Store>((set, get) => {
       // Per-doc reports; the dialogs re-adopt the backend cache on open.
       semantic: initialSemantic,
       crossval: initialCrossVal,
+      outlier: initialOutlier,
     };
   };
 
@@ -1086,6 +1121,7 @@ export const useStore = create<Store>((set, get) => {
     cluster: initialCluster,
     semantic: initialSemantic,
     crossval: initialCrossVal,
+    outlier: initialOutlier,
     archivePick: null,
     archiveLargeConfirm: null,
     externalPrompt: null,
@@ -1552,6 +1588,64 @@ export const useStore = create<Store>((set, get) => {
       }
     },
 
+    // ----- outlier finder (F30) --------------------------------------------------
+
+    startOutlierScan: async (spec) => {
+      const meta = activeMeta();
+      if (!meta || get().outlier.scanJobId != null) return;
+      try {
+        const jobId = await api.startOutlierScan(meta.id, spec, meta.revision);
+        set((s) => ({
+          outlier: {
+            ...s.outlier,
+            scanJobId: jobId,
+            processed: 0,
+            total: null,
+            spec,
+            // The old report pairs with the PREVIOUS spec; if this scan
+            // fails or is cancelled, actions must not re-enable against a
+            // report whose rows the new spec never selected.
+            report: null,
+            error: null,
+          },
+        }));
+        consumeEarlyFinish(jobId);
+      } catch (e) {
+        set((s) => ({ outlier: { ...s.outlier, error: String(e) } }));
+      }
+    },
+
+    cancelOutlierScan: async () => {
+      const jobId = get().outlier.scanJobId;
+      if (jobId != null) await api.cancelJob(jobId).catch(() => undefined);
+    },
+
+    clearOutlierReport: () => set({ outlier: initialOutlier }),
+
+    loadCachedOutlierReport: async () => {
+      const meta = activeMeta();
+      if (!meta || get().outlier.report !== null || get().outlier.scanJobId != null) return;
+      const cached = await api.getOutlierReport(meta.id).catch(() => null);
+      if (cached) {
+        const [spec, report] = cached;
+        set((s) => ({ outlier: { ...s.outlier, spec, report } }));
+      }
+    },
+
+    applyOutlierFilter: async () => {
+      const meta = activeMeta();
+      const { spec, report } = get().outlier;
+      if (!meta || !spec || !report) return false;
+      try {
+        const updated = await api.applyOutlierFilter(meta.id, spec, report.revision);
+        reloadDoc(updated);
+        return true;
+      } catch (e) {
+        set((s) => ({ outlier: { ...s.outlier, error: String(e) } }));
+        return false;
+      }
+    },
+
     // ----- compressed files (F17) --------------------------------------------
 
     startArchiveExtract: async (path, entry, allowLarge) => {
@@ -1956,6 +2050,14 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
+      if (progress.kind === "outlier") {
+        if (get().outlier.scanJobId !== progress.jobId) return;
+        set((s) => ({
+          outlier: { ...s.outlier, processed: progress.processed, total: progress.total },
+        }));
+        return;
+      }
+
       if (progress.kind === "cluster") {
         if (get().cluster.scanJobId !== progress.jobId) return;
         set((s) => ({
@@ -2126,6 +2228,33 @@ export const useStore = create<Store>((set, get) => {
           set((s) => ({
             crossval: {
               ...s.crossval,
+              scanJobId: null,
+              error: finished.status === "failed" ? (finished.error ?? "scan failed") : null,
+            },
+          }));
+        }
+        return;
+      }
+
+      if (finished.kind === "outlier") {
+        if (get().outlier.scanJobId !== finished.jobId) return;
+        if (finished.status === "done") {
+          const cached = finished.docId
+            ? await api.getOutlierReport(finished.docId).catch(() => null)
+            : null;
+          set((s) => ({
+            outlier: {
+              ...s.outlier,
+              scanJobId: null,
+              spec: cached ? cached[0] : s.outlier.spec,
+              report: cached ? cached[1] : null,
+              error: null,
+            },
+          }));
+        } else {
+          set((s) => ({
+            outlier: {
+              ...s.outlier,
               scanJobId: null,
               error: finished.status === "failed" ? (finished.error ?? "scan failed") : null,
             },

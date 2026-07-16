@@ -8,6 +8,19 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Outlier and anomaly finder** (palette → "Find outliers…"): flag
+  suspicious values as statistical CANDIDATES, never verdicts. Numeric
+  methods — IQR fences, MAD modified z-score (both robust, offered first),
+  classic z-score, percentile bounds — plus categorical rare-value share,
+  unexpected-values list, and regex pattern mismatch. Whole-column or
+  group-wise (each group uses its own statistics); blanks and non-numeric
+  cells are excluded from statistics, never flagged, and counted in the
+  report; constant columns are safe (no division by zero). The report
+  shows per-group summaries (count, median, bounds, flagged) and each
+  flagged value with the reason. Actions: filter to candidates, export the
+  JSON report, and previewed one-undo corrections — replace with blank,
+  replace with group median, cap to bounds, remove rows. Scanning never
+  marks the document dirty.
 - **Missing-value repair** (palette → "Repair missing values…"): controlled
   fills and removals from a closed set — normalize null tokens (NA, N/A,
   null, …) to true blanks, constant fill, forward/backward fill with

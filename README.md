@@ -84,6 +84,10 @@ and faithful on large, real-world delimited files.**
   forward / backward / mean / median / mode fills, grouped fills that
   never cross boundaries, linear interpolation, and thresholded row or
   column removal — all previewed, scoped, and one undo step.
+- **Outlier finder** — IQR / MAD / z-score / percentile and categorical
+  rare-value or pattern checks, whole-column or group-wise, with
+  reasons, group statistics, filtering, and previewed one-undo
+  corrections (blank, median, cap, remove).
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 

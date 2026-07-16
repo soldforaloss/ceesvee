@@ -37,6 +37,10 @@ import type {
   IndexedOpenStart,
   OpenEstimate,
   OpenOptions,
+  OutlierAction,
+  OutlierActionPreview,
+  OutlierReport,
+  OutlierSpec,
   ProfileScope,
   ProfileValidation,
   RepairPreview,
@@ -223,6 +227,35 @@ export const applySemanticAction = (
     action,
     expectedRevision,
   });
+
+/** The last completed outlier report + the spec that produced it (F30). */
+export const getOutlierReport = (docId: number) =>
+  invoke<[OutlierSpec, OutlierReport] | null>("get_outlier_report", { docId });
+
+/** Run an outlier scan as a cancellable job (F30). Read-only. */
+export const startOutlierScan = (docId: number, spec: OutlierSpec, expectedRevision: number) =>
+  invoke<number>("start_outlier_scan", { docId, spec, expectedRevision });
+
+/** Filter the grid to the rows holding flagged values (F30). */
+export const applyOutlierFilter = (docId: number, spec: OutlierSpec, expectedRevision: number) =>
+  invoke<DocumentMeta>("apply_outlier_filter", { docId, spec, expectedRevision });
+
+/** Preview a corrective outlier action (F30). */
+export const previewOutlierAction = (
+  docId: number,
+  spec: OutlierSpec,
+  action: OutlierAction,
+  expectedRevision: number,
+) =>
+  invoke<OutlierActionPreview>("preview_outlier_action", { docId, spec, action, expectedRevision });
+
+/** Apply a previewed corrective outlier action as ONE undo step (F30). */
+export const applyOutlierAction = (
+  docId: number,
+  spec: OutlierSpec,
+  action: OutlierAction,
+  expectedRevision: number,
+) => invoke<DocumentMeta>("apply_outlier_action", { docId, spec, action, expectedRevision });
 
 /** Preview exactly what a missing-value repair would do (F29). */
 export const previewRepair = (docId: number, spec: RepairSpec, expectedRevision: number) =>
