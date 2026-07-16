@@ -63,19 +63,15 @@ pub struct FollowAlert {
 /// delimiter, `"` quoting with doubling). Bytes may arrive in arbitrary
 /// chunks; an incomplete trailing record — including an open quoted field —
 /// is carried until it completes.
+#[derive(Default)]
 pub struct IncrementalCsv {
-    delimiter: u8,
     carry: Vec<u8>,
     in_quotes: bool,
 }
 
 impl IncrementalCsv {
-    pub fn new(delimiter: u8) -> IncrementalCsv {
-        IncrementalCsv {
-            delimiter,
-            carry: Vec::new(),
-            in_quotes: false,
-        }
+    pub fn new() -> IncrementalCsv {
+        IncrementalCsv::default()
     }
 
     /// How many carried bytes are waiting for their record to complete.
@@ -304,7 +300,7 @@ pub fn spawn_watcher(
 
     std::thread::spawn(move || {
         let mut offset = config.start_offset;
-        let mut parser = IncrementalCsv::new(config.delimiter);
+        let mut parser = IncrementalCsv::new();
         let mut alerted = false;
         while !stop.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
@@ -376,7 +372,7 @@ mod tests {
 
     #[test]
     fn incremental_parser_holds_partial_records_until_complete() {
-        let mut p = IncrementalCsv::new(b',');
+        let mut p = IncrementalCsv::new();
         // A record arriving in three fragments.
         assert!(p.feed(b"1,al").is_empty());
         assert!(p.feed(b"pha").is_empty());
@@ -389,7 +385,7 @@ mod tests {
 
     #[test]
     fn open_quoted_fields_stay_hidden_until_closed() {
-        let mut p = IncrementalCsv::new(b',');
+        let mut p = IncrementalCsv::new();
         // A newline INSIDE an open quote does not complete the record.
         assert!(p.feed(b"1,\"multi\nline").is_empty());
         let records = feed_records(&mut p, b" still\"\n");
@@ -399,7 +395,7 @@ mod tests {
 
     #[test]
     fn quotes_unescape_and_crlf_is_handled() {
-        let mut p = IncrementalCsv::new(b',');
+        let mut p = IncrementalCsv::new();
         let records = feed_records(&mut p, b"a,\"he said \"\"hi\"\"\"\r\nb,2\r\n");
         assert_eq!(records[0][1], "he said \"hi\"");
         assert_eq!(records[1], vec!["b", "2"]);
@@ -421,7 +417,7 @@ mod tests {
             require_utf8: true,
         };
         let mut offset = start;
-        let mut parser = IncrementalCsv::new(b',');
+        let mut parser = IncrementalCsv::new();
 
         // Nothing appended yet.
         assert!(poll_step(&config, &mut offset, &mut parser)
@@ -479,7 +475,7 @@ mod tests {
             require_utf8: true,
         };
         let mut offset = start;
-        let mut parser = IncrementalCsv::new(b',');
+        let mut parser = IncrementalCsv::new();
         {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new()
@@ -513,7 +509,7 @@ mod tests {
             require_utf8: true,
         };
         let mut offset = start;
-        let mut parser = IncrementalCsv::new(b',');
+        let mut parser = IncrementalCsv::new();
         {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new()
@@ -548,7 +544,7 @@ mod tests {
             require_utf8: true,
         };
         let mut offset = start;
-        let mut parser = IncrementalCsv::new(b',');
+        let mut parser = IncrementalCsv::new();
 
         // Rotate: replace the file with a NEW one that is already LARGER
         // than the old offset — the size check alone would read through it.
