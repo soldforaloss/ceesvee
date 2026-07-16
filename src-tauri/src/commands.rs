@@ -1295,10 +1295,25 @@ pub async fn start_group_by(
 
 // ----- change inspector / selective revert (F15) ---------------------------------
 
+/// Unsaved operations plus whether the saved state sits in the REDO branch
+/// (the user undid past the last save — nothing to list, but the document
+/// is dirty and Redo returns to the saved state).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangesReport {
+    pub saved_in_redo: bool,
+    pub changes: Vec<ChangeSummary>,
+}
+
 /// Every unsaved operation, oldest first, with cell-level samples.
 #[tauri::command]
-pub fn get_changes(doc_id: u64, state: Db<'_>) -> AppResult<Vec<ChangeSummary>> {
-    read_doc(&state, doc_id, |doc| Ok(doc.changes_since_save()))
+pub fn get_changes(doc_id: u64, state: Db<'_>) -> AppResult<ChangesReport> {
+    read_doc(&state, doc_id, |doc| {
+        Ok(ChangesReport {
+            saved_in_redo: doc.saved_in_redo_branch(),
+            changes: doc.changes_since_save(),
+        })
+    })
 }
 
 /// Revert one whole operation (as a NEW, undoable operation).
