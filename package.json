@@ -1,7 +1,7 @@
 {
   "name": "ceesvee",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.3.0",
   "type": "module",
   "description": "A fast, open-source CSV / delimited-file viewer and editor built with Tauri and React.",
   "license": "MIT",

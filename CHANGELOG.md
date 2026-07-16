@@ -6,6 +6,84 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0]
+
+### Added
+
+- **Indexed read-only mode for huge files.** Files whose estimated in-memory
+  size crosses the safety line open against a streaming record index instead of
+  being loaded whole, so multi-gigabyte CSVs browse smoothly with bounded
+  memory. An open-mode dialog shows the size/row/memory estimate and offers
+  read-only, full in-memory, or cancel; a one-click **Convert to editable**
+  materialises the document later. Browsing, find, filter, export, diagnostics,
+  profiling, duplicates, and compare all work in read-only mode; editing tools
+  are cleanly disabled behind a "Read-only (indexed)" chip.
+- **Data-fidelity diagnostics.** A panel that scans the document as a
+  cancellable background job and reports import damage (malformed bytes,
+  ragged records with their source line numbers), replacement characters,
+  mixed-type columns, blank-heavy columns, edge whitespace, duplicate or empty
+  headers, and more — each with samples, a jump-to-cell action, and one-click
+  "filter to affected rows" where applicable.
+- **Reopen with settings.** Change delimiter, encoding, or the header toggle
+  against a live preview of how the file would re-read — including exactly
+  which cells change — and apply only with explicit confirmation. Dirty
+  documents are saved (or explicitly discarded) first, never silently
+  reparsed.
+- **External-change detection.** CEESVEE fingerprints the file on disk and,
+  when another program changes it, offers reload / ignore / save-as / open the
+  disk copy side by side instead of clobbering anything.
+- **Quit protection.** Closing the window with unsaved tabs prompts to save
+  all (aborting if any save fails), discard all, or cancel.
+- **Scoped and split export.** Export everything, the visible (filtered) rows,
+  selected rows/columns, or a cell range; optionally split the output into
+  multiple files by row count, approximate file size, or the values of a
+  column (one file per group), with an optional JSON manifest recording row
+  counts and SHA-256 hashes per output.
+- **Column explorer.** A per-column profiling panel: type distribution,
+  blanks, distinct counts (exact, or estimated once cardinality explodes), top
+  values, numeric quartiles, date extremes, and text-length stats — over all
+  rows or just the visible ones — with click-to-filter directly from the
+  panel. Profiles are cached per column and survive edits to other columns.
+- **Data cleaning transforms.** Previewable, one-undo-step cleanups: trim and
+  collapse whitespace, case changes, find/replace within a column, number and
+  date normalization, blank-fill, split a column by delimiter, and merge
+  columns. Every transform shows affected counts, before/after examples, and
+  parse failures before anything is applied.
+- **Duplicate finder.** Group rows by a multi-column key with trim /
+  case-insensitive / whitespace-collapse / blank-key options; review sample
+  groups, filter the grid to duplicates, export them, or remove them in one
+  undoable step keeping the first, last, or most complete row.
+- **Compare two documents.** Positional or keyed comparison with column
+  mapping for renamed/reordered columns and value equivalences (numeric,
+  date, blank, case, trim). Results classify every record as added, removed,
+  changed, unchanged, or conflict (duplicate keys are surfaced, never silently
+  paired), with side-by-side cell diffs, jump-to-source-row, and exports of
+  each class or a JSON change report.
+- **Per-document UI state.** Find, filter, selection, column widths, frozen
+  columns, scroll position, and panel state now follow each tab instead of
+  leaking between documents.
+- **File profiles.** Save delimiter/encoding/header choices, expected columns,
+  and validation rules (required, unique, type, regex, numeric range) under a
+  name matched to file patterns; matching files suggest — or with opt-in,
+  auto-apply — the profile, and a validation report checks any document
+  against it.
+
+### Changed
+
+- **Saves are atomic.** Save/Save As stream through a temporary file that is
+  fsynced and renamed into place, so a crash or full disk can never leave a
+  half-written file; optional single or rolling `.bak` backups.
+- Saves, exports, and every heavy scan (diagnostics, profiling, duplicates,
+  compare, indexing) now run as cancellable background jobs with progress in
+  the status bar, keeping the grid responsive.
+- Exports to legacy encodings (e.g. Windows-1252) are checked up front and
+  blocked with the exact offending cells listed, instead of silently
+  substituting unmappable characters.
+- Long-running operations are guarded by document revisions: results computed
+  against an older state of the document are rejected rather than applied
+  stale.
+- Building from source now requires Rust 1.89+ (std file locking).
+
 ## [0.2.2]
 
 ### Fixed
@@ -75,7 +153,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In-app auto-updates (cryptographically signed) that check GitHub Releases on
   launch and prompt to download and install a newer version.
 
-[Unreleased]: https://github.com/soldforaloss/ceesvee/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/soldforaloss/ceesvee/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/soldforaloss/ceesvee/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/soldforaloss/ceesvee/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/soldforaloss/ceesvee/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/soldforaloss/ceesvee/compare/v0.1.0...v0.2.0
