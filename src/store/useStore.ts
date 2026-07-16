@@ -38,6 +38,7 @@ import type {
   ProfileValidation,
   BatchReport,
   CrossRule,
+  RecoverableSession,
   CrossValReport,
   OutlierReport,
   PiiReport,
@@ -91,7 +92,8 @@ export type ModalName =
   | "groupBy"
   | "reshape"
   | "recipes"
-  | "pii";
+  | "pii"
+  | "recovery";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
@@ -592,6 +594,13 @@ interface Store {
   batch: BatchState | null;
   /** PII scan state (F28). */
   pii: PiiState;
+  /** Recoverable sessions found at startup (F16). */
+  recoverySessions: RecoverableSession[];
+  setRecoverySessions: (sessions: RecoverableSession[]) => void;
+  /** Add a freshly recovered document as a tab and focus it (F16). */
+  adoptRecoveredDoc: (meta: DocumentMeta) => void;
+  /** Persist the recovery-journaling opt-in (F16). */
+  setRecoveryEnabled: (enabled: boolean) => Promise<void>;
   /** ZIP entry chooser (F17). */
   archivePick: ArchivePickState | null;
   /** Suspicious-ratio extraction awaiting confirmation (F17). */
@@ -1213,6 +1222,7 @@ export const useStore = create<Store>((set, get) => {
     deriveError: null,
     batch: null,
     pii: initialPii,
+    recoverySessions: [],
     archivePick: null,
     archiveLargeConfirm: null,
     externalPrompt: null,
@@ -1240,6 +1250,15 @@ export const useStore = create<Store>((set, get) => {
         .getSettings()
         .then((settings) => set({ settings }))
         .catch(() => set({ settings: { version: 1, profiles: [] } }));
+      // F16: offer crash recovery when journals survived a previous session.
+      void api
+        .listRecoverySessions()
+        .then((sessions) => {
+          if (sessions.length > 0) {
+            set({ recoverySessions: sessions, activeModal: "recovery" });
+          }
+        })
+        .catch(() => undefined);
     },
 
     setModal: (modal) => set({ activeModal: modal }),
@@ -1735,6 +1754,26 @@ export const useStore = create<Store>((set, get) => {
     },
 
     clearPiiReport: () => set({ pii: initialPii }),
+
+    // ----- crash recovery (F16) --------------------------------------------------
+
+    setRecoverySessions: (sessions) => set({ recoverySessions: sessions }),
+
+    adoptRecoveredDoc: (meta) =>
+      set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] })),
+
+    setRecoveryEnabled: async (enabled) => {
+      const settings: AppSettings = {
+        ...(get().settings ?? { version: 1, profiles: [] }),
+        recoveryEnabled: enabled,
+      };
+      set({ settings });
+      try {
+        await api.setSettings(settings);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
 
     loadCachedPiiReport: async () => {
       const meta = activeMeta();

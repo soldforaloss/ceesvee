@@ -31,6 +31,7 @@ use crate::error::{AppError, AppResult};
 use crate::groupby::{self, GroupByPreview, GroupBySpec};
 use crate::job::JobRegistry;
 use crate::joins::{self, JoinPreview, JoinSpec};
+use crate::journal::{self, RecoverableSession};
 use crate::outlier::{
     self, CachedOutlier, OutlierAction, OutlierActionPreview, OutlierCache, OutlierSpec,
 };
@@ -152,6 +153,7 @@ fn index_cache_root(app: &tauri::AppHandle) -> AppResult<PathBuf> {
 pub async fn open_file(
     path: String,
     options: Option<OpenOptions>,
+    app: tauri::AppHandle,
     state: Db<'_>,
 ) -> AppResult<DocumentMeta> {
     let options = options.unwrap_or_default();
@@ -184,9 +186,44 @@ pub async fn open_file(
     let id = guard.alloc_id();
     let mut doc = Document::from_parsed(id, Some(PathBuf::from(&path)), parsed, has_header);
     doc.set_fingerprint(fingerprint);
+    attach_journal_if_enabled(&app, &mut doc);
     let meta = doc.meta();
     guard.insert(doc);
     Ok(meta)
+}
+
+/// F16: attach a fresh crash-recovery journal when the opt-in is on and the
+/// document has a source file. Best-effort — journaling never blocks opens.
+fn attach_journal_if_enabled(app: &tauri::AppHandle, doc: &mut Document) {
+    let Ok(dir) = settings_dir(app) else { return };
+    let settings = settings::load_settings(&dir);
+    if !settings.recovery_enabled {
+        return;
+    }
+    let meta = doc.meta();
+    if meta.path.is_none() {
+        return;
+    }
+    let Ok(recovery) = recovery_dir(app) else {
+        return;
+    };
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = recovery.join(format!("{}-{epoch}.journal", meta.id));
+    if let Ok(writer) = journal::JournalWriter::create(path, &doc.journal_header()) {
+        doc.attach_journal(writer);
+    }
+}
+
+fn recovery_dir(app: &tauri::AppHandle) -> AppResult<PathBuf> {
+    use tauri::Manager;
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|e| AppError::Other(format!("no data directory: {e}")))?
+        .join("recovery"))
 }
 
 /// Handles returned by `start_archive_extract` (F17).
@@ -580,6 +617,7 @@ pub async fn apply_reparse(
     doc_id: u64,
     options: OpenOptions,
     expected_revision: u64,
+    app: tauri::AppHandle,
     state: Db<'_>,
 ) -> AppResult<DocumentMeta> {
     let (path, current_header) = read_doc(&state, doc_id, |doc| {
@@ -603,11 +641,20 @@ pub async fn apply_reparse(
         // Re-check under the write lock: an edit may have landed while the
         // file was being parsed.
         doc.check_revision(expected_revision)?;
+        // A journal against the OLD interpretation must not survive (its
+        // replay would target coordinates that no longer exist), and merely
+        // dropping the writer would leave the file to be offered as a
+        // recovery on the next startup.
+        if let Some(journal) = doc.take_journal() {
+            journal.delete();
+        }
         let mut fresh = Document::from_parsed(doc_id, Some(path), parsed, has_header);
         // Continue the revision sequence so anything captured against the old
         // incarnation can never accidentally match the new one.
         fresh.set_revision(doc.revision() + 1);
         fresh.set_fingerprint(fingerprint);
+        // Journaling continues against the NEW interpretation.
+        attach_journal_if_enabled(&app, &mut fresh);
         let meta = fresh.meta();
         *doc = fresh;
         Ok(meta)
@@ -682,6 +729,15 @@ pub fn close_document(
     append_cache: State<'_, AppendCache>,
     pii_cache: State<'_, PiiCache>,
 ) -> AppResult<()> {
+    // A clean close deletes the crash-recovery journal (F16): there is
+    // nothing left to recover once the user closed the tab deliberately.
+    if let Ok(handle) = doc_handle(&state, doc_id) {
+        if let Ok(mut doc) = handle.write() {
+            if let Some(journal) = doc.take_journal() {
+                journal.delete();
+            }
+        }
+    }
     lock(&state)?.remove(doc_id);
     diagnostics_cache.remove(doc_id);
     profile_cache.remove_doc(doc_id);
@@ -1294,6 +1350,119 @@ pub async fn start_group_by(
         job_id,
         doc_id: new_doc_id,
     })
+}
+
+// ----- crash recovery (F16) -------------------------------------------------------
+
+/// Recoverable sessions found at startup (expired journals swept first).
+#[tauri::command]
+pub fn list_recovery_sessions(app: tauri::AppHandle) -> AppResult<Vec<RecoverableSession>> {
+    let dir = recovery_dir(&app)?;
+    let settings = settings::load_settings(&settings_dir(&app)?);
+    journal::sweep_expired(&dir, settings.recovery_retention_days.max(1));
+    Ok(journal::scan_recoverable(&dir))
+}
+
+/// Guard: a journal path handed back by the UI must live INSIDE the
+/// recovery directory — never delete or read arbitrary files.
+fn checked_journal_path(app: &tauri::AppHandle, journal_path: &str) -> AppResult<PathBuf> {
+    let dir = recovery_dir(app)?;
+    let path = PathBuf::from(journal_path);
+    let canonical_dir = dir
+        .canonicalize()
+        .map_err(|_| AppError::invalid("no recovery data"))?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| AppError::invalid("that recovery session no longer exists"))?;
+    if !canonical.starts_with(&canonical_dir) {
+        return Err(AppError::invalid("not a recovery journal"));
+    }
+    Ok(canonical)
+}
+
+/// Recover a journaled session: reparse the source with the journal's
+/// interpretation, replay the operations, and register the result as a
+/// DIRTY document. The source file is never written. `open_copy` recovers
+/// into an unsaved copy (required when the source changed underneath).
+#[tauri::command]
+pub async fn recover_session(
+    journal_path: String,
+    open_copy: bool,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    let journal_file = checked_journal_path(&app, &journal_path)?;
+    let (header, records) = journal::read_journal(&journal_file)?;
+    let source = PathBuf::from(&header.path);
+    if !source.is_file() {
+        return Err(AppError::invalid(
+            "the source file no longer exists — use Show Location to find the journal",
+        ));
+    }
+    let disk = util::stat_fingerprint(&source);
+    let changed = match (&header.fingerprint, &disk) {
+        (Some(a), Some(b)) => a != b,
+        _ => true,
+    };
+    if changed && !open_copy {
+        return Err(AppError::invalid(
+            "the source file changed since journaling — blind replay is \
+             blocked; recover as a copy instead",
+        ));
+    }
+
+    let delimiter = header.delimiter.clone();
+    let encoding_name = header.encoding.clone();
+    let source_for_parse = source.clone();
+    let (parsed, fingerprint) = parse_file(
+        source_for_parse,
+        Some(util::delimiter_to_byte(&delimiter)),
+        Some(encoding::from_name(&encoding_name)),
+    )
+    .await?;
+
+    let id = lock(&state)?.alloc_id();
+    let mut doc = Document::from_parsed(
+        id,
+        (!open_copy).then(|| source.clone()),
+        parsed,
+        header.has_header_row,
+    );
+    if !open_copy {
+        doc.set_fingerprint(fingerprint);
+        // Journal onward from the recovered baseline BEFORE replay, so the
+        // replayed operations are immediately protected again.
+        attach_journal_if_enabled(&app, &mut doc);
+    } else {
+        doc.mark_derived_unsaved();
+    }
+    let applied = tauri::async_runtime::spawn_blocking(move || -> AppResult<(Document, usize)> {
+        let applied = doc.replay_journal_records(&records)?;
+        Ok((doc, applied))
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?;
+    let (doc, _applied) = applied?;
+    let meta = doc.meta();
+    lock(&state)?.insert(doc);
+    // Replay succeeded and the work now lives in a (journaled) document:
+    // the old journal is done.
+    let _ = std::fs::remove_file(&journal_file);
+    Ok(meta)
+}
+
+/// Discard one recovery session (deletes its journal).
+#[tauri::command]
+pub fn discard_recovery_session(journal_path: String, app: tauri::AppHandle) -> AppResult<()> {
+    let path = checked_journal_path(&app, &journal_path)?;
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+/// "Delete all recovery data": wipe every journal.
+#[tauri::command]
+pub fn delete_all_recovery(app: tauri::AppHandle) -> AppResult<usize> {
+    Ok(journal::delete_all(&recovery_dir(&app)?))
 }
 
 // ----- change inspector / selective revert (F15) ---------------------------------
@@ -2806,6 +2975,9 @@ pub async fn start_save(
                 // document, so record the save point and new baseline.
                 doc.mark_saved(Some(dest));
                 doc.set_fingerprint(fingerprint);
+                // The crash-recovery journal restarts against the saved
+                // baseline (F16) — its compaction step.
+                doc.reset_journal_baseline();
             } else if doc.path.as_deref() == Some(dest.as_path()) {
                 // An edit raced the save: the file holds the pre-edit
                 // snapshot, so the document stays dirty — but the file on

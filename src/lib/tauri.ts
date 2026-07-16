@@ -58,6 +58,7 @@ import type {
   OutlierSpec,
   ProfileScope,
   ProfileValidation,
+  RecoverableSession,
   RepairPreview,
   RepairSpec,
   ReparsePreview,
@@ -257,6 +258,20 @@ export const startAppend = (inputs: AppendInput[], options: AppendOptions) =>
 /** The per-input outcome report of a finished append (F20). */
 export const getAppendReport = (docId: number) =>
   invoke<AppendReport | null>("get_append_report", { docId });
+
+/** Recoverable sessions found at startup (expired journals swept) (F16). */
+export const listRecoverySessions = () => invoke<RecoverableSession[]>("list_recovery_sessions");
+
+/** Recover a journaled session (never writes the source) (F16). */
+export const recoverSession = (journalPath: string, openCopy: boolean) =>
+  invoke<DocumentMeta>("recover_session", { journalPath, openCopy });
+
+/** Discard one recovery session (deletes its journal) (F16). */
+export const discardRecoverySession = (journalPath: string) =>
+  invoke<void>("discard_recovery_session", { journalPath });
+
+/** Delete ALL recovery data (F16). */
+export const deleteAllRecovery = () => invoke<number>("delete_all_recovery");
 
 /** Every unsaved operation, oldest first, with cell samples (F15). */
 export const getChanges = (docId: number) =>

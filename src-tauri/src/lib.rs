@@ -27,6 +27,7 @@ mod index;
 /// registry, progress plumbing and cancellation as a stable internal API.
 pub mod job;
 mod joins;
+mod journal;
 mod outlier;
 mod parse;
 mod paste;
@@ -224,6 +225,10 @@ pub fn run() {
             commands::revert_change_cells,
             commands::revert_column_changes,
             commands::revert_all_changes,
+            commands::list_recovery_sessions,
+            commands::recover_session,
+            commands::discard_recovery_session,
+            commands::delete_all_recovery,
             commands::start_compare,
             commands::get_compare_info,
             commands::get_compare_results,

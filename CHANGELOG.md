@@ -8,6 +8,21 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Crash recovery** (opt-in, palette → "Recover unsaved work…"): an
+  append-only local journal records every edit operation (including
+  undo/redo) the moment it happens. After a crash, power failure, or
+  forced termination, startup lists recoverable sessions — file, last
+  edit time, operation count, and whether the source changed — with
+  Recover, Open Copy, Discard, and Show Location. Recovery replays the
+  operations onto a fresh parse of the source in their original order,
+  producing a DIRTY document; the source file is never written, a changed
+  source fingerprint blocks blind replay (Open Copy takes over), corrupt
+  trailing journal data never invalidates the complete operations before
+  it, and incompatible journal versions are kept for manual recovery.
+  Journals reset on every successful save (atomic compaction), delete on
+  clean close, expire on a configurable retention, and carry a privacy
+  disclosure (they contain edited cell values) plus a "Delete all
+  recovery data" action.
 - **Change inspector with selective revert** (palette → "Changes since
   save"): a side panel listing every unsaved operation — kind, time,
   affected cells with before/after values — exactly mirroring the dirty

@@ -33,6 +33,7 @@ import { OpenModeDialog } from "./components/OpenModeDialog";
 import { OutlierDialog } from "./components/OutlierDialog";
 import { QuitDialog } from "./components/QuitDialog";
 import { RecipeDialog } from "./components/RecipeDialog";
+import { RecoveryDialog } from "./components/RecoveryDialog";
 import { ReopenDialog } from "./components/ReopenDialog";
 import { RepairDialog } from "./components/RepairDialog";
 import { ReshapeDialog } from "./components/ReshapeDialog";
@@ -286,6 +287,7 @@ export default function App() {
       {activeModal === "reshape" && <ReshapeDialog onClose={() => setModal(null)} />}
       {activeModal === "recipes" && <RecipeDialog onClose={() => setModal(null)} />}
       {activeModal === "pii" && <PiiDialog onClose={() => setModal(null)} />}
+      {activeModal === "recovery" && <RecoveryDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       <CommandPalette />
       <CellEditorDialog />
