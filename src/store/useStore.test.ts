@@ -14,6 +14,7 @@ vi.mock("../lib/tauri", () => ({
   getMeta: vi.fn(),
   find: vi.fn().mockResolvedValue([]),
   cancelJob: vi.fn().mockResolvedValue(true),
+  setSettings: vi.fn().mockResolvedValue(undefined),
 }));
 
 import * as api from "../lib/tauri";
@@ -266,5 +267,59 @@ describe("indexed read-only open flow (F10)", () => {
     useStore.setState({ find: { ...useStore.getState().find, query: "x" } });
     await useStore.getState().runFind();
     expect(vi.mocked(api.find).mock.calls[1][1].limit).toBeUndefined();
+  });
+});
+
+describe("shortcut overrides and modals (F11)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useStore.setState({
+      settings: { version: 1, profiles: [] },
+      activeModal: null,
+      paletteOpen: false,
+      paletteArgCommandId: null,
+      error: null,
+    });
+  });
+
+  it("persists rebinds, unbinds, and resets through settings", async () => {
+    await useStore.getState().setShortcutOverride("file.save", "mod+shift+x");
+    expect(useStore.getState().settings?.shortcutOverrides).toEqual({
+      "file.save": "mod+shift+x",
+    });
+
+    await useStore.getState().setShortcutOverride("edit.undo", null);
+    expect(useStore.getState().settings?.shortcutOverrides).toEqual({
+      "file.save": "mod+shift+x",
+      "edit.undo": null,
+    });
+
+    await useStore.getState().setShortcutOverride("file.save", undefined);
+    expect(useStore.getState().settings?.shortcutOverrides).toEqual({ "edit.undo": null });
+    expect(vi.mocked(api.setSettings)).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the store state on a failed settings write", async () => {
+    vi.mocked(api.setSettings).mockRejectedValueOnce(new Error("disk full"));
+    await useStore.getState().setShortcutOverride("file.save", "mod+1");
+    expect(useStore.getState().settings?.shortcutOverrides).toBeUndefined();
+    expect(useStore.getState().error).toContain("disk full");
+  });
+
+  it("opening the palette in argument mode records the command", () => {
+    useStore.getState().openPaletteForArg("nav.goToRow");
+    expect(useStore.getState().paletteOpen).toBe(true);
+    expect(useStore.getState().paletteArgCommandId).toBe("nav.goToRow");
+    useStore.getState().setPaletteOpen(false);
+    expect(useStore.getState().paletteArgCommandId).toBeNull();
+  });
+
+  it("modals are owned by the store, one at a time", () => {
+    useStore.getState().setModal("sort");
+    expect(useStore.getState().activeModal).toBe("sort");
+    useStore.getState().setModal("export");
+    expect(useStore.getState().activeModal).toBe("export");
+    useStore.getState().setModal(null);
+    expect(useStore.getState().activeModal).toBeNull();
   });
 });

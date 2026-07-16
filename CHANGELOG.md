@@ -6,6 +6,18 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Command palette** (`Ctrl/Cmd+K`): fuzzy-search and run every CEESVEE
+  action from the keyboard — file, editing, view, data, export, and tab
+  commands, plus go to row/cell, opening recent files, and switching tabs.
+  Commands that can't run right now stay listed with the reason (no document,
+  read-only, nothing to undo, …).
+- **Customizable keyboard shortcuts**: a shortcut editor (via the palette →
+  "Keyboard shortcuts…") records new bindings per command, warns before
+  reassigning a chord that another command already uses, and persists
+  overrides in the settings file. Changes apply immediately.
+
 ## [0.3.0]
 
 ### Added

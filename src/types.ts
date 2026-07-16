@@ -543,6 +543,11 @@ export interface FileProfile {
 export interface AppSettings {
   version: number;
   profiles: FileProfile[];
+  /**
+   * F11: shortcut overrides keyed by stable command id, in normalized
+   * `mod+shift+k` syntax. `null` unbinds; a missing key keeps the default.
+   */
+  shortcutOverrides?: Record<string, string | null>;
 }
 
 /** One violated profile rule. */

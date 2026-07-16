@@ -30,17 +30,6 @@ import {
 } from "./Icons";
 import { Logo } from "./Logo";
 
-interface ToolbarProps {
-  onSort: () => void;
-  onExport: () => void;
-  onSummaries: () => void;
-  onFilter: () => void;
-  onProfiles: () => void;
-  onTransform: () => void;
-  onDedup: () => void;
-  onCompare: () => void;
-}
-
 interface ToolItem {
   label: string;
   title?: string;
@@ -50,17 +39,9 @@ interface ToolItem {
   active?: boolean;
 }
 
-export function Toolbar({
-  onSort,
-  onExport,
-  onSummaries,
-  onFilter,
-  onProfiles,
-  onTransform,
-  onDedup,
-  onCompare,
-}: ToolbarProps) {
+export function Toolbar() {
   const meta = useActiveMeta();
+  const setModal = useStore((s) => s.setModal);
   const theme = useStore((s) => s.theme);
   const recent = useStore((s) => s.recent);
   const [recentOpen, setRecentOpen] = useState(false);
@@ -139,33 +120,43 @@ export function Toolbar({
     {
       label: "Filter rows…",
       icon: <Filter />,
-      onClick: onFilter,
+      onClick: () => setModal("filter"),
       active: !!meta?.filtered,
       disabled: !hasDoc,
     },
-    { label: "Sort…", icon: <SortIcon />, onClick: onSort, disabled: !hasDoc || readOnly },
+    {
+      label: "Sort…",
+      icon: <SortIcon />,
+      onClick: () => setModal("sort"),
+      disabled: !hasDoc || readOnly,
+    },
     {
       label: "Clean data…",
       title: "Previewable cleanup transformations",
       icon: <Wand />,
-      onClick: onTransform,
+      onClick: () => setModal("transform"),
       disabled: !hasDoc || readOnly,
     },
     {
       label: "Find duplicates…",
       title: "Find and remove duplicate rows",
       icon: <Layers />,
-      onClick: onDedup,
+      onClick: () => setModal("dedup"),
       disabled: !hasDoc,
     },
     {
       label: "Compare…",
       title: "Compare with another open document",
       icon: <Diff />,
-      onClick: onCompare,
+      onClick: () => setModal("compare"),
       disabled: !hasDoc,
     },
-    { label: "Column summaries", icon: <Stats />, onClick: onSummaries, disabled: !hasDoc },
+    {
+      label: "Column summaries",
+      icon: <Stats />,
+      onClick: () => setModal("summaries"),
+      disabled: !hasDoc,
+    },
     {
       label: "Column explorer",
       title: "Interactive column profiling and filtering",
@@ -182,8 +173,8 @@ export function Toolbar({
       active: diagnosticsOpen,
       disabled: !hasDoc,
     },
-    { label: "Export…", icon: <Download />, onClick: onExport, disabled: !hasDoc },
-    { label: "File profiles…", icon: <Bookmark />, onClick: onProfiles },
+    { label: "Export…", icon: <Download />, onClick: () => setModal("export"), disabled: !hasDoc },
+    { label: "File profiles…", icon: <Bookmark />, onClick: () => setModal("profiles") },
   ];
 
   return (
