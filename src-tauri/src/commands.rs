@@ -1113,6 +1113,9 @@ pub async fn apply_outlier_action(
         doc.check_revision(expected_revision)?;
         let computed = outlier::action_changes(&doc, &spec, action)?;
         if !computed.remove_rows.is_empty() {
+            // Row removal shifts the absolute indices an active filter view
+            // refers to — drop it first, like every structural delete path.
+            doc.clear_filter();
             doc.delete_rows(computed.remove_rows)?;
         } else {
             doc.set_cells(computed.changes)?;

@@ -1585,6 +1585,10 @@ export const useStore = create<Store>((set, get) => {
             processed: 0,
             total: null,
             spec,
+            // The old report pairs with the PREVIOUS spec; if this scan
+            // fails or is cancelled, actions must not re-enable against a
+            // report whose rows the new spec never selected.
+            report: null,
             error: null,
           },
         }));
