@@ -24,6 +24,7 @@ use crate::error::{AppError, AppResult};
 use crate::job::JobRegistry;
 use crate::parse::{parse, ParseSettings, ParsedFile};
 use crate::reopen::{self, CurrentInterpretation};
+use crate::settings::{self, AppSettings, FileProfile, ProfileValidation};
 use crate::state::{AppState, PendingFiles, SharedDocument};
 use crate::{
     encoding, export, export_scope, filter as filter_mod, find as find_mod, save as save_mod, util,
@@ -367,6 +368,40 @@ pub fn apply_diagnostic_filter(
         let rows = diagnostics::issue_rows(doc, &issue_id)?;
         doc.set_filter(rows);
         Ok(doc.meta())
+    })
+}
+
+// ----- settings / profiles (F08) -------------------------------------------
+
+fn settings_dir(app: &tauri::AppHandle) -> AppResult<std::path::PathBuf> {
+    use tauri::Manager;
+    app.path()
+        .app_data_dir()
+        .map_err(|e| AppError::Other(format!("application-data directory unavailable: {e}")))
+}
+
+/// Load persisted profiles + preferences (defaults when missing; a corrupt
+/// file is preserved as a backup and defaults returned).
+#[tauri::command]
+pub fn get_settings(app: tauri::AppHandle) -> AppResult<AppSettings> {
+    Ok(settings::load_settings(&settings_dir(&app)?))
+}
+
+/// Persist profiles + preferences atomically.
+#[tauri::command]
+pub fn set_settings(settings: AppSettings, app: tauri::AppHandle) -> AppResult<()> {
+    settings::save_settings(&settings_dir(&app)?, &settings)
+}
+
+/// Check a document against a profile's column and data rules. Read-only.
+#[tauri::command]
+pub fn validate_profile(
+    doc_id: u64,
+    profile: FileProfile,
+    state: Db<'_>,
+) -> AppResult<ProfileValidation> {
+    read_doc(&state, doc_id, |doc| {
+        settings::validate_profile(doc, &profile)
     })
 }
 

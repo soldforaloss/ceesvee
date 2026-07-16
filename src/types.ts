@@ -284,6 +284,67 @@ export interface ScopeCounts {
   cols: number;
 }
 
+/** How a file profile decides whether it applies to a path (F08). */
+export type ProfileMatch =
+  | { type: "exactPath"; path: string }
+  | { type: "directory"; directory: string }
+  | { type: "extension"; extension: string }
+  | { type: "glob"; pattern: string };
+
+export type ExpectedType = "number" | "date" | "bool" | "text";
+
+export interface RegexRule {
+  column: string;
+  pattern: string;
+}
+
+export interface RangeRule {
+  column: string;
+  min: number | null;
+  max: number | null;
+}
+
+/** A reusable description of a recurring file format (F08). */
+export interface FileProfile {
+  id: string;
+  name: string;
+  matcher: ProfileMatch;
+  /** Auto-reparse matching (clean) documents with these settings. */
+  autoApply: boolean;
+  delimiter: string | null;
+  encoding: string | null;
+  hasHeaderRow: boolean | null;
+  defaultExport: ExportOptions | null;
+  expectedColumns: string[];
+  enforceOrder: boolean;
+  expectedTypes: [string, ExpectedType][];
+  requiredColumns: string[];
+  uniqueColumns: string[];
+  regexRules: RegexRule[];
+  rangeRules: RangeRule[];
+}
+
+/** The persisted settings document (versioned JSON in app-data). */
+export interface AppSettings {
+  version: number;
+  profiles: FileProfile[];
+}
+
+/** One violated profile rule. */
+export interface ProfileIssue {
+  kind: string;
+  column: string | null;
+  detail: string;
+  affectedCount: number;
+}
+
+/** Outcome of checking a document against a profile. */
+export interface ProfileValidation {
+  profileId: string;
+  ok: boolean;
+  issues: ProfileIssue[];
+}
+
 /** One cell (or header) that a target encoding cannot represent. */
 export interface EncodingIncompatibility {
   /** Data-row index; null for a header cell. */

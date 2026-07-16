@@ -4,9 +4,11 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import * as api from "../lib/tauri";
 import { applyReplace } from "../lib/replace";
+import { matchingProfiles, profileSettingsDiffer } from "../lib/profiles";
 import { currentOpenOptions, fingerprintKey } from "../lib/reopen";
 import { isLegacyEncoding } from "../lib/save";
 import type {
+  AppSettings,
   CellRect,
   ColumnSummary,
   DiagnosticsReport,
@@ -15,12 +17,14 @@ import type {
   ExportOptions,
   ExportScope,
   ExternalChange,
+  FileProfile,
   FilterGroup,
   FindMatch,
   FindOptions,
   JobFinished,
   JobProgress,
   OpenOptions,
+  ProfileValidation,
   ReparsePreview,
   SortKey,
   SplitOptions,
@@ -166,6 +170,32 @@ function awaitJob(jobId: number): Promise<JobFinished> {
   return new Promise((resolve) => jobWaiters.set(jobId, resolve));
 }
 
+// Trailing-debounce timer for persisting the grid scroll position.
+let scrollTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Everything document-specific about the UI (F08), snapshotted and restored
+ * on tab switches so nothing leaks between documents.
+ */
+export interface DocumentUiState {
+  find: FindState;
+  filter: FilterState;
+  columnWidths: Record<number, number>;
+  frozenColumnCount: number;
+  selection: CellRect | null;
+  selectedRows: number[];
+  selectedColumns: number[];
+  scrollPosition: { row: number; column: number };
+  activeExplorerColumn: number | null;
+  lastExportOptions?: ExportOptions;
+}
+
+/** A matched profile suggestion awaiting the user's decision. */
+export interface ProfileSuggestion {
+  docId: number;
+  profile: FileProfile;
+}
+
 const initialFilter: FilterState = {
   open: false,
   spec: {
@@ -193,8 +223,18 @@ interface Store {
   selectedCols: number[];
   find: FindState;
   filter: FilterState;
-  /** Per-document count of pinned leading columns, keyed by doc id. */
-  frozenCols: Record<number, number>;
+  /** Column widths of the ACTIVE document (saved/restored on tab switch). */
+  columnWidths: Record<number, number>;
+  /** Pinned leading columns of the ACTIVE document. */
+  frozenColumnCount: number;
+  /** Last grid scroll position of the ACTIVE document. */
+  scrollPosition: { row: number; column: number };
+  /** Column focused in the explorer panel (F05), per active document. */
+  activeExplorerColumn: number | null;
+  /** Export options last used for the ACTIVE document, seeding the dialog. */
+  lastExportOptions?: ExportOptions;
+  /** Saved UI state of every non-active document, keyed by document id. */
+  uiStates: Record<number, DocumentUiState>;
   /** Detected per-column type + summary for the active doc (null until loaded). */
   summaries: ColumnSummary[] | null;
   /** Which document `summaries` belong to (guards against cross-tab staleness). */
@@ -217,6 +257,12 @@ interface Store {
   fileJobs: Record<number, FileJobState>;
   /** A lossy save blocked by the encoding-compatibility scan, if any. */
   encodingIssues: EncodingIssuesPrompt | null;
+  /** Persisted profiles + preferences (null until loaded). */
+  settings: AppSettings | null;
+  /** A profile matching the active document, awaiting a decision. */
+  profileSuggestion: ProfileSuggestion | null;
+  /** Latest profile-validation result, for the profiles dialog. */
+  profileValidation: ProfileValidation | null;
 
   // lifecycle / chrome
   init: () => void;
@@ -225,6 +271,9 @@ interface Store {
   setActive: (id: number) => void;
   setSelection: (rect: CellRect | null, rows: number[], cols: number[]) => void;
   setFrozenCols: (count: number) => void;
+  setColumnWidth: (col: number, width: number) => void;
+  resetColumnWidths: () => void;
+  setScrollPosition: (row: number, column: number) => void;
   loadSummaries: () => void;
 
   // documents
@@ -261,6 +310,14 @@ interface Store {
     split: SplitOptions,
     writeManifest: boolean,
   ) => Promise<void>;
+
+  // file profiles (F08)
+  saveProfiles: (profiles: FileProfile[]) => Promise<void>;
+  /** Apply a profile via the previewed reopen flow (safe for dirty docs). */
+  applyProfile: (profile: FileProfile) => void;
+  dismissProfileSuggestion: () => void;
+  runProfileValidation: (profile: FileProfile) => Promise<void>;
+  clearProfileValidation: () => void;
 
   // editing
   setCell: (row: number, col: number, value: string) => Promise<void>;
@@ -328,6 +385,98 @@ export const useStore = create<Store>((set, get) => {
   const activeMeta = (): DocumentMeta | null => {
     const { tabs, activeId } = get();
     return tabs.find((t) => t.id === activeId) ?? null;
+  };
+
+  const defaultUiState = (): DocumentUiState => ({
+    find: initialFind,
+    filter: initialFilter,
+    columnWidths: {},
+    frozenColumnCount: 0,
+    selection: null,
+    selectedRows: [],
+    selectedColumns: [],
+    scrollPosition: { row: 0, column: 0 },
+    activeExplorerColumn: null,
+    lastExportOptions: undefined,
+  });
+
+  /**
+   * The state patch for making `id` the active document (F08): snapshot the
+   * current document's UI state, then restore the target's (or defaults).
+   * Nothing document-specific survives the switch outside its snapshot.
+   */
+  const switchPatch = (s: Store, id: number | null): Partial<Store> => {
+    const uiStates = { ...s.uiStates };
+    if (s.activeId != null && s.tabs.some((t) => t.id === s.activeId)) {
+      uiStates[s.activeId] = {
+        find: s.find,
+        filter: s.filter,
+        columnWidths: s.columnWidths,
+        frozenColumnCount: s.frozenColumnCount,
+        selection: s.selectionRect,
+        selectedRows: s.selectedRows,
+        selectedColumns: s.selectedCols,
+        scrollPosition: s.scrollPosition,
+        activeExplorerColumn: s.activeExplorerColumn,
+        lastExportOptions: s.lastExportOptions,
+      };
+    }
+    const next = (id != null ? uiStates[id] : undefined) ?? defaultUiState();
+    return {
+      uiStates,
+      activeId: id,
+      find: next.find,
+      filter: next.filter,
+      columnWidths: next.columnWidths,
+      frozenColumnCount: next.frozenColumnCount,
+      selectionRect: next.selection,
+      selectedRows: next.selectedRows,
+      selectedCols: next.selectedColumns,
+      selection: null,
+      scrollPosition: next.scrollPosition,
+      activeExplorerColumn: next.activeExplorerColumn,
+      lastExportOptions: next.lastExportOptions,
+      summaries: null,
+      summariesDocId: null,
+      jumpTarget: null,
+      reopen: initialReopen,
+      profileSuggestion:
+        s.profileSuggestion && s.profileSuggestion.docId === id ? s.profileSuggestion : null,
+    };
+  };
+
+  /** Surface (or auto-apply) a matching profile after a document opens. */
+  const suggestProfileFor = async (meta: DocumentMeta) => {
+    const profiles = get().settings?.profiles ?? [];
+    if (!meta.path) return;
+    const matches = matchingProfiles(profiles, meta.path);
+    if (matches.length === 0) return;
+    const profile = matches[0];
+
+    const current = get().tabs.find((t) => t.id === meta.id);
+    if (!current) return;
+    if (!profileSettingsDiffer(profile, current)) return; // already interpreted this way
+
+    // Automatic application requires the profile's explicit opt-in AND a
+    // clean document — a dirty document is never silently reparsed.
+    if (profile.autoApply && !current.dirty) {
+      try {
+        const updated = await api.applyReparse(
+          meta.id,
+          {
+            delimiter: profile.delimiter ?? undefined,
+            encoding: profile.encoding ?? undefined,
+            hasHeaderRow: profile.hasHeaderRow ?? undefined,
+          },
+          current.revision,
+        );
+        reloadDoc(updated);
+        return;
+      } catch {
+        // Fall through to a manual suggestion on any failure.
+      }
+    }
+    set({ profileSuggestion: { docId: meta.id, profile } });
   };
 
   /** Replace a tab's metadata (dirty/undo flags) without reloading the grid. */
@@ -499,7 +648,12 @@ export const useStore = create<Store>((set, get) => {
     selectedCols: [],
     find: initialFind,
     filter: initialFilter,
-    frozenCols: {},
+    columnWidths: {},
+    frozenColumnCount: 0,
+    scrollPosition: { row: 0, column: 0 },
+    activeExplorerColumn: null,
+    lastExportOptions: undefined,
+    uiStates: {},
     summaries: null,
     summariesDocId: null,
     diagnosticsOpen: false,
@@ -511,6 +665,9 @@ export const useStore = create<Store>((set, get) => {
     quitPromptOpen: false,
     fileJobs: {},
     encodingIssues: null,
+    settings: null,
+    profileSuggestion: null,
+    profileValidation: null,
 
     init: () => {
       const theme = loadTheme();
@@ -519,6 +676,11 @@ export const useStore = create<Store>((set, get) => {
       window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
         if (get().theme === "system") applyThemeClass("system");
       });
+      // Load persisted profiles (corrupt files fall back to defaults in Rust).
+      void api
+        .getSettings()
+        .then((settings) => set({ settings }))
+        .catch(() => set({ settings: { version: 1, profiles: [] } }));
     },
 
     setTheme: (theme) => {
@@ -533,19 +695,7 @@ export const useStore = create<Store>((set, get) => {
 
     setError: (error) => set({ error }),
 
-    setActive: (id) =>
-      set({
-        activeId: id,
-        selection: null,
-        selectionRect: null,
-        selectedRows: [],
-        selectedCols: [],
-        summaries: null,
-        summariesDocId: null,
-        jumpTarget: null,
-        // The reopen dialog previews the active document only.
-        reopen: initialReopen,
-      }),
+    setActive: (id) => set((s) => switchPatch(s, id)),
 
     setSelection: (rect, rows, cols) => {
       set({ selectionRect: rect, selectedRows: rows, selectedCols: cols });
@@ -568,12 +718,23 @@ export const useStore = create<Store>((set, get) => {
       }, 120);
     },
 
-    setFrozenCols: (count) =>
-      set((s) => {
-        const id = s.activeId;
-        if (id == null) return {};
-        return { frozenCols: { ...s.frozenCols, [id]: Math.max(0, count) } };
-      }),
+    setFrozenCols: (count) => set({ frozenColumnCount: Math.max(0, count) }),
+
+    setColumnWidth: (col, width) =>
+      set((s) => ({ columnWidths: { ...s.columnWidths, [col]: width } })),
+
+    resetColumnWidths: () => set({ columnWidths: {} }),
+
+    setScrollPosition: (row, column) => {
+      // Trailing debounce: visible-region events fire on every scroll frame.
+      if (scrollTimer !== null) clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(() => {
+        const current = get().scrollPosition;
+        if (current.row !== row || current.column !== column) {
+          set({ scrollPosition: { row, column } });
+        }
+      }, 250);
+    },
 
     loadSummaries: () => {
       const id = get().activeId;
@@ -602,14 +763,19 @@ export const useStore = create<Store>((set, get) => {
     openPath: async (path) => {
       const existing = get().tabs.find((t) => t.path === path);
       if (existing) {
-        set({ activeId: existing.id });
+        set((s) => switchPatch(s, existing.id));
         return;
       }
       set({ busy: true, error: null });
       try {
         const meta = await api.openFile(path);
-        set((s) => ({ tabs: [...s.tabs, meta], activeId: meta.id, busy: false }));
+        set((s) => ({
+          ...switchPatch(s, meta.id),
+          tabs: [...s.tabs, meta],
+          busy: false,
+        }));
         pushRecent(path);
+        void suggestProfileFor(meta);
       } catch (e) {
         set({ error: String(e), busy: false });
       }
@@ -618,7 +784,7 @@ export const useStore = create<Store>((set, get) => {
     newDoc: async () => {
       try {
         const meta = await api.newDocument(50, 4);
-        set((s) => ({ tabs: [...s.tabs, meta], activeId: meta.id }));
+        set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] }));
       } catch (e) {
         set({ error: String(e) });
       }
@@ -629,13 +795,16 @@ export const useStore = create<Store>((set, get) => {
       set((s) => {
         const tabs = s.tabs.filter((t) => t.id !== id);
         const closingActive = s.activeId === id;
-        const activeId = closingActive
+        const nextActive = closingActive
           ? tabs.length
             ? tabs[tabs.length - 1].id
             : null
           : s.activeId;
-        const frozenCols = { ...s.frozenCols };
-        delete frozenCols[id];
+        // Switch first (snapshots the outgoing active state), then drop every
+        // trace of the closed document's transient state.
+        const patch = closingActive ? switchPatch({ ...s, tabs } as Store, nextActive) : {};
+        const uiStates = { ...(patch.uiStates ?? s.uiStates) };
+        delete uiStates[id];
         const diagnostics = { ...s.diagnostics };
         delete diagnostics[id];
         const ignoredFingerprints = { ...s.ignoredFingerprints };
@@ -643,12 +812,14 @@ export const useStore = create<Store>((set, get) => {
         // Only invalidate the grid cache when the active document actually
         // changed; closing a background tab must not refetch the active grid.
         return {
+          ...patch,
           tabs,
-          activeId,
-          frozenCols,
+          activeId: nextActive,
+          uiStates,
           diagnostics,
           ignoredFingerprints,
           externalPrompt: s.externalPrompt?.docId === id ? null : s.externalPrompt,
+          profileSuggestion: s.profileSuggestion?.docId === id ? null : s.profileSuggestion,
           dataVersion: closingActive ? s.dataVersion + 1 : s.dataVersion,
         };
       });
@@ -666,35 +837,25 @@ export const useStore = create<Store>((set, get) => {
     deleteRows: (indices) => mutate((id) => api.deleteRows(id, indices)),
     moveRow: (from, to) => mutate((id) => api.moveRow(id, from, to)),
     insertColumn: (at, name) => {
-      const id = get().activeId;
-      if (id != null) {
-        // Column identity shifts: invalidate summaries and keep the frozen
-        // boundary on the same logical columns (shift it right if we inserted
-        // within the frozen region).
-        set((s) => {
-          const frozen = s.frozenCols[id] ?? 0;
-          return {
-            summaries: null,
-            summariesDocId: null,
-            frozenCols: { ...s.frozenCols, [id]: at < frozen ? frozen + 1 : frozen },
-          };
-        });
-      }
+      // Column identity shifts: invalidate summaries and keep the frozen
+      // boundary on the same logical columns (shift it right if we inserted
+      // within the frozen region).
+      set((s) => ({
+        summaries: null,
+        summariesDocId: null,
+        frozenColumnCount: at < s.frozenColumnCount ? s.frozenColumnCount + 1 : s.frozenColumnCount,
+      }));
       return mutate((docId) => api.insertColumn(docId, at, name));
     },
     deleteColumns: (indices) => {
-      const id = get().activeId;
-      if (id != null) {
-        set((s) => {
-          const frozen = s.frozenCols[id] ?? 0;
-          const removedBelow = indices.filter((c) => c < frozen).length;
-          return {
-            summaries: null,
-            summariesDocId: null,
-            frozenCols: { ...s.frozenCols, [id]: Math.max(0, frozen - removedBelow) },
-          };
-        });
-      }
+      set((s) => {
+        const removedBelow = indices.filter((c) => c < s.frozenColumnCount).length;
+        return {
+          summaries: null,
+          summariesDocId: null,
+          frozenColumnCount: Math.max(0, s.frozenColumnCount - removedBelow),
+        };
+      });
       return mutate((docId) => api.deleteColumns(docId, indices));
     },
     renameColumn: (col, name) => mutate((id) => api.renameColumn(id, col, name)),
@@ -1173,8 +1334,51 @@ export const useStore = create<Store>((set, get) => {
         }
       }
 
+      // Remember the options per document, to seed the next export dialog.
+      set({ lastExportOptions: options });
       await runExportJob(meta.id, chosen, options, scope, split, writeManifest);
     },
+
+    // ----- file profiles (F08) -------------------------------------------------
+
+    saveProfiles: async (profiles) => {
+      const settings: AppSettings = {
+        ...(get().settings ?? { version: 1, profiles: [] }),
+        profiles,
+      };
+      set({ settings });
+      try {
+        await api.setSettings(settings);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    applyProfile: (profile) => {
+      // Manual application always goes through the previewed reopen flow, so
+      // a dirty document gets its Save/Discard/Cancel confirmation (F02).
+      set({ profileSuggestion: null });
+      get().openReopenDialog({
+        delimiter: profile.delimiter ?? undefined,
+        encoding: profile.encoding ?? undefined,
+        hasHeaderRow: profile.hasHeaderRow ?? undefined,
+      });
+    },
+
+    dismissProfileSuggestion: () => set({ profileSuggestion: null }),
+
+    runProfileValidation: async (profile) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      try {
+        const validation = await api.validateProfile(meta.id, profile);
+        set({ profileValidation: validation });
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    clearProfileValidation: () => set({ profileValidation: null }),
   };
 });
 

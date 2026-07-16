@@ -4,6 +4,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AppSettings,
   CellRect,
   ColumnSummary,
   DiagnosticsReport,
@@ -13,10 +14,12 @@ import type {
   ExportScope,
   ExternalChange,
   FileFingerprint,
+  FileProfile,
   FilterGroup,
   FindMatch,
   FindOptions,
   OpenOptions,
+  ProfileValidation,
   ReparsePreview,
   ReplaceResult,
   RowsResponse,
@@ -163,6 +166,16 @@ export const startSave = (
   options: ExportOptions,
   expectedRevision: number,
 ) => invoke<number>("start_save", { docId, path, options, expectedRevision });
+
+/** Load persisted profiles + preferences (safe defaults on corruption). */
+export const getSettings = () => invoke<AppSettings>("get_settings");
+
+/** Persist profiles + preferences atomically. */
+export const setSettings = (settings: AppSettings) => invoke<void>("set_settings", { settings });
+
+/** Check a document against a profile's column and data rules (read-only). */
+export const validateProfile = (docId: number, profile: FileProfile) =>
+  invoke<ProfileValidation>("validate_profile", { docId, profile });
 
 /**
  * Start a scoped, optionally split, atomic streaming export (never touches

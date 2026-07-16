@@ -18,18 +18,23 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
   const selectionRect = useStore((s) => s.selectionRect);
   const selectedRows = useStore((s) => s.selectedRows);
   const selectedCols = useStore((s) => s.selectedCols);
+  const lastExportOptions = useStore((s) => s.lastExportOptions);
 
-  const [opts, setOpts] = useState<ExportOptions>(() => ({
-    delimiter: meta?.delimiter ?? ",",
-    encoding: ENCODING_OPTIONS.some((o) => o.value === meta?.encoding)
-      ? (meta?.encoding ?? "UTF-8")
-      : "UTF-8",
-    quoteStyle: "minimal",
-    lineEnding: meta?.lineEnding ?? "lf",
-    bom: meta?.hadBom ?? false,
-    includeHeaders: meta?.hasHeaderRow ?? true,
-    backup: "none",
-  }));
+  const [opts, setOpts] = useState<ExportOptions>(
+    () =>
+      // Per-document memory of the last export settings (F08).
+      lastExportOptions ?? {
+        delimiter: meta?.delimiter ?? ",",
+        encoding: ENCODING_OPTIONS.some((o) => o.value === meta?.encoding)
+          ? (meta?.encoding ?? "UTF-8")
+          : "UTF-8",
+        quoteStyle: "minimal",
+        lineEnding: meta?.lineEnding ?? "lf",
+        bom: meta?.hadBom ?? false,
+        includeHeaders: meta?.hasHeaderRow ?? true,
+        backup: "none",
+      },
+  );
 
   const choices = useMemo(
     () => scopeChoices(filtered, selectionRect, selectedRows, selectedCols),

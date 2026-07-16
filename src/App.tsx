@@ -12,6 +12,8 @@ import { FilterDialog } from "./components/FilterDialog";
 import { FindBar } from "./components/FindBar";
 import { Grid } from "./components/Grid";
 import { Close } from "./components/Icons";
+import { ProfilesDialog } from "./components/ProfilesDialog";
+import { ProfileSuggestionBar } from "./components/ProfileSuggestionBar";
 import { QuitDialog } from "./components/QuitDialog";
 import { ReopenDialog } from "./components/ReopenDialog";
 import { SortDialog } from "./components/SortDialog";
@@ -36,6 +38,7 @@ export default function App() {
   const [exportOpen, setExportOpen] = useState(false);
   const [summariesOpen, setSummariesOpen] = useState(false);
   const [filterOpen, setFilterOpen] = useState(false);
+  const [profilesOpen, setProfilesOpen] = useState(false);
   const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const [dragOver, setDragOver] = useState(false);
@@ -214,9 +217,11 @@ export default function App() {
         onExport={() => setExportOpen(true)}
         onSummaries={() => setSummariesOpen(true)}
         onFilter={() => setFilterOpen(true)}
+        onProfiles={() => setProfilesOpen(true)}
       />
       <Tabs />
       <SourceBar />
+      <ProfileSuggestionBar />
       <FindBar />
 
       <main className="relative flex min-h-0 flex-1">
@@ -239,6 +244,7 @@ export default function App() {
       {exportOpen && <ExportDialog onClose={() => setExportOpen(false)} />}
       {summariesOpen && <SummaryPanel onClose={() => setSummariesOpen(false)} />}
       {filterOpen && <FilterDialog onClose={() => setFilterOpen(false)} />}
+      {profilesOpen && <ProfilesDialog onClose={() => setProfilesOpen(false)} />}
       <ReopenDialog />
       <ExternalChangeDialog />
       <QuitDialog />

@@ -287,7 +287,7 @@ pub enum BackupPolicy {
 }
 
 /// Options controlling how a document is serialized on save.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportOptions {
     /// One-character delimiter string.

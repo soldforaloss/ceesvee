@@ -25,7 +25,7 @@ export function ColumnMenu({ state, headers, onClose }: ColumnMenuProps) {
   const insertColumn = useStore((s) => s.insertColumn);
   const deleteColumns = useStore((s) => s.deleteColumns);
   const setFrozenCols = useStore((s) => s.setFrozenCols);
-  const frozenCols = useStore((s) => (s.activeId != null ? (s.frozenCols[s.activeId] ?? 0) : 0));
+  const frozenCols = useStore((s) => s.frozenColumnCount);
 
   useEffect(() => {
     const onDown = (e: MouseEvent) => {
