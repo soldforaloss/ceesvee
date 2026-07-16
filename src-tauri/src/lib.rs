@@ -2,6 +2,7 @@
 //! exposed to the web front end through a small Tauri command surface.
 
 mod analyze;
+mod append;
 mod archive;
 mod clipboard;
 mod cluster;
@@ -10,6 +11,7 @@ mod compare;
 mod crossval;
 mod dedup;
 mod delimiter;
+mod derived;
 mod diagnostics;
 mod document;
 mod dto;
@@ -101,6 +103,7 @@ pub fn run() {
         .manage(crate::semantic::SemanticCache::default())
         .manage(crate::crossval::CrossValCache::default())
         .manage(crate::outlier::OutlierCache::default())
+        .manage(crate::append::AppendCache::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -193,6 +196,9 @@ pub fn run() {
             commands::apply_outlier_filter,
             commands::preview_outlier_action,
             commands::apply_outlier_action,
+            commands::preview_append,
+            commands::start_append,
+            commands::get_append_report,
             commands::start_compare,
             commands::get_compare_info,
             commands::get_compare_results,

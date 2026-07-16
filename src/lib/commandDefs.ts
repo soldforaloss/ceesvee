@@ -298,6 +298,14 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("semantic"),
     },
     {
+      id: "data.append",
+      title: "Append files…",
+      keywords: ["concatenate", "combine", "merge files", "stack", "union"],
+      category: "Data",
+      unavailableReason: () => null,
+      run: () => openModal("append"),
+    },
+    {
       id: "data.outlier",
       title: "Find outliers…",
       keywords: ["anomaly", "iqr", "mad", "z-score", "suspicious", "statistics"],

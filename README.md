@@ -88,6 +88,11 @@ and faithful on large, real-world delimited files.**
   rare-value or pattern checks, whole-column or group-wise, with
   reasons, group statistics, filtering, and previewed one-undo
   corrections (blank, median, cap, remove).
+- **Append files** — concatenate open tabs, files, or a folder into a
+  new document, aligning columns by name / case-insensitive name /
+  position / manual mapping, with union or intersection schemas,
+  provenance columns, and per-input reports. Inputs stay untouched;
+  huge outputs open indexed automatically.
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 

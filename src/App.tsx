@@ -3,6 +3,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useState } from "react";
 
+import { AppendDialog } from "./components/AppendDialog";
 import { ArchiveEntryDialog } from "./components/ArchiveEntryDialog";
 import { CellEditorDialog } from "./components/CellEditorDialog";
 import { ClusterDialog } from "./components/ClusterDialog";
@@ -271,6 +272,7 @@ export default function App() {
       {activeModal === "crossval" && <CrossValDialog onClose={() => setModal(null)} />}
       {activeModal === "repair" && <RepairDialog onClose={() => setModal(null)} />}
       {activeModal === "outlier" && <OutlierDialog onClose={() => setModal(null)} />}
+      {activeModal === "append" && <AppendDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       <CommandPalette />
       <CellEditorDialog />

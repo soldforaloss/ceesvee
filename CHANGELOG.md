@@ -8,6 +8,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Multi-file append** (palette → "Append files…"): combine rows from open
+  tabs, picked files, or a whole folder of delimited files into a NEW
+  document — inputs are never modified. Columns align by exact name,
+  case-insensitive name, position, or an explicit manual mapping; the
+  output schema is the union, intersection, or the first input's columns.
+  Optional source-file and source-row provenance columns (collision-safe
+  names), duplicate-header rejection or tolerance, and stop-or-continue on
+  failing inputs with a per-input outcome report. The preview shows the
+  output schema, per-input mapped/missing columns, projected rows, and the
+  projected backing; huge outputs automatically spill to disk and open as
+  an indexed read-only document that cleans up after itself.
 - **Outlier and anomaly finder** (palette → "Find outliers…"): flag
   suspicious values as statistical CANDIDATES, never verdicts. Numeric
   methods — IQR fences, MAD modified z-score (both robust, offered first),

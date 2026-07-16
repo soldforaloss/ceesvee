@@ -82,7 +82,8 @@ export type ModalName =
   | "semantic"
   | "crossval"
   | "repair"
-  | "outlier";
+  | "outlier"
+  | "append";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
@@ -370,6 +371,17 @@ const initialCrossVal: CrossValState = {
   error: null,
 };
 
+/** A running derived-document job (F20–F23: append/join/group/pivot). */
+export interface DeriveState {
+  jobId: number;
+  /** The id the NEW document will register under. */
+  docId: number;
+  kind: "append" | "join" | "groupBy" | "reshape";
+  processed: number;
+  total: number | null;
+  message: string | null;
+}
+
 /** Outlier-finder state (F30), for the ACTIVE document. */
 export interface OutlierState {
   scanJobId: number | null;
@@ -525,6 +537,10 @@ interface Store {
   crossval: CrossValState;
   /** Outlier-finder state (F30). */
   outlier: OutlierState;
+  /** Running derived-document job (F20–F23), if any. */
+  derive: DeriveState | null;
+  /** Error from the last derive job, for the dialog that started it. */
+  deriveError: string | null;
   /** ZIP entry chooser (F17). */
   archivePick: ArchivePickState | null;
   /** Suspicious-ratio extraction awaiting confirmation (F17). */
@@ -625,6 +641,11 @@ interface Store {
   loadCachedCrossvalReport: () => Promise<void>;
   /** Filter to rows violating one rule (index) or any rule (null). */
   applyCrossvalFilter: (rule: number | null) => Promise<boolean>;
+
+  // derived documents (F20–F23)
+  /** Track a started derive job so completion adds the new tab. */
+  trackDerive: (jobId: number, docId: number, kind: DeriveState["kind"]) => void;
+  cancelDerive: () => Promise<void>;
 
   // outlier finder (F30)
   startOutlierScan: (spec: OutlierSpec) => Promise<void>;
@@ -1122,6 +1143,8 @@ export const useStore = create<Store>((set, get) => {
     semantic: initialSemantic,
     crossval: initialCrossVal,
     outlier: initialOutlier,
+    derive: null,
+    deriveError: null,
     archivePick: null,
     archiveLargeConfirm: null,
     externalPrompt: null,
@@ -1586,6 +1609,21 @@ export const useStore = create<Store>((set, get) => {
         set((s) => ({ crossval: { ...s.crossval, error: String(e) } }));
         return false;
       }
+    },
+
+    // ----- derived documents (F20–F23) -------------------------------------------
+
+    trackDerive: (jobId, docId, kind) => {
+      set({
+        derive: { jobId, docId, kind, processed: 0, total: null, message: null },
+        deriveError: null,
+      });
+      consumeEarlyFinish(jobId);
+    },
+
+    cancelDerive: async () => {
+      const derive = get().derive;
+      if (derive) await api.cancelJob(derive.jobId).catch(() => undefined);
     },
 
     // ----- outlier finder (F30) --------------------------------------------------
@@ -2058,6 +2096,20 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
+      if (progress.kind === "derive") {
+        const derive = get().derive;
+        if (derive?.jobId !== progress.jobId) return;
+        set({
+          derive: {
+            ...derive,
+            processed: progress.processed,
+            total: progress.total,
+            message: progress.message ?? derive.message,
+          },
+        });
+        return;
+      }
+
       if (progress.kind === "cluster") {
         if (get().cluster.scanJobId !== progress.jobId) return;
         set((s) => ({
@@ -2232,6 +2284,26 @@ export const useStore = create<Store>((set, get) => {
               error: finished.status === "failed" ? (finished.error ?? "scan failed") : null,
             },
           }));
+        }
+        return;
+      }
+
+      if (finished.kind === "derive") {
+        const derive = get().derive;
+        if (derive?.jobId !== finished.jobId) return;
+        set({ derive: null });
+        if (finished.status !== "done") {
+          if (finished.status === "failed") {
+            set({ deriveError: finished.error ?? "the operation failed" });
+          }
+          return;
+        }
+        try {
+          // The job registered the NEW document; add its tab and focus it.
+          const meta = await api.getMeta(derive.docId);
+          set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] }));
+        } catch (e) {
+          set({ deriveError: String(e) });
         }
         return;
       }

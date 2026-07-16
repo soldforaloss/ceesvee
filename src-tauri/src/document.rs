@@ -552,6 +552,21 @@ impl Document {
         self.archive_guard = guard;
     }
 
+    /// Attach the temp-directory guard backing a DERIVED document (F20–F23:
+    /// append/join/group/pivot outputs spilled to disk). The guard's Drop
+    /// deletes the directory when the document closes; a Save As clears it
+    /// through [`Document::mark_saved`], exactly like archive extractions.
+    pub fn set_derived_guard(&mut self, guard: IndexDirGuard) {
+        self.archive_guard = Some(guard);
+    }
+
+    /// Mark a freshly built DERIVED document as unsaved-with-content: it has
+    /// no undo history, but closing it must still warn, and Save routes to
+    /// Save As. The first successful save clears this via `mark_saved`.
+    pub fn mark_derived_unsaved(&mut self) {
+        self.saved_marker = usize::MAX;
+    }
+
     /// Current document revision (see the field docs for what bumps it).
     pub fn revision(&self) -> u64 {
         self.revision

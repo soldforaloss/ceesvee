@@ -268,6 +268,61 @@ export interface SemanticActionPreview {
   newColumn: string | null;
 }
 
+/** One append input (F20): an open tab or a file on disk. */
+export type AppendInput = { type: "openDoc"; docId: number } | { type: "file"; path: string };
+
+/** How input columns map onto the output schema (F20). */
+export type AlignMode =
+  | { type: "exactName" }
+  | { type: "caseInsensitiveName" }
+  | { type: "position" }
+  | { type: "manual"; outputHeaders: string[]; perInput: (number | null)[][] };
+
+/** Which columns the output schema contains (F20). */
+export type SchemaMode = "union" | "intersection" | "primary";
+
+export interface AppendOptions {
+  align: AlignMode;
+  schema: SchemaMode;
+  addSourceFile?: boolean;
+  addSourceRow?: boolean;
+  allowDuplicateHeaders?: boolean;
+  continueOnError?: boolean;
+}
+
+export interface InputPreview {
+  name: string;
+  columns: number;
+  mapped: number;
+  /** Output columns this input cannot fill (blank in its rows). */
+  missing: string[];
+  warning: string | null;
+}
+
+/** Preview of an append, computed without creating anything (F20). */
+export interface AppendPreview {
+  outputColumns: string[];
+  projectedRows: number;
+  rowsEstimated: boolean;
+  /** Whether the output will likely open indexed (read-only). */
+  projectedIndexed: boolean;
+  perInput: InputPreview[];
+}
+
+export interface InputOutcome {
+  name: string;
+  rows: number;
+  error: string | null;
+}
+
+/** Per-input outcome report of a finished append (F20). */
+export interface AppendReport {
+  outputColumns: string[];
+  totalRows: number;
+  indexed: boolean;
+  inputs: InputOutcome[];
+}
+
 /** Outlier detection method (F30) — a closed, validated set. */
 export type OutlierMethod =
   | { type: "iqr"; k: number }
