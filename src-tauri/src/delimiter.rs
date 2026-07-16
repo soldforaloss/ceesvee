@@ -6,7 +6,7 @@
 //! non-zero and the most consistent across lines.
 
 /// Delimiters we try to detect, in priority order for tie-breaks.
-pub const CANDIDATES: [u8; 4] = [b',', b'\t', b';', b'|'];
+pub const CANDIDATES: [u8; 4] = *b",\t;|";
 
 const MAX_SAMPLE_LINES: usize = 50;
 
