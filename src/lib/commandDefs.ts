@@ -281,6 +281,14 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("semantic"),
     },
     {
+      id: "data.crossval",
+      title: "Validate across columns…",
+      keywords: ["rules", "cross column", "relationship", "consistency", "sum", "conditional"],
+      category: "Data",
+      unavailableReason: needsDoc,
+      run: () => openModal("crossval"),
+    },
+    {
       id: "data.compare",
       title: "Compare…",
       keywords: ["diff", "changes", "versus"],

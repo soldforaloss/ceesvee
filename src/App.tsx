@@ -10,6 +10,7 @@ import { ColumnExplorerPanel } from "./components/ColumnExplorerPanel";
 import { CommandPalette } from "./components/CommandPalette";
 import { CompareDialog } from "./components/CompareDialog";
 import { CopyAsDialog } from "./components/CopyAsDialog";
+import { CrossValDialog } from "./components/CrossValDialog";
 import { PasteSpecialDialog } from "./components/PasteSpecialDialog";
 import { DedupDialog } from "./components/DedupDialog";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
@@ -265,6 +266,7 @@ export default function App() {
       {activeModal === "copyAs" && <CopyAsDialog onClose={() => setModal(null)} />}
       {activeModal === "cluster" && <ClusterDialog onClose={() => setModal(null)} />}
       {activeModal === "semantic" && <SemanticDialog onClose={() => setModal(null)} />}
+      {activeModal === "crossval" && <CrossValDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       <CommandPalette />
       <CellEditorDialog />

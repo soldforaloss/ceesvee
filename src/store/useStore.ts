@@ -36,6 +36,8 @@ import type {
   OpenOptions,
   ProfileScope,
   ProfileValidation,
+  CrossRule,
+  CrossValReport,
   ReparsePreview,
   SemanticAction,
   SemanticReport,
@@ -75,7 +77,8 @@ export type ModalName =
   | "copyAs"
   | "pasteSpecial"
   | "cluster"
-  | "semantic";
+  | "semantic"
+  | "crossval";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
@@ -339,6 +342,26 @@ const initialSemantic: SemanticState = {
   error: null,
 };
 
+/** Cross-column validation state (F27), for the ACTIVE document. */
+export interface CrossValState {
+  scanJobId: number | null;
+  processed: number;
+  total: number | null;
+  /** The rules the report was computed with (needed to re-derive filters). */
+  rules: CrossRule[] | null;
+  report: CrossValReport | null;
+  error: string | null;
+}
+
+const initialCrossVal: CrossValState = {
+  scanJobId: null,
+  processed: 0,
+  total: null,
+  rules: null,
+  report: null,
+  error: null,
+};
+
 /** ZIP entry chooser state (F17). */
 export interface ArchivePickState {
   path: string;
@@ -470,6 +493,8 @@ interface Store {
   cluster: ClusterState;
   /** Semantic-type detection state (F26). */
   semantic: SemanticState;
+  /** Cross-column validation state (F27). */
+  crossval: CrossValState;
   /** ZIP entry chooser (F17). */
   archivePick: ArchivePickState | null;
   /** Suspicious-ratio extraction awaiting confirmation (F17). */
@@ -559,6 +584,15 @@ interface Store {
     action: SemanticAction,
     expectedRevision: number,
   ) => Promise<boolean>;
+
+  // cross-column validation (F27)
+  startCrossvalScan: (rules: CrossRule[]) => Promise<void>;
+  cancelCrossvalScan: () => Promise<void>;
+  clearCrossvalReport: () => void;
+  /** Re-adopt the backend-cached report (used when the dialog opens). */
+  loadCachedCrossvalReport: () => Promise<void>;
+  /** Filter to rows violating one rule (index) or any rule (null). */
+  applyCrossvalFilter: (rule: number | null) => Promise<boolean>;
 
   // compressed files (F17)
   /** Start extracting an archive (gzip member or chosen ZIP entry). */
@@ -792,8 +826,9 @@ export const useStore = create<Store>((set, get) => {
         error: null,
       },
       dedup: initialDedup,
-      // Per-doc report; the dialog re-adopts the backend cache on open.
+      // Per-doc reports; the dialogs re-adopt the backend cache on open.
       semantic: initialSemantic,
+      crossval: initialCrossVal,
     };
   };
 
@@ -1041,6 +1076,7 @@ export const useStore = create<Store>((set, get) => {
     indexing: null,
     cluster: initialCluster,
     semantic: initialSemantic,
+    crossval: initialCrossVal,
     archivePick: null,
     archiveLargeConfirm: null,
     externalPrompt: null,
@@ -1444,6 +1480,60 @@ export const useStore = create<Store>((set, get) => {
       }
     },
 
+    // ----- cross-column validation (F27) ---------------------------------------
+
+    startCrossvalScan: async (rules) => {
+      const meta = activeMeta();
+      if (!meta || get().crossval.scanJobId != null) return;
+      try {
+        const jobId = await api.startCrossvalScan(meta.id, rules, meta.revision);
+        set((s) => ({
+          crossval: {
+            ...s.crossval,
+            scanJobId: jobId,
+            processed: 0,
+            total: null,
+            rules,
+            error: null,
+          },
+        }));
+        consumeEarlyFinish(jobId);
+      } catch (e) {
+        set((s) => ({ crossval: { ...s.crossval, error: String(e) } }));
+      }
+    },
+
+    cancelCrossvalScan: async () => {
+      const jobId = get().crossval.scanJobId;
+      if (jobId != null) await api.cancelJob(jobId).catch(() => undefined);
+    },
+
+    clearCrossvalReport: () => set({ crossval: initialCrossVal }),
+
+    loadCachedCrossvalReport: async () => {
+      const meta = activeMeta();
+      if (!meta || get().crossval.report !== null || get().crossval.scanJobId != null) return;
+      const cached = await api.getCrossvalReport(meta.id).catch(() => null);
+      if (cached) {
+        const [rules, report] = cached;
+        set((s) => ({ crossval: { ...s.crossval, rules, report } }));
+      }
+    },
+
+    applyCrossvalFilter: async (rule) => {
+      const meta = activeMeta();
+      const { rules, report } = get().crossval;
+      if (!meta || !rules || !report) return false;
+      try {
+        const updated = await api.applyCrossvalFilter(meta.id, rules, rule, report.revision);
+        reloadDoc(updated);
+        return true;
+      } catch (e) {
+        set((s) => ({ crossval: { ...s.crossval, error: String(e) } }));
+        return false;
+      }
+    },
+
     // ----- compressed files (F17) --------------------------------------------
 
     startArchiveExtract: async (path, entry, allowLarge) => {
@@ -1821,6 +1911,14 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
+      if (progress.kind === "crossval") {
+        if (get().crossval.scanJobId !== progress.jobId) return;
+        set((s) => ({
+          crossval: { ...s.crossval, processed: progress.processed, total: progress.total },
+        }));
+        return;
+      }
+
       if (progress.kind === "cluster") {
         if (get().cluster.scanJobId !== progress.jobId) return;
         set((s) => ({
@@ -1978,6 +2076,33 @@ export const useStore = create<Store>((set, get) => {
           set((s) => ({
             semantic: {
               ...s.semantic,
+              scanJobId: null,
+              error: finished.status === "failed" ? (finished.error ?? "scan failed") : null,
+            },
+          }));
+        }
+        return;
+      }
+
+      if (finished.kind === "crossval") {
+        if (get().crossval.scanJobId !== finished.jobId) return;
+        if (finished.status === "done") {
+          const cached = finished.docId
+            ? await api.getCrossvalReport(finished.docId).catch(() => null)
+            : null;
+          set((s) => ({
+            crossval: {
+              ...s.crossval,
+              scanJobId: null,
+              rules: cached ? cached[0] : s.crossval.rules,
+              report: cached ? cached[1] : null,
+              error: null,
+            },
+          }));
+        } else {
+          set((s) => ({
+            crossval: {
+              ...s.crossval,
               scanJobId: null,
               error: finished.status === "failed" ? (finished.error ?? "scan failed") : null,
             },

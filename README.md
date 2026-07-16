@@ -76,6 +76,10 @@ and faithful on large, real-world delimited files.**
   counts, filter to valid or invalid rows, and run previewed, undoable
   quick actions (normalize, percent→decimal, extract URL host / email
   domain). Overrides persist in file profiles.
+- **Cross-column validation** — relational rules between columns (typed
+  comparisons, date order, conditional required, sum equality with
+  tolerance, allowed combinations, …) with violation samples, jump-to-row,
+  filter-to-violations, and JSON reports. Rules persist in file profiles.
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 

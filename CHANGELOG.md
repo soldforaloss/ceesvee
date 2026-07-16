@@ -8,6 +8,18 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Cross-column validation** (palette → "Validate across columns…"):
+  relational rules BETWEEN columns from a closed, validated set — equals /
+  differs, typed numeric comparison, typed date order, conditional required
+  (with explicit blank-condition handling), exactly-one / at-least-one /
+  mutually-exclusive populated, sum equality with absolute or percentage
+  tolerance, and allowed value combinations. Rules reference columns by name
+  and can be saved into a matching file profile. Scanning is a cancellable,
+  read-only, revision-stamped job; violations list the involved values with
+  a reason, support jump-to-row, filter-to-violations (per rule or overall),
+  and JSON report export. Invalid rule configurations are rejected before
+  any row is read, and numeric/date checks use typed coercion — never
+  lexical comparison.
 - **Semantic data-type detection** (palette → "Semantic types…"): recognise
   real-world value types beyond number/date/bool — email, URL, UUID, IPv4,
   IPv6, JSON, percentage, currency, phone number, postal code, and
