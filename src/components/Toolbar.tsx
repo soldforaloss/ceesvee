@@ -24,6 +24,7 @@ import {
   Sun,
   Trash,
   Undo,
+  Wand,
 } from "./Icons";
 import { Logo } from "./Logo";
 
@@ -33,6 +34,7 @@ interface ToolbarProps {
   onSummaries: () => void;
   onFilter: () => void;
   onProfiles: () => void;
+  onTransform: () => void;
 }
 
 interface ToolItem {
@@ -44,7 +46,14 @@ interface ToolItem {
   active?: boolean;
 }
 
-export function Toolbar({ onSort, onExport, onSummaries, onFilter, onProfiles }: ToolbarProps) {
+export function Toolbar({
+  onSort,
+  onExport,
+  onSummaries,
+  onFilter,
+  onProfiles,
+  onTransform,
+}: ToolbarProps) {
   const meta = useActiveMeta();
   const theme = useStore((s) => s.theme);
   const recent = useStore((s) => s.recent);
@@ -116,6 +125,13 @@ export function Toolbar({ onSort, onExport, onSummaries, onFilter, onProfiles }:
       disabled: !hasDoc,
     },
     { label: "Sort…", icon: <SortIcon />, onClick: onSort, disabled: !hasDoc },
+    {
+      label: "Clean data…",
+      title: "Previewable cleanup transformations",
+      icon: <Wand />,
+      onClick: onTransform,
+      disabled: !hasDoc,
+    },
     { label: "Column summaries", icon: <Stats />, onClick: onSummaries, disabled: !hasDoc },
     {
       label: "Column explorer",

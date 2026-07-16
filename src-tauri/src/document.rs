@@ -743,6 +743,62 @@ impl Document {
         Ok(())
     }
 
+    /// Replace a set of columns with freshly filled ones in ONE undoable
+    /// operation (the split/merge transforms): removes `remove`, inserts the
+    /// new columns at `insert_at` (a position in the post-removal layout) and
+    /// fills their values. The grid stays rectangular throughout, and a single
+    /// undo restores headers, values and structure.
+    pub fn replace_columns(
+        &mut self,
+        mut remove: Vec<usize>,
+        insert_at: usize,
+        new_columns: Vec<(String, Vec<String>)>,
+    ) -> AppResult<()> {
+        remove.sort_unstable();
+        remove.dedup();
+        if let Some(&max) = remove.last() {
+            if max >= self.headers.len() {
+                return Err(AppError::invalid("column index out of range"));
+            }
+        }
+        if remove.len() >= self.headers.len() && new_columns.is_empty() {
+            return Err(AppError::invalid("cannot delete every column"));
+        }
+        let n_rows = self.rows.len();
+        for (_, values) in &new_columns {
+            if values.len() != n_rows {
+                return Err(AppError::invalid("replacement column has wrong row count"));
+            }
+        }
+        if insert_at > self.headers.len() - remove.len() {
+            return Err(AppError::invalid("column index out of range"));
+        }
+
+        let mut sub: Vec<EditOp> = Vec::new();
+        if !remove.is_empty() {
+            sub.push(self.op_delete_columns(&remove));
+        }
+        let mut changes: Vec<(usize, usize, String)> = Vec::new();
+        for (i, (header, values)) in new_columns.into_iter().enumerate() {
+            let at = insert_at + i;
+            sub.push(self.op_insert_column(at, header));
+            for (r, value) in values.into_iter().enumerate() {
+                if !value.is_empty() {
+                    changes.push((r, at, value));
+                }
+            }
+        }
+        if let Some(op) = self.op_set_cells(changes) {
+            sub.push(op);
+        }
+        match sub.len() {
+            0 => {}
+            1 => self.register(sub.pop().expect("checked length")),
+            _ => self.register(EditOp::Composite(sub)),
+        }
+        Ok(())
+    }
+
     /// Sort rows by one or more keys. Empty `keys` is a no-op.
     pub fn sort(&mut self, keys: &[SortKey]) -> AppResult<()> {
         if keys.is_empty() || self.rows.len() < 2 {
@@ -1474,6 +1530,34 @@ mod tests {
             Err(AppError::StaleRevision { .. })
         ));
         assert!(d.check_revision(d.revision()).is_ok());
+    }
+
+    #[test]
+    fn replace_columns_is_one_undo_and_stays_rectangular() {
+        let mut d = doc_from("full name,age\nAda Lovelace,36\nBob Ray,40", true);
+        // Split "full name" into two columns in a single operation.
+        d.replace_columns(
+            vec![0],
+            0,
+            vec![
+                ("first".into(), vec!["Ada".into(), "Bob".into()]),
+                ("last".into(), vec!["Lovelace".into(), "Ray".into()]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(d.headers(), &["first", "last", "age"]);
+        assert_eq!(d.n_cols(), 3);
+        assert_eq!(d.cell(0, 0), "Ada");
+        assert_eq!(d.cell(1, 1), "Ray");
+        assert_eq!(d.cell(0, 2), "36");
+        assert!(d.rows().iter().all(|r| r.len() == 3), "rectangular");
+
+        // ONE undo restores the original headers, values and structure.
+        d.undo().unwrap();
+        assert_eq!(d.headers(), &["full name", "age"]);
+        assert_eq!(d.cell(0, 0), "Ada Lovelace");
+        assert_eq!(d.cell(1, 0), "Bob Ray");
+        assert!(!d.can_undo(), "split+fill was a single operation");
     }
 
     #[test]

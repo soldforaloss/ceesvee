@@ -168,6 +168,13 @@ export const Bookmark = ({ className }: IconProps) => (
   </svg>
 );
 
+export const Wand = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8L19 13M15 9h0M17.8 6.2L19 5M12.2 6.2L11 5" />
+    <path d="M3 21l9-9" />
+  </svg>
+);
+
 export const BarChart = ({ className }: IconProps) => (
   <svg {...base} className={className}>
     <line x1="18" y1="20" x2="18" y2="10" />

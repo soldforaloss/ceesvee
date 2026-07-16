@@ -31,6 +31,8 @@ import type {
   ReparsePreview,
   SortKey,
   SplitOptions,
+  TransformErrorPolicy,
+  TransformSpec,
 } from "../types";
 
 export type ThemePref = "light" | "dark" | "system";
@@ -336,6 +338,18 @@ interface Store {
     split: SplitOptions,
     writeManifest: boolean,
   ) => Promise<void>;
+
+  // data-cleaning transforms (F06)
+  /**
+   * Apply a previewed transform (one undo step). Returns whether it was
+   * committed; re-applies the active filter afterwards.
+   */
+  applyTransformSpec: (
+    spec: TransformSpec,
+    scope: ExportScope,
+    policy: TransformErrorPolicy,
+    expectedRevision: number,
+  ) => Promise<boolean>;
 
   // column explorer (F05)
   setExplorerOpen: (open: boolean) => void;
@@ -1415,6 +1429,40 @@ export const useStore = create<Store>((set, get) => {
       // Remember the options per document, to seed the next export dialog.
       set({ lastExportOptions: options });
       await runExportJob(meta.id, chosen, options, scope, split, writeManifest);
+    },
+
+    // ----- data-cleaning transforms (F06) ----------------------------------------
+
+    applyTransformSpec: async (spec, scope, policy, expectedRevision) => {
+      const meta = activeMeta();
+      if (!meta) return false;
+      const hadFilter = meta.filtered;
+      try {
+        const jobId = await api.applyTransform(meta.id, spec, scope, policy, expectedRevision);
+        const finished = await awaitJob(jobId);
+        if (finished.status !== "done") {
+          if (finished.status === "failed") {
+            set({ error: finished.error ?? "transform failed" });
+          }
+          return false;
+        }
+        const updated = await api.getMeta(meta.id);
+        reloadDoc(updated);
+        // The backend dropped the filter view before committing; recompute it
+        // from the (kept) filter spec so the user's view survives the edit.
+        if (hadFilter) {
+          try {
+            const refiltered = await api.setFilter(meta.id, get().filter.spec);
+            reloadDoc(refiltered);
+          } catch {
+            // The spec may reference a column the transform removed.
+          }
+        }
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
     },
 
     // ----- column explorer (F05) ------------------------------------------------

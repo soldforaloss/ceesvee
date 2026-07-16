@@ -23,6 +23,7 @@ import { StatusBar } from "./components/StatusBar";
 import { SummaryPanel } from "./components/SummaryPanel";
 import { Tabs } from "./components/Tabs";
 import { Toolbar } from "./components/Toolbar";
+import { TransformDialog } from "./components/TransformDialog";
 import { onJobFinished, onJobProgress } from "./lib/jobs";
 import * as api from "./lib/tauri";
 import { checkForUpdates } from "./lib/updater";
@@ -40,6 +41,7 @@ export default function App() {
   const [summariesOpen, setSummariesOpen] = useState(false);
   const [filterOpen, setFilterOpen] = useState(false);
   const [profilesOpen, setProfilesOpen] = useState(false);
+  const [transformOpen, setTransformOpen] = useState(false);
   const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const [dragOver, setDragOver] = useState(false);
@@ -219,6 +221,7 @@ export default function App() {
         onSummaries={() => setSummariesOpen(true)}
         onFilter={() => setFilterOpen(true)}
         onProfiles={() => setProfilesOpen(true)}
+        onTransform={() => setTransformOpen(true)}
       />
       <Tabs />
       <SourceBar />
@@ -247,6 +250,7 @@ export default function App() {
       {summariesOpen && <SummaryPanel onClose={() => setSummariesOpen(false)} />}
       {filterOpen && <FilterDialog onClose={() => setFilterOpen(false)} />}
       {profilesOpen && <ProfilesDialog onClose={() => setProfilesOpen(false)} />}
+      {transformOpen && <TransformDialog onClose={() => setTransformOpen(false)} />}
       <ReopenDialog />
       <ExternalChangeDialog />
       <QuitDialog />
