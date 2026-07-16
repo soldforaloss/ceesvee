@@ -37,6 +37,9 @@ import type {
   ProfileScope,
   ProfileValidation,
   ReparsePreview,
+  SemanticAction,
+  SemanticReport,
+  SemanticType,
   SortKey,
   SplitOptions,
   TransformErrorPolicy,
@@ -71,7 +74,8 @@ export type ModalName =
   | "shortcuts"
   | "copyAs"
   | "pasteSpecial"
-  | "cluster";
+  | "cluster"
+  | "semantic";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
@@ -318,6 +322,23 @@ const initialCluster: ClusterState = {
   error: null,
 };
 
+/** Semantic-type detection state (F26), for the ACTIVE document. */
+export interface SemanticState {
+  scanJobId: number | null;
+  processed: number;
+  total: number | null;
+  report: SemanticReport | null;
+  error: string | null;
+}
+
+const initialSemantic: SemanticState = {
+  scanJobId: null,
+  processed: 0,
+  total: null,
+  report: null,
+  error: null,
+};
+
 /** ZIP entry chooser state (F17). */
 export interface ArchivePickState {
   path: string;
@@ -447,6 +468,8 @@ interface Store {
   indexing: IndexingState | null;
   /** Fuzzy clustering state (F24). */
   cluster: ClusterState;
+  /** Semantic-type detection state (F26). */
+  semantic: SemanticState;
   /** ZIP entry chooser (F17). */
   archivePick: ArchivePickState | null;
   /** Suspicious-ratio extraction awaiting confirmation (F17). */
@@ -513,6 +536,27 @@ interface Store {
     column: number,
     mapping: [string, string][],
     scope: ExportScope,
+    expectedRevision: number,
+  ) => Promise<boolean>;
+
+  // semantic data types (F26)
+  startSemanticScan: () => Promise<void>;
+  cancelSemanticScan: () => Promise<void>;
+  clearSemanticReport: () => void;
+  /** Re-adopt the backend-cached report (used when the dialog opens). */
+  loadCachedSemanticReport: () => Promise<void>;
+  /** Filter to rows (in)valid for a type; blanks match neither. */
+  applySemanticFilter: (
+    column: number,
+    semantic: SemanticType,
+    keepValid: boolean,
+    expectedRevision: number,
+  ) => Promise<boolean>;
+  /** Apply a previewed semantic quick action as one undo step. */
+  applySemanticAction: (
+    column: number,
+    semantic: SemanticType,
+    action: SemanticAction,
     expectedRevision: number,
   ) => Promise<boolean>;
 
@@ -748,6 +792,8 @@ export const useStore = create<Store>((set, get) => {
         error: null,
       },
       dedup: initialDedup,
+      // Per-doc report; the dialog re-adopts the backend cache on open.
+      semantic: initialSemantic,
     };
   };
 
@@ -994,6 +1040,7 @@ export const useStore = create<Store>((set, get) => {
     openDecision: null,
     indexing: null,
     cluster: initialCluster,
+    semantic: initialSemantic,
     archivePick: null,
     archiveLargeConfirm: null,
     externalPrompt: null,
@@ -1323,6 +1370,76 @@ export const useStore = create<Store>((set, get) => {
         return true;
       } catch (e) {
         set((s) => ({ cluster: { ...s.cluster, error: String(e) } }));
+        return false;
+      }
+    },
+
+    // ----- semantic data types (F26) -------------------------------------------
+
+    startSemanticScan: async () => {
+      const meta = activeMeta();
+      if (!meta || get().semantic.scanJobId != null) return;
+      try {
+        const jobId = await api.startSemanticScan(meta.id, meta.revision);
+        set((s) => ({
+          semantic: { ...s.semantic, scanJobId: jobId, processed: 0, total: null, error: null },
+        }));
+        consumeEarlyFinish(jobId);
+      } catch (e) {
+        set((s) => ({ semantic: { ...s.semantic, error: String(e) } }));
+      }
+    },
+
+    cancelSemanticScan: async () => {
+      const jobId = get().semantic.scanJobId;
+      if (jobId != null) await api.cancelJob(jobId).catch(() => undefined);
+    },
+
+    clearSemanticReport: () => set({ semantic: initialSemantic }),
+
+    loadCachedSemanticReport: async () => {
+      const meta = activeMeta();
+      if (!meta || get().semantic.report !== null || get().semantic.scanJobId != null) return;
+      const report = await api.getSemanticReport(meta.id).catch(() => null);
+      if (report) set((s) => ({ semantic: { ...s.semantic, report } }));
+    },
+
+    applySemanticFilter: async (column, semantic, keepValid, expectedRevision) => {
+      const meta = activeMeta();
+      if (!meta) return false;
+      try {
+        const updated = await api.applySemanticFilter(
+          meta.id,
+          column,
+          semantic,
+          keepValid,
+          expectedRevision,
+        );
+        reloadDoc(updated);
+        return true;
+      } catch (e) {
+        set((s) => ({ semantic: { ...s.semantic, error: String(e) } }));
+        return false;
+      }
+    },
+
+    applySemanticAction: async (column, semantic, action, expectedRevision) => {
+      const meta = activeMeta();
+      if (!meta) return false;
+      try {
+        const updated = await api.applySemanticAction(
+          meta.id,
+          column,
+          semantic,
+          action,
+          expectedRevision,
+        );
+        reloadDoc(updated);
+        // The document changed; the report is stale by definition.
+        set((s) => ({ semantic: { ...s.semantic, report: null } }));
+        return true;
+      } catch (e) {
+        set((s) => ({ semantic: { ...s.semantic, error: String(e) } }));
         return false;
       }
     },
@@ -1696,6 +1813,14 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
+      if (progress.kind === "semantic") {
+        if (get().semantic.scanJobId !== progress.jobId) return;
+        set((s) => ({
+          semantic: { ...s.semantic, processed: progress.processed, total: progress.total },
+        }));
+        return;
+      }
+
       if (progress.kind === "cluster") {
         if (get().cluster.scanJobId !== progress.jobId) return;
         set((s) => ({
@@ -1836,6 +1961,25 @@ export const useStore = create<Store>((set, get) => {
               ...s.compare,
               jobId: null,
               error: finished.status === "failed" ? (finished.error ?? "comparison failed") : null,
+            },
+          }));
+        }
+        return;
+      }
+
+      if (finished.kind === "semantic") {
+        if (get().semantic.scanJobId !== finished.jobId) return;
+        if (finished.status === "done") {
+          const report = finished.docId
+            ? await api.getSemanticReport(finished.docId).catch(() => null)
+            : null;
+          set((s) => ({ semantic: { ...s.semantic, scanJobId: null, report, error: null } }));
+        } else {
+          set((s) => ({
+            semantic: {
+              ...s.semantic,
+              scanJobId: null,
+              error: finished.status === "failed" ? (finished.error ?? "scan failed") : null,
             },
           }));
         }

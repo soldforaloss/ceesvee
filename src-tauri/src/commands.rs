@@ -31,6 +31,9 @@ use crate::parse::{parse, ParseSettings, ParsedFile};
 use crate::paste::{self, PasteOptions, PastePreview};
 use crate::profile::{self, ColumnProfile, ProfileCache, ProfileOptions, ProfileScope};
 use crate::reopen::{self, CurrentInterpretation};
+use crate::semantic::{
+    self, SemanticAction, SemanticActionPreview, SemanticCache, SemanticReport, SemanticType,
+};
 use crate::settings::{self, AppSettings, FileProfile, ProfileValidation};
 use crate::state::{AppState, PendingFiles, SharedDocument};
 use crate::transform::{self, TransformErrorPolicy, TransformPreview, TransformSpec};
@@ -662,6 +665,7 @@ pub fn close_document(
     dedup_cache: State<'_, DedupCache>,
     compare_cache: State<'_, CompareCache>,
     cluster_cache: State<'_, ClusterCache>,
+    semantic_cache: State<'_, SemanticCache>,
 ) -> AppResult<()> {
     lock(&state)?.remove(doc_id);
     diagnostics_cache.remove(doc_id);
@@ -669,6 +673,7 @@ pub fn close_document(
     dedup_cache.remove(doc_id);
     compare_cache.remove_doc(doc_id);
     cluster_cache.remove(doc_id);
+    semantic_cache.remove(doc_id);
     Ok(())
 }
 
@@ -737,6 +742,135 @@ pub fn apply_value_clusters(
         doc.set_cells(changes)?;
         Ok(doc.meta())
     })
+}
+
+// ----- semantic data-type detection (F26) ------------------------------------
+
+/// The last completed semantic report for a document, if any. Carries the
+/// revision it was computed against and whether it came from a sample.
+#[tauri::command]
+pub fn get_semantic_report(
+    doc_id: u64,
+    semantic_cache: State<'_, SemanticCache>,
+) -> Option<SemanticReport> {
+    semantic_cache.get(doc_id)
+}
+
+/// Start a semantic-type scan over every column as a cancellable job (F26).
+/// Detection is strictly read-only; large indexed documents are sampled and
+/// the report says so.
+#[tauri::command]
+pub async fn start_semantic_scan(
+    doc_id: u64,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    semantic_cache: State<'_, SemanticCache>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+    }
+    let sink = semantic_cache.share();
+    let ctx = jobs.begin_for_app(&app, "semantic", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            let report = semantic::scan(&doc, ctx)?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, report);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// Filter the grid to rows whose cell in `column` is valid (or invalid) for
+/// a semantic type. Blank cells match neither filter.
+#[tauri::command]
+pub async fn apply_semantic_filter(
+    doc_id: u64,
+    column: usize,
+    semantic: SemanticType,
+    keep_valid: bool,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        // Compute against a consistent read snapshot first…
+        let rows = {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            semantic::semantic_rows(&doc, column, semantic, keep_valid)?
+        };
+        // …then swap the filter view in (re-checked: an edit may have raced).
+        let mut doc = handle.write().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+        doc.set_filter(rows);
+        Ok(doc.meta())
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Preview exactly what a semantic quick action would change — counts plus
+/// leading before/after examples. Nothing is mutated.
+#[tauri::command]
+pub async fn preview_semantic_action(
+    doc_id: u64,
+    column: usize,
+    semantic: SemanticType,
+    action: SemanticAction,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<SemanticActionPreview> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let doc = handle.read().map_err(poisoned)?;
+        // Actions mutate, so previews are for editable documents only.
+        doc.ensure_editable()?;
+        doc.check_revision(expected_revision)?;
+        semantic::preview_action(&doc, column, semantic, action)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Apply a previewed semantic action as ONE undoable operation, guarded by
+/// the preview's revision. In-place actions commit via `set_cells`; the
+/// extraction actions insert a new column right after the source.
+#[tauri::command]
+pub async fn apply_semantic_action(
+    doc_id: u64,
+    column: usize,
+    semantic: SemanticType,
+    action: SemanticAction,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut doc = handle.write().map_err(poisoned)?;
+        doc.ensure_editable()?;
+        doc.check_revision(expected_revision)?;
+        let (changes, new_column) = semantic::action_changes(&doc, column, semantic, action)?;
+        match new_column {
+            Some((name, values)) => {
+                doc.replace_columns(Vec::new(), column + 1, vec![(name, values)])?;
+            }
+            None => doc.set_cells(changes)?,
+        }
+        Ok(doc.meta())
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
 }
 
 #[tauri::command]

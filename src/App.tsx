@@ -26,6 +26,7 @@ import { ProfileSuggestionBar } from "./components/ProfileSuggestionBar";
 import { OpenModeDialog } from "./components/OpenModeDialog";
 import { QuitDialog } from "./components/QuitDialog";
 import { ReopenDialog } from "./components/ReopenDialog";
+import { SemanticDialog } from "./components/SemanticDialog";
 import { ShortcutsDialog } from "./components/ShortcutsDialog";
 import { SortDialog } from "./components/SortDialog";
 import { SourceBar } from "./components/SourceBar";
@@ -263,6 +264,7 @@ export default function App() {
       {activeModal === "shortcuts" && <ShortcutsDialog onClose={() => setModal(null)} />}
       {activeModal === "copyAs" && <CopyAsDialog onClose={() => setModal(null)} />}
       {activeModal === "cluster" && <ClusterDialog onClose={() => setModal(null)} />}
+      {activeModal === "semantic" && <SemanticDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       <CommandPalette />
       <CellEditorDialog />

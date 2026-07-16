@@ -273,6 +273,14 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("cluster"),
     },
     {
+      id: "data.semantic",
+      title: "Semantic types…",
+      keywords: ["detect", "email", "url", "uuid", "ip", "phone", "column types", "validate"],
+      category: "Data",
+      unavailableReason: needsDoc,
+      run: () => openModal("semantic"),
+    },
+    {
       id: "data.compare",
       title: "Compare…",
       keywords: ["diff", "changes", "versus"],

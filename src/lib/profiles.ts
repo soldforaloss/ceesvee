@@ -103,5 +103,6 @@ export function profileFromDocument(name: string, meta: DocumentMeta): FileProfi
     uniqueColumns: [],
     regexRules: [],
     rangeRules: [],
+    semanticTypes: [],
   };
 }

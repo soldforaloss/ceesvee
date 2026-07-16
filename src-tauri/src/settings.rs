@@ -97,6 +97,12 @@ pub struct FileProfile {
     pub regex_rules: Vec<RegexRule>,
     #[serde(default)]
     pub range_rules: Vec<RangeRule>,
+
+    /// F26: user overrides of detected semantic types, keyed by column name
+    /// so they survive rescans and reopened files. `FreeText` forces a column
+    /// back to plain text regardless of what detection says.
+    #[serde(default)]
+    pub semantic_types: Vec<(String, crate::semantic::SemanticType)>,
 }
 
 /// The persisted settings document.
@@ -420,7 +426,40 @@ mod tests {
                 min: Some(0.0),
                 max: Some(1000.0),
             }],
+            semantic_types: Vec::new(),
         }
+    }
+
+    #[test]
+    fn semantic_overrides_round_trip_and_default_empty() {
+        use crate::semantic::SemanticType;
+        let dir = tempfile::tempdir().unwrap();
+        // A pre-F26 profile (no semanticTypes key) still loads, empty.
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            br#"{"version":1,"profiles":[{"id":"p","name":"n",
+                 "matcher":{"type":"extension","extension":"csv"},
+                 "delimiter":null,"encoding":null,"hasHeaderRow":null}]}"#,
+        )
+        .unwrap();
+        let mut settings = load_settings(dir.path());
+        assert!(settings.profiles[0].semantic_types.is_empty());
+
+        // Overrides persist across save/load (they survive rescans by
+        // keying on the column NAME, not its position).
+        settings.profiles[0].semantic_types = vec![
+            ("email".into(), SemanticType::Email),
+            ("notes".into(), SemanticType::FreeText),
+        ];
+        save_settings(dir.path(), &settings).unwrap();
+        let loaded = load_settings(dir.path());
+        assert_eq!(
+            loaded.profiles[0].semantic_types,
+            vec![
+                ("email".into(), SemanticType::Email),
+                ("notes".into(), SemanticType::FreeText),
+            ]
+        );
     }
 
     #[test]

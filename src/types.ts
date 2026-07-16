@@ -215,6 +215,59 @@ export interface ClusterReport {
   clusters: ValueCluster[];
 }
 
+/** Semantic data type (F26) — a closed set mirrored from the Rust enum. */
+export type SemanticType =
+  | "uuid"
+  | "email"
+  | "url"
+  | "ipv4"
+  | "ipv6"
+  | "json"
+  | "percentage"
+  | "currency"
+  | "phoneNumber"
+  | "postalCode"
+  | "categorical"
+  | "freeText";
+
+/** Per-column semantic detection result (F26). */
+export interface ColumnSemantics {
+  column: number;
+  /** The badge, when a type cleared the documented threshold. */
+  detected: SemanticType | null;
+  /** Best-scoring candidate even when nothing cleared the threshold. */
+  bestCandidate: SemanticType | null;
+  confidence: number;
+  matching: number;
+  conflicting: number;
+  nonBlank: number;
+}
+
+export interface SemanticReport {
+  revision: number;
+  /** True when only a leading sample was scanned (large indexed documents). */
+  sampled: boolean;
+  scannedRows: number;
+  threshold: number;
+  columns: ColumnSemantics[];
+}
+
+/** Previewable semantic quick actions (F26) — a closed, validated set. */
+export type SemanticAction =
+  | "normalize"
+  | "percentToDecimal"
+  | "extractUrlHost"
+  | "extractEmailDomain";
+
+/** What a semantic action would change, computed without mutating (F26). */
+export interface SemanticActionPreview {
+  affected: number;
+  /** Leading examples as [before, after] pairs. */
+  examples: [string, string][];
+  /** The new column's name, for the extraction actions. */
+  newColumn: string | null;
+}
+
 /** Copy As output format (F14). */
 export type CopyFormat =
   | { type: "tsv" }
@@ -641,6 +694,11 @@ export interface FileProfile {
   uniqueColumns: string[];
   regexRules: RegexRule[];
   rangeRules: RangeRule[];
+  /**
+   * F26: user overrides of detected semantic types, keyed by column NAME so
+   * they survive rescans. "freeText" forces plain text.
+   */
+  semanticTypes: [string, SemanticType][];
 }
 
 /** The persisted settings document (versioned JSON in app-data). */

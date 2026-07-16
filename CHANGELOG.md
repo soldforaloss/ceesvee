@@ -8,6 +8,21 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Semantic data-type detection** (palette → "Semantic types…"): recognise
+  real-world value types beyond number/date/bool — email, URL, UUID, IPv4,
+  IPv6, JSON, percentage, currency, phone number, postal code, and
+  low-cardinality categorical columns. Each column reports the detected type
+  with its confidence and matching/conflicting counts; a badge appears only
+  at ≥95% matching over at least 10 non-blank cells, so low-confidence
+  columns stay plain text. Detection never mutates data, and phone numbers
+  and postal codes are never converted to numbers. Quick actions — filter to
+  valid/invalid rows, normalize (lowercase emails/UUIDs), percentage →
+  decimal, extract URL host or email domain into a new column — all show an
+  exact preview first and apply as ONE undo step. Per-column overrides
+  (including forcing plain text) persist into a matching file profile keyed
+  by column NAME, so they survive rescans and reopening. Large indexed
+  documents scan a labelled 100k-row sample. The cell editor gains a
+  **Pretty-print JSON** button for cells that parse as JSON.
 - **Command palette** (`Ctrl/Cmd+K`): fuzzy-search and run every CEESVEE
   action from the keyboard — file, editing, view, data, export, and tab
   commands, plus go to row/cell, opening recent files, and switching tabs.
