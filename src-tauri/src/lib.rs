@@ -33,6 +33,7 @@ mod paste;
 mod profile;
 mod reopen;
 mod repair;
+mod reshape;
 mod save;
 mod semantic;
 mod settings;
@@ -205,6 +206,8 @@ pub fn run() {
             commands::start_join,
             commands::preview_group_by,
             commands::start_group_by,
+            commands::preview_reshape,
+            commands::start_reshape,
             commands::start_compare,
             commands::get_compare_info,
             commands::get_compare_results,

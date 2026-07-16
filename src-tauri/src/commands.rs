@@ -39,6 +39,7 @@ use crate::paste::{self, PasteOptions, PastePreview};
 use crate::profile::{self, ColumnProfile, ProfileCache, ProfileOptions, ProfileScope};
 use crate::reopen::{self, CurrentInterpretation};
 use crate::repair::{self, RepairPreview, RepairSpec};
+use crate::reshape::{self, ReshapePreview, ReshapeSpec};
 use crate::semantic::{
     self, SemanticAction, SemanticActionPreview, SemanticCache, SemanticReport, SemanticType,
 };
@@ -1275,6 +1276,66 @@ pub async fn start_group_by(
             let source = handle.read().map_err(poisoned)?;
             source.check_revision(expected_revision)?;
             let doc = groupby::run(&source, &spec, new_doc_id, cache_root, ctx)?;
+            drop(source);
+            let registry = app_for_job.state::<Mutex<AppState>>();
+            registry
+                .lock()
+                .map_err(|_| AppError::Other("internal state lock error".into()))?
+                .insert(doc);
+            Ok(())
+        })
+        .await;
+    });
+    Ok(IndexedOpenStart {
+        job_id,
+        doc_id: new_doc_id,
+    })
+}
+
+// ----- pivot / unpivot / transpose (F23) ---------------------------------------
+
+/// Preview a reshape: projected dimensions, duplicate pivot coordinates,
+/// and column limits. Nothing is created.
+#[tauri::command]
+pub async fn preview_reshape(
+    doc_id: u64,
+    spec: ReshapeSpec,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<ReshapePreview> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+        reshape::preview(&doc, &spec)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Run a reshape as a cancellable "derive" job into a NEW document (F23).
+#[tauri::command]
+pub async fn start_reshape(
+    doc_id: u64,
+    spec: ReshapeSpec,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<IndexedOpenStart> {
+    let handle = doc_handle(&state, doc_id)?;
+    let new_doc_id = lock(&state)?.alloc_id();
+    let cache_root = index_cache_root(&app)?;
+
+    let ctx = jobs.begin_for_app(&app, "derive", Some(new_doc_id));
+    let job_id = ctx.id;
+    let app_for_job = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            use tauri::Manager;
+            let source = handle.read().map_err(poisoned)?;
+            source.check_revision(expected_revision)?;
+            let doc = reshape::run(&source, &spec, new_doc_id, cache_root, ctx)?;
             drop(source);
             let registry = app_for_job.state::<Mutex<AppState>>();
             registry

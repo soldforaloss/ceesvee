@@ -55,6 +55,8 @@ import type {
   RepairSpec,
   ReparsePreview,
   ReplaceResult,
+  ReshapePreview,
+  ReshapeSpec,
   RowsResponse,
   ScopeCounts,
   SelectionStats,
@@ -248,6 +250,14 @@ export const startAppend = (inputs: AppendInput[], options: AppendOptions) =>
 /** The per-input outcome report of a finished append (F20). */
 export const getAppendReport = (docId: number) =>
   invoke<AppendReport | null>("get_append_report", { docId });
+
+/** Preview a reshape — creates nothing (F23). */
+export const previewReshape = (docId: number, spec: ReshapeSpec, expectedRevision: number) =>
+  invoke<ReshapePreview>("preview_reshape", { docId, spec, expectedRevision });
+
+/** Run a reshape as a cancellable "derive" job into a NEW document (F23). */
+export const startReshape = (docId: number, spec: ReshapeSpec, expectedRevision: number) =>
+  invoke<IndexedOpenStart>("start_reshape", { docId, spec, expectedRevision });
 
 /** Preview a group-by — creates nothing (F22). */
 export const previewGroupBy = (docId: number, spec: GroupBySpec, expectedRevision: number) =>

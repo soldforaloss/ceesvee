@@ -8,6 +8,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Pivot, unpivot, and transpose** (palette → "Pivot / unpivot /
+  transpose…"): reshape between wide and long forms into a NEW document.
+  Unpivot keeps chosen identifier columns and melts the rest into
+  attribute/value rows (blank-omission and source-row provenance
+  options); pivot turns a column's distinct values into headers with a
+  chosen aggregation (none / count / sum / mean / median / min / max /
+  first / last) — deterministic sorted column order, duplicate
+  row-key/header coordinates detected, and "none" refuses multi-value
+  cells with a clear error; transpose swaps rows and columns. Column
+  counts are size-guarded with an explicit confirm, and pivot + unpivot
+  round-trip when the data is losslessly representable.
 - **Group-by aggregations** (palette → "Group by…"): summarise the active
   document into a NEW grouped document. Aggregates: row count, non-blank
   count, distinct count, sum, mean, min, max, median, first, last,

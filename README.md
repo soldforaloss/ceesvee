@@ -100,6 +100,8 @@ and faithful on large, real-world delimited files.**
 - **Group by** — count / distinct / sum / mean / min / max / median /
   first / last / concatenate aggregations into a new grouped document,
   with normalized grouping, blank-key policies, and ordering options.
+- **Pivot / unpivot / transpose** — reshape wide↔long with aggregation
+  choices, duplicate-coordinate detection, provenance, and size guards.
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 

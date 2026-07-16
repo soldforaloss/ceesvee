@@ -342,6 +342,14 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("compare"),
     },
     {
+      id: "data.reshape",
+      title: "Pivot / unpivot / transpose…",
+      keywords: ["reshape", "wide", "long", "melt", "crosstab", "rotate"],
+      category: "Data",
+      unavailableReason: needsDoc,
+      run: () => openModal("reshape"),
+    },
+    {
       id: "data.groupBy",
       title: "Group by…",
       keywords: ["aggregate", "summarize", "sum", "count", "pivot table", "rollup"],
