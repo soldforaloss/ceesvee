@@ -25,6 +25,7 @@ import { Close } from "./components/Icons";
 import { ProfilesDialog } from "./components/ProfilesDialog";
 import { ProfileSuggestionBar } from "./components/ProfileSuggestionBar";
 import { OpenModeDialog } from "./components/OpenModeDialog";
+import { OutlierDialog } from "./components/OutlierDialog";
 import { QuitDialog } from "./components/QuitDialog";
 import { ReopenDialog } from "./components/ReopenDialog";
 import { RepairDialog } from "./components/RepairDialog";
@@ -269,6 +270,7 @@ export default function App() {
       {activeModal === "semantic" && <SemanticDialog onClose={() => setModal(null)} />}
       {activeModal === "crossval" && <CrossValDialog onClose={() => setModal(null)} />}
       {activeModal === "repair" && <RepairDialog onClose={() => setModal(null)} />}
+      {activeModal === "outlier" && <OutlierDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       <CommandPalette />
       <CellEditorDialog />

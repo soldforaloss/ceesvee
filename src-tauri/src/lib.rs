@@ -23,6 +23,7 @@ mod index;
 /// Public so downstream features (and the test harness) can treat the job
 /// registry, progress plumbing and cancellation as a stable internal API.
 pub mod job;
+mod outlier;
 mod parse;
 mod paste;
 mod profile;
@@ -99,6 +100,7 @@ pub fn run() {
         .manage(crate::cluster::ClusterCache::default())
         .manage(crate::semantic::SemanticCache::default())
         .manage(crate::crossval::CrossValCache::default())
+        .manage(crate::outlier::OutlierCache::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -186,6 +188,11 @@ pub fn run() {
             commands::apply_crossval_filter,
             commands::preview_repair,
             commands::apply_repair,
+            commands::get_outlier_report,
+            commands::start_outlier_scan,
+            commands::apply_outlier_filter,
+            commands::preview_outlier_action,
+            commands::apply_outlier_action,
             commands::start_compare,
             commands::get_compare_info,
             commands::get_compare_results,

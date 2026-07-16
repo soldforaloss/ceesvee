@@ -268,6 +268,68 @@ export interface SemanticActionPreview {
   newColumn: string | null;
 }
 
+/** Outlier detection method (F30) — a closed, validated set. */
+export type OutlierMethod =
+  | { type: "iqr"; k: number }
+  | { type: "mad"; threshold: number }
+  | { type: "zScore"; threshold: number }
+  | { type: "percentile"; lower: number; upper: number }
+  | { type: "rareCategory"; maxShare: number }
+  | { type: "unexpectedCategory"; allowed: string[] }
+  | { type: "patternMismatch"; pattern: string };
+
+export interface OutlierSpec {
+  column: number;
+  method: OutlierMethod;
+  /** Group-wise analysis: statistics computed per group key. */
+  groupColumns: number[];
+  scope: ExportScope;
+}
+
+/** Corrective actions (F30) — all previewed, all one undo step. */
+export type OutlierAction = "replaceBlank" | "replaceMedian" | "capToBounds" | "removeRows";
+
+export interface GroupSummary {
+  key: string[];
+  count: number;
+  flagged: number;
+  mean: number | null;
+  median: number | null;
+  stdDev: number | null;
+  q1: number | null;
+  q3: number | null;
+  mad: number | null;
+  lower: number | null;
+  upper: number | null;
+}
+
+export interface FlaggedValue {
+  /** Absolute row index. */
+  row: number;
+  value: string;
+  group: string[];
+  reason: string;
+}
+
+export interface OutlierReport {
+  revision: number;
+  scannedRows: number;
+  considered: number;
+  flagged: number;
+  blanks: number;
+  invalidNumeric: number;
+  groups: GroupSummary[];
+  groupsTotal: number;
+  sample: FlaggedValue[];
+}
+
+export interface OutlierActionPreview {
+  revision: number;
+  cellsAffected: number;
+  rowsRemoved: number;
+  examples: { row: number; before: string; after: string }[];
+}
+
 /** Missing-value repair operation (F29) — a closed, validated set. */
 export type RepairOp =
   | { type: "normalizeNullTokens"; tokens: string[] }

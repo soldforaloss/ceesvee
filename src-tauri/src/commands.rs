@@ -28,6 +28,9 @@ use crate::dto::{
 };
 use crate::error::{AppError, AppResult};
 use crate::job::JobRegistry;
+use crate::outlier::{
+    self, CachedOutlier, OutlierAction, OutlierActionPreview, OutlierCache, OutlierSpec,
+};
 use crate::parse::{parse, ParseSettings, ParsedFile};
 use crate::paste::{self, PasteOptions, PastePreview};
 use crate::profile::{self, ColumnProfile, ProfileCache, ProfileOptions, ProfileScope};
@@ -669,6 +672,7 @@ pub fn close_document(
     cluster_cache: State<'_, ClusterCache>,
     semantic_cache: State<'_, SemanticCache>,
     crossval_cache: State<'_, CrossValCache>,
+    outlier_cache: State<'_, OutlierCache>,
 ) -> AppResult<()> {
     lock(&state)?.remove(doc_id);
     diagnostics_cache.remove(doc_id);
@@ -678,6 +682,7 @@ pub fn close_document(
     cluster_cache.remove(doc_id);
     semantic_cache.remove(doc_id);
     crossval_cache.remove(doc_id);
+    outlier_cache.remove(doc_id);
     Ok(())
 }
 
@@ -992,6 +997,123 @@ pub async fn apply_repair(
             doc.delete_rows(computed.remove_rows)?;
         } else if !computed.remove_columns.is_empty() {
             doc.delete_columns(computed.remove_columns)?;
+        } else {
+            doc.set_cells(computed.changes)?;
+        }
+        Ok(doc.meta())
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+// ----- outlier and anomaly finder (F30) --------------------------------------
+
+/// The last completed outlier report + the spec that produced it.
+#[tauri::command]
+pub fn get_outlier_report(
+    doc_id: u64,
+    outlier_cache: State<'_, OutlierCache>,
+) -> Option<CachedOutlier> {
+    outlier_cache.get(doc_id)
+}
+
+/// Run an outlier scan as a cancellable job (F30). Read-only — scanning
+/// never marks the document dirty.
+#[tauri::command]
+pub async fn start_outlier_scan(
+    doc_id: u64,
+    spec: OutlierSpec,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    outlier_cache: State<'_, OutlierCache>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+    }
+    let sink = outlier_cache.share();
+    let ctx = jobs.begin_for_app(&app, "outlier", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            let report = outlier::scan(&doc, &spec, ctx)?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, (spec, report));
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// Filter the grid to the rows holding flagged values, guarded by the
+/// report's revision (a stale report cannot be applied).
+#[tauri::command]
+pub async fn apply_outlier_filter(
+    doc_id: u64,
+    spec: OutlierSpec,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let rows = {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            outlier::flagged_rows(&doc, &spec)?
+        };
+        let mut doc = handle.write().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+        doc.set_filter(rows);
+        Ok(doc.meta())
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Preview a corrective action — counts plus before/after examples.
+#[tauri::command]
+pub async fn preview_outlier_action(
+    doc_id: u64,
+    spec: OutlierSpec,
+    action: OutlierAction,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<OutlierActionPreview> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.ensure_editable()?;
+        doc.check_revision(expected_revision)?;
+        Ok(outlier::action_changes(&doc, &spec, action)?.preview)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Apply a previewed corrective action as ONE undoable operation.
+#[tauri::command]
+pub async fn apply_outlier_action(
+    doc_id: u64,
+    spec: OutlierSpec,
+    action: OutlierAction,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut doc = handle.write().map_err(poisoned)?;
+        doc.ensure_editable()?;
+        doc.check_revision(expected_revision)?;
+        let computed = outlier::action_changes(&doc, &spec, action)?;
+        if !computed.remove_rows.is_empty() {
+            doc.delete_rows(computed.remove_rows)?;
         } else {
             doc.set_cells(computed.changes)?;
         }
