@@ -22,6 +22,7 @@ export function ChangesPanel() {
   const jumpToCell = useStore((s) => s.jumpToCell);
 
   const [changes, setChanges] = useState<ChangeSummary[]>([]);
+  const [savedInRedo, setSavedInRedo] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [working, setWorking] = useState(false);
   const [revertColumn, setRevertColumn] = useState(0);
@@ -33,7 +34,11 @@ export function ChangesPanel() {
     let cancelled = false;
     api
       .getChanges(docId)
-      .then((list) => !cancelled && setChanges(list))
+      .then((report) => {
+        if (cancelled) return;
+        setChanges(report.changes);
+        setSavedInRedo(report.savedInRedo);
+      })
       .catch((e) => !cancelled && setError(String(e)));
     return () => {
       cancelled = true;
@@ -91,7 +96,13 @@ export function ChangesPanel() {
       {error && <p className="px-3 py-2 text-xs text-red-600 dark:text-red-400">{error}</p>}
 
       <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto p-2">
-        {changes.length === 0 && (
+        {changes.length === 0 && savedInRedo && (
+          <p className="rounded bg-amber-50 px-2 py-2 text-center text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+            You undid past the last save — the saved state is ahead of the current history. Redo
+            returns to it; a new edit will branch away from it permanently.
+          </p>
+        )}
+        {changes.length === 0 && !savedInRedo && (
           <p className="py-6 text-center text-xs text-zinc-400">
             No unsaved changes — the document matches its last save.
           </p>
