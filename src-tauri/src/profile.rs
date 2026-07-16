@@ -498,7 +498,7 @@ mod tests {
     #[test]
     fn visible_scope_reflects_the_active_filter() {
         let mut d = doc_from("n\n1\n2\n3\n4\n5");
-        d.set_filter(vec![0, 2, 4]); // 1, 3, 5
+        d.set_filter(vec![0, 2, 4]).unwrap(); // 1, 3, 5
         let (_r, ctx) = ctx();
         let all =
             profile_column(&d, 0, ProfileScope::All, &ProfileOptions::default(), &ctx).unwrap();
@@ -602,7 +602,7 @@ mod tests {
         assert!(profile_is_valid(&d, &profile_b));
 
         // A filter change invalidates only the visible-rows profile.
-        d.set_filter(vec![0]);
+        d.set_filter(vec![0]).unwrap();
         assert!(profile_is_valid(&d, &profile_b));
         assert!(!profile_is_valid(&d, &visible_b));
 

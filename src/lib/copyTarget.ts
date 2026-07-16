@@ -1,7 +1,14 @@
 // Resolve what Copy As / Paste Special operate on from the grid selection
 // state (F14). Pure and unit-tested; the dialogs stay thin.
 
-import type { CellRect } from "../types";
+/** The active selection rectangle, pre-translated by the caller: display
+ * rows plus PHYSICAL columns in display order (F12 layouts can hide and
+ * reorder columns, so the rect's x/width cannot be used directly). */
+export interface RectSelection {
+  y: number;
+  height: number;
+  cols: number[];
+}
 
 export interface CopyTarget {
   /** Display row indices; `null` means every visible row (kept off the IPC
@@ -13,21 +20,21 @@ export interface CopyTarget {
 /**
  * The rows/columns a copy should cover. "visible" copies the whole filtered
  * view; "selection" prefers the active rectangle, then row markers, then
- * column markers.
+ * column markers. All columns are PHYSICAL indices.
  */
 export function resolveCopyTarget(
   scope: "selection" | "visible",
-  selectionRect: CellRect | null,
+  rect: RectSelection | null,
   selectedRows: number[],
   selectedCols: number[],
   colCount: number,
 ): CopyTarget | null {
   const allCols = Array.from({ length: colCount }, (_, i) => i);
   if (scope === "visible") return { rows: null, cols: allCols };
-  if (selectionRect) {
+  if (rect) {
     return {
-      rows: Array.from({ length: selectionRect.height }, (_, i) => selectionRect.y + i),
-      cols: Array.from({ length: selectionRect.width }, (_, i) => selectionRect.x + i),
+      rows: Array.from({ length: rect.height }, (_, i) => rect.y + i),
+      cols: [...rect.cols],
     };
   }
   if (selectedRows.length) return { rows: [...selectedRows], cols: allCols };

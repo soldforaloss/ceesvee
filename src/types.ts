@@ -13,6 +13,14 @@ export interface DocumentMeta {
   filtered: boolean;
   colCount: number;
   headers: string[];
+  /**
+   * Stable logical column IDs (F12), in lockstep with `headers`. Assigned
+   * positionally at parse ("c0".."cN-1") and preserved through renames,
+   * reorders and undo/redo, so named views survive structural edits.
+   */
+  columnIds: string[];
+  /** Whether a non-destructive view sort (F12) is currently applied. */
+  viewSorted?: boolean;
   hasHeaderRow: boolean;
   delimiter: string;
   encoding: string;
@@ -1230,6 +1238,41 @@ export interface FileProfile {
   semanticTypes: [string, SemanticType][];
   /** F27: cross-column validation rules (closed DTO set, columns by name). */
   crossRules: CrossRule[];
+  /** F12: named views saved for matching files. */
+  namedViews?: NamedView[];
+  /** F12: the view last applied to a matching file, restored on reopen. */
+  lastViewId?: string | null;
+}
+
+/** One key of a named view's non-destructive sort (F12), by stable column ID. */
+export interface ViewSortKey {
+  columnId: string;
+  descending?: boolean;
+}
+
+/**
+ * A named, reusable, NON-DESTRUCTIVE way of looking at a matching document
+ * (F12): row filter + view sort + column layout. Columns are referenced by
+ * stable logical IDs (`DocumentMeta.columnIds`); the filter keeps its column
+ * indices but carries the ID snapshot it was saved against so it can be
+ * remapped (or warn recoverably) after structural edits. Applying a view
+ * never mutates data and never marks a document dirty.
+ */
+export interface NamedView {
+  id: string;
+  name: string;
+  filter: FilterGroup | null;
+  /** Column IDs at save time, aligned with the filter's column indices. */
+  filterColumnIds: string[];
+  sortKeys: ViewSortKey[];
+  hiddenColumnIds: string[];
+  /** Arbitrary pinned columns (not just a leading count), in pin order. */
+  pinnedColumnIds: string[];
+  /** Display order for unpinned columns; IDs not listed keep file order. */
+  columnOrder: string[];
+  /** Column widths in px, keyed by column ID. */
+  columnWidths: Record<string, number>;
+  wrapText: boolean;
 }
 
 /** The persisted settings document (versioned JSON in app-data). */

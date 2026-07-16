@@ -8,7 +8,12 @@ import { Modal } from "./Modal";
 export function SortDialog({ onClose }: { onClose: () => void }) {
   const meta = useActiveMeta();
   const sortBy = useStore((s) => s.sortBy);
+  const applyViewSort = useStore((s) => s.applyViewSort);
   const [keys, setKeys] = useState<SortKey[]>([{ column: 0, descending: false }]);
+  // Read-only (indexed / follow) documents can only sort the VIEW; editable
+  // documents default to the view sort too — it never rewrites the file.
+  const readOnly = meta?.backing === "indexedReadOnly" || !!meta?.follow;
+  const [viewOnly, setViewOnly] = useState(true);
 
   if (!meta) return null;
 
@@ -21,7 +26,11 @@ export function SortDialog({ onClose }: { onClose: () => void }) {
     setKeys((ks) => [...ks, { column: nextUnusedColumn(ks, meta.colCount), descending: false }]);
 
   const apply = () => {
-    void sortBy(keys);
+    if (viewOnly || readOnly) {
+      void applyViewSort(keys);
+    } else {
+      void sortBy(keys);
+    }
     onClose();
   };
 
@@ -92,6 +101,23 @@ export function SortDialog({ onClose }: { onClose: () => void }) {
         >
           + Add another column
         </button>
+        <label className="flex items-start gap-2 border-t border-zinc-200 pt-3 text-sm dark:border-zinc-700/60">
+          <input
+            type="checkbox"
+            checked={viewOnly || readOnly}
+            disabled={readOnly}
+            onChange={(e) => setViewOnly(e.target.checked)}
+            className="mt-0.5 accent-violet-600"
+          />
+          <span>
+            Sort the view only (non-destructive)
+            <span className="block text-xs text-zinc-500 dark:text-zinc-400">
+              {readOnly
+                ? "Read-only document: only the view can be sorted."
+                : "Row order in the file is untouched and Save keeps the source order; uncheck to reorder the rows themselves (undoable)."}
+            </span>
+          </span>
+        </label>
       </div>
     </Modal>
   );

@@ -105,5 +105,7 @@ export function profileFromDocument(name: string, meta: DocumentMeta): FileProfi
     rangeRules: [],
     semanticTypes: [],
     crossRules: [],
+    namedViews: [],
+    lastViewId: null,
   };
 }

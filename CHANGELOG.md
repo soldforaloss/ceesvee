@@ -8,6 +8,21 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Named views and column layouts** (palette → "Named views…", or the
+  status-bar chip): save reusable, NON-destructive ways of looking at a
+  file — row filter, a new view-only sort that never reorders the
+  source rows or touches undo, hidden columns, arbitrary pinned
+  columns (not just a leading count), drag-reordering, per-column
+  widths, and wrap text. Views persist in the file's profile, restore
+  on reopen, and reference columns by stable IDs so renames — and
+  reorders, inserts, deletes, even undo/redo — never break them;
+  a missing column produces a recoverable warning instead of
+  corrupting the view. Applying a view never marks the document
+  dirty, edits in a sorted/filtered view land on the correct source
+  cells, exports ask explicitly whether to respect hidden columns and
+  view order, and plain Save always keeps the file's own row and
+  column order. Auto-fit widths (one, selected, or all columns) and
+  the view sort work on read-only indexed documents too.
 - **Follow / tail mode** (palette → "Open in follow mode…"): watch a
   growing CSV log inside CEESVEE. The document opens read-only; a watcher
   appends complete records as the file grows, holding partial trailing

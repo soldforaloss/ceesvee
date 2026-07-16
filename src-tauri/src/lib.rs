@@ -176,6 +176,8 @@ pub fn run() {
             commands::set_header_mode,
             commands::set_filter,
             commands::clear_filter,
+            commands::set_view_sort,
+            commands::reset_row_view,
             commands::find,
             commands::replace_all,
             commands::undo,

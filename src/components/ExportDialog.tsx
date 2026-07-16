@@ -3,8 +3,9 @@ import { useEffect, useMemo, useState } from "react";
 import { buildSplit, scopeChoices, scopeKey } from "../lib/export";
 import { DELIMITER_OPTIONS, ENCODING_OPTIONS } from "../lib/labels";
 import * as api from "../lib/tauri";
+import { layoutIsTrivial, projectColumns } from "../lib/viewProjection";
 import { useActiveMeta, useStore } from "../store/useStore";
-import type { ExportOptions, ScopeCounts, SplitOptions } from "../types";
+import type { ExportOptions, ExportScope, ScopeCounts, SplitOptions } from "../types";
 import { Modal } from "./Modal";
 
 /**
@@ -15,10 +16,23 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
   const meta = useActiveMeta();
   const exportScoped = useStore((s) => s.exportScoped);
   const filtered = useStore((s) => s.tabs.find((t) => t.id === s.activeId)?.filtered ?? false);
-  const selectionRect = useStore((s) => s.selectionRect);
   const selectedRows = useStore((s) => s.selectedRows);
   const selectedCols = useStore((s) => s.selectedCols);
   const lastExportOptions = useStore((s) => s.lastExportOptions);
+  // F12: range scopes need PHYSICAL columns; null when the display selection
+  // spans reordered columns (the range option is simply not offered then).
+  const selectionRect = useStore((s) => s.selectionPhysicalRect)();
+  const columnLayout = useStore((s) => s.columnLayout);
+  const viewSorted = meta?.viewSorted ?? false;
+  // The view's visible columns in display order (for "view order" exports).
+  const viewProjection = useMemo(
+    () => (meta ? projectColumns(meta.columnIds, columnLayout) : null),
+    [meta, columnLayout],
+  );
+  const viewAffectsColumns = !layoutIsTrivial(columnLayout);
+  // F12: exports ASK explicitly whether to respect the view's hidden columns
+  // and order — defaulting to the file's own columns.
+  const [columnMode, setColumnMode] = useState<"file" | "view">("file");
 
   const [opts, setOpts] = useState<ExportOptions>(
     () =>
@@ -37,8 +51,8 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
   );
 
   const choices = useMemo(
-    () => scopeChoices(filtered, selectionRect, selectedRows, selectedCols),
-    [filtered, selectionRect, selectedRows, selectedCols],
+    () => scopeChoices(filtered, selectionRect, selectedRows, selectedCols, viewSorted),
+    [filtered, selectionRect, selectedRows, selectedCols, viewSorted],
   );
   const [scopeIdx, setScopeIdx] = useState(() => {
     // A flow that prepared a specific scope (F28's "Export non-PII
@@ -51,7 +65,17 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
     }
     return 0;
   });
-  const scope = (choices[scopeIdx] ?? choices[0]).scope;
+  const rowScope = (choices[scopeIdx] ?? choices[0]).scope;
+  // "Visible columns in view order" composes with the whole-document row
+  // scopes; explicit selections already carry their own columns.
+  const viewColumnsApply =
+    columnMode === "view" &&
+    viewAffectsColumns &&
+    (rowScope.type === "all" || rowScope.type === "visibleRows");
+  const scope: ExportScope =
+    viewColumnsApply && viewProjection
+      ? { type: "selectedColumns", columns: viewProjection.physical }
+      : rowScope;
 
   const [splitKind, setSplitKind] = useState<SplitOptions["type"]>("none");
   const [rowsPerFile, setRowsPerFile] = useState(100_000);
@@ -76,7 +100,7 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
       stale = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meta?.id, meta?.revision, scopeKey(scope), scopeIdx]);
+  }, [meta?.id, meta?.revision, scopeKey(scope), scopeIdx, columnMode]);
 
   if (!meta) return null;
   const patch = (p: Partial<ExportOptions>) => setOpts((o) => ({ ...o, ...p }));
@@ -127,6 +151,41 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
             ))}
           </select>
         </Row>
+
+        {viewAffectsColumns && (
+          <Row label="Columns">
+            <div className="space-y-1">
+              <label className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  checked={columnMode === "file"}
+                  onChange={() => setColumnMode("file")}
+                  className="accent-violet-600"
+                />
+                <span>All columns, file order</span>
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  checked={columnMode === "view"}
+                  onChange={() => setColumnMode("view")}
+                  className="accent-violet-600"
+                />
+                <span>
+                  Visible columns, view order ({viewProjection?.physical.length ?? 0} of{" "}
+                  {meta.colCount}; exports the visible rows)
+                </span>
+              </label>
+            </div>
+          </Row>
+        )}
+
+        {viewSorted && (
+          <p className="text-xs text-zinc-500 dark:text-zinc-400">
+            A view sort is applied: the "Visible rows" scope (and any column export) writes rows in
+            the current view order; "All rows" keeps the file's own order.
+          </p>
+        )}
 
         <p className="rounded bg-zinc-50 px-2 py-1.5 text-xs tabular-nums text-zinc-600 dark:bg-zinc-900 dark:text-zinc-300">
           {counts

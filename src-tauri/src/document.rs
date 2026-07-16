@@ -57,12 +57,22 @@ struct CellEdit {
     new: String,
 }
 
+/// Positional column IDs for a fresh document: "c0".."cN-1". Deterministic so
+/// a saved named view (F12) still resolves after the same file is reopened.
+fn positional_column_ids(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("c{i}")).collect()
+}
+
 /// A removed column, captured for undo.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RemovedColumn {
     index: usize,
     header: String,
     values: Vec<String>,
+    /// Stable logical column ID (F12), restored verbatim on undo so named
+    /// views referencing the column survive a delete + undo round-trip.
+    #[serde(default)]
+    id: String,
 }
 
 /// A single reversible edit. Structural ops capture exactly what they need to
@@ -86,6 +96,10 @@ enum EditOp {
     InsertColumn {
         at: usize,
         name: String,
+        /// Stable logical column ID (F12), assigned once at op creation so
+        /// undo/redo (and journal replay) reproduce the same identity.
+        #[serde(default)]
+        id: String,
     },
     /// Columns removed, ascending by original index.
     DeleteColumns {
@@ -273,9 +287,23 @@ pub struct Document {
     follow_range_from: Option<usize>,
     /// `undo_stack.len()` at the last save; the document is dirty when it differs.
     saved_marker: usize,
-    /// Absolute indices of the rows matching the active filter, in order; `None`
-    /// when unfiltered. A non-undoable view: recomputed on `set_filter` and
-    /// cleared by structural mutations (handled in the command layer).
+    /// Stable logical column IDs (F12), in lockstep with `headers`. Assigned
+    /// positionally at parse ("c0".."cN-1"); inserts mint fresh IDs and every
+    /// op carries the IDs it touches, so undo/redo restore identities exactly.
+    column_ids: Vec<String>,
+    /// Next fresh column-ID number (never reused within a session).
+    next_column_id: u64,
+    /// Row-filter ingredient of the display view: absolute indices of the rows
+    /// matching the active filter, in SOURCE order; `None` when unfiltered.
+    filter_rows: Option<Vec<usize>>,
+    /// Non-destructive sort ingredient of the display view (F12): the keys the
+    /// visible rows are ordered by. Never touches source order or the undo
+    /// stack; empty = source order.
+    view_sort: Vec<SortKey>,
+    /// The COMPOSED display→absolute row mapping (filter ∘ view sort); `None`
+    /// when both ingredients are off. A non-undoable snapshot: recomputed when
+    /// either ingredient changes and cleared by structural mutations (handled
+    /// in the command layer).
     filter_view: Option<Vec<usize>>,
     /// Monotonically increasing revision, bumped on every change that could
     /// invalidate a deferred operation: data and structural mutations,
@@ -364,6 +392,10 @@ impl Document {
             follow: false,
             follow_range_from: None,
             saved_marker: 0,
+            column_ids: positional_column_ids(n_cols_final),
+            next_column_id: n_cols_final as u64,
+            filter_rows: None,
+            view_sort: Vec::new(),
             filter_view: None,
             revision: 1,
             col_revisions: vec![1; n_cols_final],
@@ -405,6 +437,10 @@ impl Document {
             follow: false,
             follow_range_from: None,
             saved_marker: 0,
+            column_ids: positional_column_ids(cols),
+            next_column_id: cols as u64,
+            filter_rows: None,
+            view_sort: Vec::new(),
             filter_view: None,
             revision: 1,
             col_revisions: vec![1; cols],
@@ -453,6 +489,10 @@ impl Document {
             follow: false,
             follow_range_from: None,
             saved_marker: 0,
+            column_ids: positional_column_ids(n_cols),
+            next_column_id: n_cols as u64,
+            filter_rows: None,
+            view_sort: Vec::new(),
             filter_view: None,
             revision: 1,
             col_revisions: vec![1; n_cols],
@@ -529,10 +569,14 @@ impl Document {
         self.revision += 1;
         self.touch_all_columns();
         // A live "only new rows" range keeps following the file: extend the
-        // view to include what was just appended.
+        // view to include what was just appended. Follow documents are
+        // memory-backed, so recomposition cannot fail in practice — if it
+        // ever did, dropping the whole view beats leaving a stale one.
         if let Some(from) = self.follow_range_from {
             let rows: Vec<usize> = (from.min(self.rows.len())..self.rows.len()).collect();
-            self.set_filter(rows);
+            if self.set_filter(rows).is_err() {
+                self.clear_row_view();
+            }
         }
     }
 
@@ -714,9 +758,9 @@ impl Document {
         }
     }
 
-    // ----- row filter view -------------------------------------------------
+    // ----- row view (filter ∘ non-destructive sort) ------------------------
 
-    /// Visible row count: the filtered count when a filter is active, else the
+    /// Visible row count: the view's count when one is active, else the
     /// full row count.
     pub fn visible_len(&self) -> usize {
         self.filter_view
@@ -725,27 +769,108 @@ impl Document {
             .unwrap_or_else(|| self.n_rows())
     }
 
-    /// The active filter's matching absolute row indices, in order, if any.
+    /// The active view's absolute row indices, in DISPLAY order, if any.
     pub fn filter_view(&self) -> Option<&[usize]> {
         self.filter_view.as_deref()
     }
 
-    /// Replace the active filter with a precomputed view (absolute row indices).
-    pub fn set_filter(&mut self, view: Vec<usize>) {
-        self.filter_view = Some(view);
-        // The visible-row set is an input to scoped previews, so changing it
-        // must invalidate them.
-        self.revision += 1;
-        self.filter_revision = self.revision;
+    /// Replace the active filter with a precomputed row set (absolute indices
+    /// in source order). An active view sort (F12) is preserved: the new
+    /// visible rows are re-ordered by the same keys.
+    pub fn set_filter(&mut self, view: Vec<usize>) -> AppResult<()> {
+        self.filter_rows = Some(view);
+        self.recompose_row_view()
     }
 
-    pub fn clear_filter(&mut self) {
+    /// Drop the filter ingredient (a view sort, if any, stays applied).
+    pub fn clear_filter(&mut self) -> AppResult<()> {
         // A cleared filter also ends the F19 live "only new rows" range.
         self.follow_range_from = None;
-        if self.filter_view.take().is_some() {
+        if self.filter_rows.take().is_some() {
+            self.recompose_row_view()?;
+        }
+        Ok(())
+    }
+
+    /// Set (or clear, with empty `keys`) the non-destructive view sort (F12).
+    /// Orders the DISPLAY view only: source rows never move, nothing enters
+    /// the undo stack, and the document does not become dirty. Available on
+    /// read-only (indexed / follow) documents too.
+    pub fn set_view_sort(&mut self, keys: Vec<SortKey>) -> AppResult<()> {
+        for key in &keys {
+            if key.column >= self.headers.len() {
+                return Err(AppError::invalid("sort column out of range"));
+            }
+        }
+        self.view_sort = keys;
+        self.recompose_row_view()
+    }
+
+    /// Whether a non-destructive view sort is active.
+    pub fn view_sorted(&self) -> bool {
+        !self.view_sort.is_empty()
+    }
+
+    /// Drop BOTH row-view ingredients (filter and view sort). Structural
+    /// mutations call this from the command layer: they shift the absolute
+    /// indices a snapshot view refers to.
+    pub fn clear_row_view(&mut self) {
+        // Ending the whole row view also ends the F19 live range.
+        self.follow_range_from = None;
+        let had_view = self.filter_rows.is_some() || !self.view_sort.is_empty();
+        self.filter_rows = None;
+        self.view_sort.clear();
+        self.filter_view = None;
+        if had_view {
+            // The visible-row set is an input to scoped previews, so changing
+            // it must invalidate them.
             self.revision += 1;
             self.filter_revision = self.revision;
         }
+    }
+
+    /// Rebuild the composed display→absolute mapping from the two ingredients
+    /// and bump the revision (the visible-row set is an input to scoped
+    /// previews). The sort extracts only the key columns — streamed for
+    /// indexed documents — and is stable, so ties keep source/filter order.
+    fn recompose_row_view(&mut self) -> AppResult<()> {
+        let composed = if self.view_sort.is_empty() {
+            self.filter_rows.clone()
+        } else {
+            let base: Vec<usize> = match &self.filter_rows {
+                Some(rows) => rows.clone(),
+                None => (0..self.n_rows()).collect(),
+            };
+            // Remap the keys onto the extracted key-column layout.
+            let key_cols: Vec<usize> = self.view_sort.iter().map(|k| k.column).collect();
+            let local_keys: Vec<SortKey> = self
+                .view_sort
+                .iter()
+                .enumerate()
+                .map(|(i, k)| SortKey {
+                    column: i,
+                    descending: k.descending,
+                })
+                .collect();
+            let mut keyed: Vec<(usize, Vec<String>)> = Vec::with_capacity(base.len());
+            self.visit_rows_at(&base, &mut |_, row| {
+                let keys: Vec<String> = key_cols
+                    .iter()
+                    .map(|&c| row.get(c).cloned().unwrap_or_default())
+                    .collect();
+                keyed.push((0, keys));
+                Ok(true)
+            })?;
+            for (slot, &abs) in keyed.iter_mut().zip(base.iter()) {
+                slot.0 = abs;
+            }
+            keyed.sort_by(|a, b| crate::sort::compare_rows(&a.1, &b.1, &local_keys));
+            Some(keyed.into_iter().map(|(abs, _)| abs).collect())
+        };
+        self.filter_view = composed;
+        self.revision += 1;
+        self.filter_revision = self.revision;
+        Ok(())
     }
 
     /// Translate a visible (display) row index to its absolute index. Identity
@@ -928,9 +1053,11 @@ impl Document {
             file_name,
             row_count: self.visible_len(),
             total_row_count: self.n_rows(),
-            filtered: self.filter_view.is_some(),
+            filtered: self.filter_rows.is_some(),
             col_count: self.headers.len(),
             headers: self.headers.clone(),
+            column_ids: self.column_ids.clone(),
+            view_sorted: self.view_sorted(),
             has_header_row: self.has_header_row,
             delimiter: String::from_utf8_lossy(&[self.delimiter]).to_string(),
             encoding: self.encoding_name.clone(),
@@ -1939,6 +2066,9 @@ impl Document {
             let rev = self.revision;
             self.col_revisions.resize(self.headers.len(), rev);
         }
+        // Column IDs are maintained inside apply/revert for every structural
+        // op, so they can never drift from the headers.
+        debug_assert_eq!(self.column_ids.len(), self.headers.len());
     }
 
     fn stamp_op(&mut self, op: &EditOp) {
@@ -2014,8 +2144,16 @@ impl Document {
         op
     }
 
+    /// Mint a fresh stable column ID (F12). Never reused within a session.
+    fn fresh_column_id(&mut self) -> String {
+        let id = format!("c{}", self.next_column_id);
+        self.next_column_id += 1;
+        id
+    }
+
     fn op_insert_column(&mut self, at: usize, name: String) -> EditOp {
-        let op = EditOp::InsertColumn { at, name };
+        let id = self.fresh_column_id();
+        let op = EditOp::InsertColumn { at, name, id };
         self.apply(&op);
         op
     }
@@ -2027,6 +2165,7 @@ impl Document {
                 index: i,
                 header: self.headers[i].clone(),
                 values: self.rows.iter().map(|r| r[i].clone()).collect(),
+                id: self.column_ids[i].clone(),
             })
             .collect();
         let op = EditOp::DeleteColumns { removed };
@@ -2061,8 +2200,9 @@ impl Document {
                 self.rows.insert(*to, row);
                 self.remap_dirty_row_moved(*from, *to);
             }
-            EditOp::InsertColumn { at, name } => {
+            EditOp::InsertColumn { at, name, id } => {
                 self.headers.insert(*at, name.clone());
+                self.column_ids.insert(*at, id.clone());
                 for row in &mut self.rows {
                     row.insert(*at, String::new());
                 }
@@ -2072,6 +2212,7 @@ impl Document {
                 let indices: Vec<usize> = removed.iter().map(|c| c.index).collect();
                 for &i in indices.iter().rev() {
                     self.headers.remove(i);
+                    self.column_ids.remove(i);
                     for row in &mut self.rows {
                         row.remove(i);
                     }
@@ -2084,6 +2225,8 @@ impl Document {
             EditOp::MoveColumn { from, to } => {
                 let header = self.headers.remove(*from);
                 self.headers.insert(*to, header);
+                let id = self.column_ids.remove(*from);
+                self.column_ids.insert(*to, id);
                 for row in &mut self.rows {
                     let cell = row.remove(*from);
                     row.insert(*to, cell);
@@ -2131,6 +2274,7 @@ impl Document {
             }
             EditOp::InsertColumn { at, .. } => {
                 self.headers.remove(*at);
+                self.column_ids.remove(*at);
                 for row in &mut self.rows {
                     row.remove(*at);
                 }
@@ -2139,6 +2283,7 @@ impl Document {
             EditOp::DeleteColumns { removed } => {
                 for col in removed.iter() {
                     self.headers.insert(col.index, col.header.clone());
+                    self.column_ids.insert(col.index, col.id.clone());
                     for (r, row) in self.rows.iter_mut().enumerate() {
                         row.insert(col.index, col.values[r].clone());
                     }
@@ -2152,6 +2297,8 @@ impl Document {
             EditOp::MoveColumn { from, to } => {
                 let header = self.headers.remove(*to);
                 self.headers.insert(*from, header);
+                let id = self.column_ids.remove(*to);
+                self.column_ids.insert(*from, id);
                 for row in &mut self.rows {
                     let cell = row.remove(*to);
                     row.insert(*from, cell);
@@ -2543,8 +2690,15 @@ mod tests {
         assert_bumps(&mut d, "set_header_mode", |d| {
             d.set_header_mode(false).unwrap()
         });
-        assert_bumps(&mut d, "set_filter", |d| d.set_filter(vec![0]));
-        assert_bumps(&mut d, "clear_filter", |d| d.clear_filter());
+        assert_bumps(&mut d, "set_filter", |d| d.set_filter(vec![0]).unwrap());
+        assert_bumps(&mut d, "clear_filter", |d| d.clear_filter().unwrap());
+        assert_bumps(&mut d, "set_view_sort", |d| {
+            d.set_view_sort(vec![SortKey {
+                column: 0,
+                descending: true,
+            }])
+            .unwrap()
+        });
     }
 
     #[test]
@@ -2554,7 +2708,7 @@ mod tests {
         let mut d = doc_from("a\n1\n2", true);
         d.set_follow(true);
         d.set_follow_range(Some(2));
-        d.set_filter(Vec::new()); // rows 0..2 are old; nothing new yet
+        d.set_filter(Vec::new()).unwrap(); // rows 0..2 are old; nothing new yet
         assert_eq!(d.visible_len(), 0);
 
         d.append_follow_rows(vec![vec!["3".into()]]);
@@ -2562,7 +2716,7 @@ mod tests {
         assert_eq!(d.get_rows(0, 10).unwrap().rows[0][0], "3");
 
         // Clearing the filter ends the live range.
-        d.clear_filter();
+        d.clear_filter().unwrap();
         d.append_follow_rows(vec![vec!["4".into()]]);
         assert_eq!(d.visible_len(), 4);
     }
@@ -2575,7 +2729,7 @@ mod tests {
         d.set_cell(0, 0, "1".into()).unwrap();
         assert_eq!(d.revision(), r);
         // Clearing a filter that isn't set changes nothing.
-        d.clear_filter();
+        d.clear_filter().unwrap();
         assert_eq!(d.revision(), r);
         // Toggling the header mode to its current value changes nothing.
         d.set_header_mode(true).unwrap();
@@ -2675,10 +2829,10 @@ mod tests {
             f0,
             "cell edits leave the filter revision"
         );
-        d.set_filter(vec![0]);
+        d.set_filter(vec![0]).unwrap();
         assert_eq!(d.filter_revision(), d.revision());
         let f1 = d.filter_revision();
-        d.clear_filter();
+        d.clear_filter().unwrap();
         assert!(d.filter_revision() > f1);
     }
 
@@ -2994,14 +3148,38 @@ mod indexed_tests {
     #[test]
     fn filtered_reads_work_on_indexed_documents() {
         let (_, mut indexed, root) = golden_pair(SAMPLE);
-        indexed.set_filter(vec![1, 3]);
+        indexed.set_filter(vec![1, 3]).unwrap();
         assert_eq!(indexed.visible_len(), 2);
         let win = indexed.get_rows(0, 10).unwrap();
         assert_eq!(win.rows.len(), 2);
         assert_eq!(win.rows[0][0], "Doe, Jane");
         assert_eq!(win.rows[1][0], "multi\nline");
-        indexed.clear_filter();
+        indexed.clear_filter().unwrap();
         assert_eq!(indexed.visible_len(), 4);
+        drop(indexed);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn view_sort_works_on_indexed_documents() {
+        // The non-destructive sort (F12) is a read-only view, so unlike the
+        // destructive sort it must work on indexed documents too.
+        let (_, mut indexed, root) = golden_pair(SAMPLE);
+        assert!(!indexed.is_editable());
+        indexed
+            .set_view_sort(vec![SortKey {
+                column: 0,
+                descending: false,
+            }])
+            .unwrap();
+        let win = indexed.get_rows(0, 10).unwrap();
+        let first_col: Vec<&str> = win.rows.iter().map(|r| r[0].as_str()).collect();
+        let mut expected = first_col.clone();
+        expected.sort();
+        assert_eq!(first_col, expected, "display order follows the view sort");
+        assert!(indexed.meta().view_sorted);
+        assert!(!indexed.meta().filtered, "sort alone is not a filter");
+        indexed.clear_row_view();
         drop(indexed);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3333,5 +3511,179 @@ mod f16_tests {
         live.reset_journal_baseline();
         let (_h, records) = read_journal(&journal_path).unwrap();
         assert!(records.is_empty(), "a clean save leaves an empty journal");
+    }
+}
+
+#[cfg(test)]
+mod f12_tests {
+    use super::*;
+    use crate::parse::{parse, ParseSettings};
+
+    fn doc_from(csv: &str, has_header: bool) -> Document {
+        let parsed = parse(csv.as_bytes(), &ParseSettings::default()).unwrap();
+        Document::from_parsed(1, None, parsed, has_header)
+    }
+
+    fn key(column: usize, descending: bool) -> SortKey {
+        SortKey { column, descending }
+    }
+
+    #[test]
+    fn column_ids_positional_and_stable_through_rename() {
+        let mut d = doc_from("name,age\nAda,36", true);
+        assert_eq!(d.meta().column_ids, vec!["c0", "c1"]);
+        d.rename_column(0, "person".into()).unwrap();
+        assert_eq!(
+            d.meta().column_ids,
+            vec!["c0", "c1"],
+            "renaming changes the header text, never the identity"
+        );
+        d.undo().unwrap();
+        assert_eq!(d.meta().column_ids, vec!["c0", "c1"]);
+    }
+
+    #[test]
+    fn column_ids_track_structure_and_undo_redo_restores_identity() {
+        let mut d = doc_from("a,b\n1,2", true);
+        d.insert_column(1, "x".into()).unwrap();
+        assert_eq!(d.meta().column_ids, vec!["c0", "c2", "c1"]);
+        d.move_column(2, 0).unwrap();
+        assert_eq!(d.meta().column_ids, vec!["c1", "c0", "c2"]);
+        d.delete_columns(vec![0]).unwrap();
+        assert_eq!(d.meta().column_ids, vec!["c0", "c2"]);
+
+        // Undo restores the SAME identities, not fresh ones.
+        d.undo().unwrap();
+        assert_eq!(d.meta().column_ids, vec!["c1", "c0", "c2"]);
+        d.undo().unwrap();
+        assert_eq!(d.meta().column_ids, vec!["c0", "c2", "c1"]);
+        d.undo().unwrap();
+        assert_eq!(d.meta().column_ids, vec!["c0", "c1"]);
+        // Redo of the insert reproduces the same minted id.
+        d.redo().unwrap();
+        assert_eq!(d.meta().column_ids, vec!["c0", "c2", "c1"]);
+    }
+
+    #[test]
+    fn column_ids_survive_replace_columns_round_trip() {
+        let mut d = doc_from("full,keep\nAda Lovelace,1", true);
+        let before = d.meta().column_ids.clone();
+        d.replace_columns(
+            vec![0],
+            0,
+            vec![
+                ("first".into(), vec!["Ada".into()]),
+                ("last".into(), vec!["Lovelace".into()]),
+            ],
+        )
+        .unwrap();
+        let after = d.meta().column_ids.clone();
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[2], "c1", "untouched column keeps its id");
+        assert_ne!(after[0], before[0], "replacement columns get fresh ids");
+        d.undo().unwrap();
+        assert_eq!(
+            d.meta().column_ids,
+            before,
+            "one undo restores the original identities"
+        );
+    }
+
+    #[test]
+    fn journal_replay_reproduces_column_ids() {
+        // The stable id rides inside the serialized op, so crash recovery
+        // (F16) rebuilds the same identities a named view was saved against.
+        let mut live = doc_from("a,b\n1,2", true);
+        live.insert_column(1, "mid".into()).unwrap();
+        let op_json = serde_json::to_value(&live.undo_stack[0]).unwrap();
+
+        let mut recovered = doc_from("a,b\n1,2", true);
+        recovered
+            .replay_journal_records(&[crate::journal::JournalRecord::Op { op: op_json }])
+            .unwrap();
+        assert_eq!(recovered.meta().column_ids, live.meta().column_ids);
+    }
+
+    #[test]
+    fn view_sort_orders_display_without_touching_source() {
+        let mut d = doc_from("n\n9\n10\n2", true);
+        d.set_view_sort(vec![key(0, false)]).unwrap();
+
+        let win = d.get_rows(0, 10).unwrap();
+        let shown: Vec<&str> = win.rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(shown, vec!["2", "9", "10"], "typed (numeric) order");
+
+        // Source order, undo history and the dirty flag are untouched.
+        assert_eq!(d.rows()[0][0], "9");
+        assert!(!d.is_dirty());
+        assert!(!d.can_undo());
+        assert!(d.meta().view_sorted);
+        assert!(!d.meta().filtered);
+
+        // Display coordinates translate to the correct absolute rows, so an
+        // edit made in a sorted view lands on the right source row.
+        assert_eq!(d.display_to_abs(0), Some(2));
+        assert_eq!(d.display_to_abs(2), Some(1));
+        d.set_cell(d.display_to_abs(0).unwrap(), 0, "3".into())
+            .unwrap();
+        assert_eq!(d.rows()[2][0], "3", "the edit hit the absolute row");
+    }
+
+    #[test]
+    fn view_sort_composes_with_filter_and_clears_independently() {
+        let mut d = doc_from("v\nb\nd\na\nc", true);
+        d.set_filter(vec![0, 1, 3]).unwrap(); // hide "a"
+        d.set_view_sort(vec![key(0, true)]).unwrap();
+        let shown: Vec<usize> = d.filter_view().unwrap().to_vec();
+        assert_eq!(shown, vec![1, 3, 0], "filtered rows in descending order");
+
+        // Re-filtering keeps the sort.
+        d.set_filter(vec![0, 2]).unwrap();
+        assert_eq!(d.filter_view().unwrap(), &[0, 2], "b > a descending");
+        assert!(d.meta().view_sorted);
+
+        // Clearing the filter keeps the sort over all rows.
+        d.clear_filter().unwrap();
+        assert_eq!(d.filter_view().unwrap(), &[1, 3, 0, 2]);
+        assert!(!d.meta().filtered);
+
+        // Clearing the sort with empty keys drops the whole view.
+        d.set_view_sort(Vec::new()).unwrap();
+        assert!(d.filter_view().is_none());
+        assert!(!d.meta().view_sorted);
+    }
+
+    #[test]
+    fn view_sort_is_stable_for_ties() {
+        let mut d = doc_from("k,i\nx,1\nx,2\nx,3", true);
+        d.set_view_sort(vec![key(0, false)]).unwrap();
+        assert_eq!(
+            d.filter_view().unwrap(),
+            &[0, 1, 2],
+            "equal keys keep source order"
+        );
+    }
+
+    #[test]
+    fn clear_row_view_drops_both_ingredients() {
+        let mut d = doc_from("v\n2\n1", true);
+        d.set_filter(vec![0]).unwrap();
+        d.set_view_sort(vec![key(0, false)]).unwrap();
+        let rev = d.revision();
+        d.clear_row_view();
+        assert!(d.filter_view().is_none());
+        assert!(!d.meta().filtered);
+        assert!(!d.meta().view_sorted);
+        assert_eq!(d.revision(), rev + 1, "one bump for the combined clear");
+        // Idempotent: clearing an empty view bumps nothing.
+        d.clear_row_view();
+        assert_eq!(d.revision(), rev + 1);
+    }
+
+    #[test]
+    fn view_sort_rejects_out_of_range_column() {
+        let mut d = doc_from("a\n1", true);
+        assert!(d.set_view_sort(vec![key(5, false)]).is_err());
+        assert!(!d.meta().view_sorted);
     }
 }

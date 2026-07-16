@@ -24,6 +24,14 @@ pub struct DocumentMeta {
     pub filtered: bool,
     pub col_count: usize,
     pub headers: Vec<String>,
+    /// Stable logical column IDs (F12), in lockstep with `headers`. Assigned
+    /// positionally at parse ("c0".."cN-1") and preserved through renames,
+    /// reorders and undo/redo, so named views survive structural edits.
+    #[serde(default)]
+    pub column_ids: Vec<String>,
+    /// Whether a non-destructive view sort (F12) is currently applied.
+    #[serde(default)]
+    pub view_sorted: bool,
     pub has_header_row: bool,
     /// The delimiter as a one-character string (e.g. "," or "\t").
     pub delimiter: String,
@@ -79,8 +87,8 @@ pub struct RowsResponse {
     pub dirty: Vec<Vec<bool>>,
 }
 
-/// One key in a multi-column sort.
-#[derive(Debug, Clone, Deserialize)]
+/// One key in a multi-column sort (destructive sort and the F12 view sort).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SortKey {
     pub column: usize,
@@ -183,8 +191,9 @@ pub struct ColumnSummary {
     pub numeric: Option<NumericSummary>,
 }
 
-/// Comparison operator for a single filter condition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+/// Comparison operator for a single filter condition. Serializable so named
+/// views (F12) can persist their filter in the settings file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FilterOp {
     Equals,
@@ -203,7 +212,7 @@ pub enum FilterOp {
 }
 
 /// How sibling filter nodes are combined.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Conjunction {
     And,
@@ -211,7 +220,7 @@ pub enum Conjunction {
 }
 
 /// A single leaf condition: `column <op> value`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FilterCondition {
     pub column: usize,
@@ -223,7 +232,7 @@ pub struct FilterCondition {
 }
 
 /// A group of filter nodes combined with a conjunction (supports nesting).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FilterGroup {
     pub conjunction: Conjunction,
@@ -232,7 +241,7 @@ pub struct FilterGroup {
 
 /// A node in the filter tree: a leaf condition or a nested group. Tagged by a
 /// `type` field on the wire ("condition" / "group").
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum FilterNode {
     Condition(FilterCondition),

@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(changes, vec![(1, 0, "foo".to_string())]);
 
         // Visible-rows scope skips hidden rows entirely.
-        d.set_filter(vec![0, 2]); // hide the row with FOO
+        d.set_filter(vec![0, 2]).unwrap(); // hide the row with FOO
         let changes = mapping_changes(&d, 0, &mapping, &ExportScope::VisibleRows).unwrap();
         assert!(changes.is_empty(), "hidden rows are untouched");
     }

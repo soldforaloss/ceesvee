@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useStore } from "../store/useStore";
 
 export interface ColumnMenuState {
+  /** PHYSICAL column index (the grid translates display → physical). */
   col: number;
   x: number;
   y: number;
@@ -11,12 +12,14 @@ export interface ColumnMenuState {
 interface ColumnMenuProps {
   state: ColumnMenuState;
   headers: string[];
+  /** Stable logical column IDs (F12), for layout membership checks. */
+  columnIds: string[];
   /** Indexed read-only document (F10): only view operations are offered. */
   readOnly?: boolean;
   onClose: () => void;
 }
 
-export function ColumnMenu({ state, headers, readOnly, onClose }: ColumnMenuProps) {
+export function ColumnMenu({ state, headers, columnIds, readOnly, onClose }: ColumnMenuProps) {
   const { col, x, y } = state;
   const ref = useRef<HTMLDivElement>(null);
   const [renaming, setRenaming] = useState(false);
@@ -28,6 +31,15 @@ export function ColumnMenu({ state, headers, readOnly, onClose }: ColumnMenuProp
   const deleteColumns = useStore((s) => s.deleteColumns);
   const setFrozenCols = useStore((s) => s.setFrozenCols);
   const frozenCols = useStore((s) => s.frozenColumnCount);
+  // F12: non-destructive view operations (work on read-only documents too).
+  const applyViewSort = useStore((s) => s.applyViewSort);
+  const setColumnHidden = useStore((s) => s.setColumnHidden);
+  const pinColumn = useStore((s) => s.pinColumn);
+  const requestAutoFit = useStore((s) => s.requestAutoFit);
+  const columnLayout = useStore((s) => s.columnLayout);
+  const columnId = columnIds[col];
+  const isPinned = columnId !== undefined && !!columnLayout?.pinnedColumnIds.includes(columnId);
+  const hasPins = (columnLayout?.pinnedColumnIds.length ?? 0) > 0;
 
   useEffect(() => {
     const onDown = (e: MouseEvent) => {
@@ -100,11 +112,29 @@ export function ColumnMenu({ state, headers, readOnly, onClose }: ColumnMenuProp
               <MenuItem onClick={() => run(() => void sortBy([{ column: col, descending: true }]))}>
                 Sort descending
               </MenuItem>
-              <Divider />
             </>
           )}
-          <MenuItem onClick={() => run(() => setFrozenCols(col + 1))}>Freeze up to here</MenuItem>
-          {frozenCols > 0 && (
+          <MenuItem
+            onClick={() => run(() => void applyViewSort([{ column: col, descending: false }]))}
+          >
+            Sort view A→Z (non-destructive)
+          </MenuItem>
+          <MenuItem
+            onClick={() => run(() => void applyViewSort([{ column: col, descending: true }]))}
+          >
+            Sort view Z→A (non-destructive)
+          </MenuItem>
+          <Divider />
+          <MenuItem onClick={() => run(() => setColumnHidden(col, true))}>Hide column</MenuItem>
+          <MenuItem onClick={() => run(() => pinColumn(col, !isPinned))}>
+            {isPinned ? "Unpin column" : "Pin column"}
+          </MenuItem>
+          <MenuItem onClick={() => run(() => requestAutoFit([col]))}>Auto-fit width</MenuItem>
+          <MenuItem onClick={() => run(() => requestAutoFit("all"))}>Auto-fit all columns</MenuItem>
+          {!hasPins && (
+            <MenuItem onClick={() => run(() => setFrozenCols(col + 1))}>Freeze up to here</MenuItem>
+          )}
+          {!hasPins && frozenCols > 0 && (
             <MenuItem onClick={() => run(() => setFrozenCols(0))}>Unfreeze columns</MenuItem>
           )}
           {!readOnly && (

@@ -744,7 +744,7 @@ pub fn set_row_range_filter(
     write_doc(&state, doc_id, |doc| {
         let rows: Vec<usize> = (from_row.min(doc.n_rows())..doc.n_rows()).collect();
         doc.set_follow_range(Some(from_row));
-        doc.set_filter(rows);
+        doc.set_filter(rows)?;
         Ok(doc.meta())
     })
 }
@@ -1063,7 +1063,7 @@ pub async fn apply_semantic_filter(
         // …then swap the filter view in (re-checked: an edit may have raced).
         let mut doc = handle.write().map_err(poisoned)?;
         doc.check_revision(expected_revision)?;
-        doc.set_filter(rows);
+        doc.set_filter(rows)?;
         Ok(doc.meta())
     })
     .await
@@ -1189,7 +1189,7 @@ pub async fn apply_crossval_filter(
         };
         let mut doc = handle.write().map_err(poisoned)?;
         doc.check_revision(expected_revision)?;
-        doc.set_filter(rows);
+        doc.set_filter(rows)?;
         Ok(doc.meta())
     })
     .await
@@ -1311,7 +1311,7 @@ pub async fn apply_outlier_filter(
         };
         let mut doc = handle.write().map_err(poisoned)?;
         doc.check_revision(expected_revision)?;
-        doc.set_filter(rows);
+        doc.set_filter(rows)?;
         Ok(doc.meta())
     })
     .await
@@ -1354,9 +1354,9 @@ pub async fn apply_outlier_action(
         doc.check_revision(expected_revision)?;
         let computed = outlier::action_changes(&doc, &spec, action)?;
         if !computed.remove_rows.is_empty() {
-            // Row removal shifts the absolute indices an active filter view
+            // Row removal shifts the absolute indices an active row view
             // refers to — drop it first, like every structural delete path.
-            doc.clear_filter();
+            doc.clear_row_view();
             doc.delete_rows(computed.remove_rows)?;
         } else {
             doc.set_cells(computed.changes)?;
@@ -2142,7 +2142,7 @@ pub fn apply_diagnostic_filter(
     write_doc(&state, doc_id, |doc| {
         doc.check_revision(expected_revision)?;
         let rows = diagnostics::issue_rows(doc, &issue_id)?;
-        doc.set_filter(rows);
+        doc.set_filter(rows)?;
         Ok(doc.meta())
     })
 }
@@ -2463,7 +2463,7 @@ pub async fn apply_duplicate_filter(
         // …then swap the filter view in (re-checked: an edit may have raced).
         let mut doc = handle.write().map_err(poisoned)?;
         doc.check_revision(expected_revision)?;
-        doc.set_filter(rows);
+        doc.set_filter(rows)?;
         Ok(doc.meta())
     })
     .await
@@ -2503,7 +2503,7 @@ pub async fn apply_deduplicate(
             let mut doc = handle.write().map_err(poisoned)?;
             // Results cannot be applied after the document revision changes.
             doc.check_revision(expected_revision)?;
-            doc.clear_filter();
+            doc.clear_row_view();
             doc.delete_rows(removals)?;
             Ok(())
         })
@@ -2585,7 +2585,7 @@ pub async fn apply_transform(
             // Cell values (and possibly column structure) change: the filter
             // view may no longer be correct, so drop it. The front end
             // re-applies its filter spec afterwards.
-            doc.clear_filter();
+            doc.clear_row_view();
             transform::commit(&mut doc, computed.changes)?;
             Ok(())
         })
@@ -2812,7 +2812,7 @@ pub fn apply_paste_special(
         let block = paste::parse_clipboard(&text)?;
         let block = paste::transform_block(block, &options, selection_rows, selection_cols);
         // Pasting can grow/reshape the grid, so it drops any active filter.
-        doc.clear_filter();
+        doc.clear_row_view();
         doc.paste_special(
             abs,
             anchor_col,
@@ -2837,7 +2837,7 @@ pub fn paste(
         // Pasting can grow/reshape the grid, so it drops any active filter and
         // operates on the absolute anchor position.
         let abs = abs_insert_row(doc, anchor_row)?;
-        doc.clear_filter();
+        doc.clear_row_view();
         doc.paste(abs, anchor_col, block)?;
         Ok(doc.meta())
     })
@@ -2849,7 +2849,7 @@ pub fn paste(
 pub fn insert_rows(doc_id: u64, at: usize, count: usize, state: Db<'_>) -> AppResult<DocumentMeta> {
     write_doc(&state, doc_id, |doc| {
         let abs = abs_insert_row(doc, at)?;
-        doc.clear_filter();
+        doc.clear_row_view();
         doc.insert_rows(abs, count)?;
         Ok(doc.meta())
     })
@@ -2862,7 +2862,7 @@ pub fn delete_rows(doc_id: u64, indices: Vec<usize>, state: Db<'_>) -> AppResult
         for d in indices {
             abs.push(abs_row(doc, d)?);
         }
-        doc.clear_filter();
+        doc.clear_row_view();
         doc.delete_rows(abs)?;
         Ok(doc.meta())
     })
@@ -2873,7 +2873,7 @@ pub fn move_row(doc_id: u64, from: usize, to: usize, state: Db<'_>) -> AppResult
     write_doc(&state, doc_id, |doc| {
         let from_abs = abs_row(doc, from)?;
         let to_abs = abs_row(doc, to)?;
-        doc.clear_filter();
+        doc.clear_row_view();
         doc.move_row(from_abs, to_abs)?;
         Ok(doc.meta())
     })
@@ -2890,7 +2890,7 @@ pub fn insert_column(
 ) -> AppResult<DocumentMeta> {
     write_doc(&state, doc_id, |doc| {
         // Column structure shifts the indices a filter references, so drop it.
-        doc.clear_filter();
+        doc.clear_row_view();
         doc.insert_column(at, name)?;
         Ok(doc.meta())
     })
@@ -2899,7 +2899,7 @@ pub fn insert_column(
 #[tauri::command]
 pub fn delete_columns(doc_id: u64, indices: Vec<usize>, state: Db<'_>) -> AppResult<DocumentMeta> {
     write_doc(&state, doc_id, |doc| {
-        doc.clear_filter();
+        doc.clear_row_view();
         doc.delete_columns(indices)?;
         Ok(doc.meta())
     })
@@ -2921,7 +2921,7 @@ pub fn rename_column(
 #[tauri::command]
 pub fn move_column(doc_id: u64, from: usize, to: usize, state: Db<'_>) -> AppResult<DocumentMeta> {
     write_doc(&state, doc_id, |doc| {
-        doc.clear_filter();
+        doc.clear_row_view();
         doc.move_column(from, to)?;
         Ok(doc.meta())
     })
@@ -2933,7 +2933,7 @@ pub fn move_column(doc_id: u64, from: usize, to: usize, state: Db<'_>) -> AppRes
 pub fn sort(doc_id: u64, keys: Vec<SortKey>, state: Db<'_>) -> AppResult<DocumentMeta> {
     write_doc(&state, doc_id, |doc| {
         // Sorting reorders all rows, invalidating a filter view; drop it.
-        doc.clear_filter();
+        doc.clear_row_view();
         doc.sort(&keys)?;
         Ok(doc.meta())
     })
@@ -2944,7 +2944,7 @@ pub fn set_header_mode(doc_id: u64, has_header: bool, state: Db<'_>) -> AppResul
     write_doc(&state, doc_id, |doc| {
         // Re-interpreting the header row shifts all row indices; drop any filter.
         doc.ensure_editable()?;
-        doc.clear_filter();
+        doc.clear_row_view();
         doc.set_header_mode(has_header)?;
         Ok(doc.meta())
     })
@@ -2982,20 +2982,45 @@ pub fn set_filter(doc_id: u64, spec: FilterGroup, state: Db<'_>) -> AppResult<Do
         doc.set_follow_range(None);
         let view = filter_mod::matching_rows(doc, &spec)?;
         // A filter that excludes nothing isn't an active filter — avoids reporting
-        // "N of N rows · filtered" for a match-all or empty spec.
+        // "N of N rows · filtered" for a match-all or empty spec. An active view
+        // sort (F12) is preserved either way.
         if view.len() == doc.n_rows() {
-            doc.clear_filter();
+            doc.clear_filter()?;
         } else {
-            doc.set_filter(view);
+            doc.set_filter(view)?;
         }
         Ok(doc.meta())
     })
 }
 
+/// Drop the row filter. A non-destructive view sort (F12) stays applied;
+/// `reset_row_view` clears both.
 #[tauri::command]
 pub fn clear_filter(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
     write_doc(&state, doc_id, |doc| {
-        doc.clear_filter();
+        doc.clear_filter()?;
+        Ok(doc.meta())
+    })
+}
+
+/// Set (or clear, with empty `keys`) the non-destructive view sort (F12).
+/// Orders the DISPLAY view only: source rows never move, nothing enters the
+/// undo stack, and the document never becomes dirty. Works on read-only
+/// (indexed / follow) documents; composes with an active filter.
+#[tauri::command]
+pub fn set_view_sort(doc_id: u64, keys: Vec<SortKey>, state: Db<'_>) -> AppResult<DocumentMeta> {
+    write_doc(&state, doc_id, |doc| {
+        doc.set_view_sort(keys)?;
+        Ok(doc.meta())
+    })
+}
+
+/// Drop BOTH row-view ingredients (filter and view sort) in one step —
+/// "Reset view", and jumps that need display == absolute coordinates.
+#[tauri::command]
+pub fn reset_row_view(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
+    write_doc(&state, doc_id, |doc| {
+        doc.clear_row_view();
         Ok(doc.meta())
     })
 }
@@ -3007,7 +3032,7 @@ pub fn undo(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
     write_doc(&state, doc_id, |doc| {
         // Undo/redo may reinstate rows the filter view doesn't account for, so the
         // view is dropped to keep coordinates consistent.
-        doc.clear_filter();
+        doc.clear_row_view();
         doc.undo()?;
         Ok(doc.meta())
     })
@@ -3016,7 +3041,7 @@ pub fn undo(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
 #[tauri::command]
 pub fn redo(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
     write_doc(&state, doc_id, |doc| {
-        doc.clear_filter();
+        doc.clear_row_view();
         doc.redo()?;
         Ok(doc.meta())
     })

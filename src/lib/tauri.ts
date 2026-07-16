@@ -593,6 +593,13 @@ export const setFilter = (docId: number, spec: FilterGroup) =>
 
 export const clearFilter = (docId: number) => invoke<DocumentMeta>("clear_filter", { docId });
 
+/** F12: set (or clear, with empty keys) the non-destructive view sort. */
+export const setViewSort = (docId: number, keys: SortKey[]) =>
+  invoke<DocumentMeta>("set_view_sort", { docId, keys });
+
+/** F12: drop BOTH row-view ingredients (filter and view sort) in one step. */
+export const resetRowView = (docId: number) => invoke<DocumentMeta>("reset_row_view", { docId });
+
 export const find = (docId: number, options: FindOptions) =>
   invoke<FindMatch[]>("find", { docId, options });
 

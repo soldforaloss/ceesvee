@@ -454,7 +454,7 @@ mod tests {
         }
         csv.push_str("100,1\n");
         let mut d = doc(&csv);
-        d.set_filter(vec![0, 1, 10]);
+        d.set_filter(vec![0, 1, 10]).unwrap();
         let computed = compute(
             &d,
             &RepairSpec {

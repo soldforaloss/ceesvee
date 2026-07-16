@@ -23,7 +23,9 @@ export function TransformDialog({ onClose }: { onClose: () => void }) {
   const meta = useActiveMeta();
   const applyTransformSpec = useStore((s) => s.applyTransformSpec);
   const filtered = useStore((s) => s.tabs.find((t) => t.id === s.activeId)?.filtered ?? false);
-  const selectionRect = useStore((s) => s.selectionRect);
+  // Range scopes reach the backend in PHYSICAL columns; null when the
+  // display selection spans reordered columns (the option is not offered).
+  const selectionRect = useStore((s) => s.selectionPhysicalRect)();
   const selectedRows = useStore((s) => s.selectedRows);
   const selectedCols = useStore((s) => s.selectedCols);
 

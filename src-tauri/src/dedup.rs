@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn visible_scope_dedupes_only_visible_rows() {
         let mut d = doc_from("k\na\na\na");
-        d.set_filter(vec![0, 2]); // middle "a" hidden
+        d.set_filter(vec![0, 2]).unwrap(); // middle "a" hidden
         let report = find_duplicates(&d, &spec(vec![0]), &ExportScope::VisibleRows, None).unwrap();
         assert_eq!(report.considered_rows, 2);
         assert_eq!(report.sample_groups[0].rows, vec![0, 2]);
