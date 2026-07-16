@@ -546,10 +546,14 @@ mod tests {
         let mut offset = start;
         let mut parser = IncrementalCsv::new();
 
-        // Rotate: replace the file with a NEW one that is already LARGER
-        // than the old offset — the size check alone would read through it.
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, "a,b\nfresh,rows\nfresh,rows\nfresh,rows\n").unwrap();
+        // Rotate the way logrotate does: write the NEW file (already LARGER
+        // than the old offset — the size check alone would read through it)
+        // and RENAME it over the watched path. The new inode is allocated
+        // while the old file still exists, so it can never be recycled into
+        // the same number (remove-then-create can, on ext4/overlayfs).
+        let staged = dir.path().join("log.csv.new");
+        std::fs::write(&staged, "a,b\nfresh,rows\nfresh,rows\nfresh,rows\n").unwrap();
+        std::fs::rename(&staged, &path).unwrap();
         assert!(std::fs::metadata(&path).unwrap().len() >= start);
 
         let alert = poll_step(&config, &mut offset, &mut parser).unwrap();
