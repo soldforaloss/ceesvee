@@ -829,7 +829,10 @@ mod tests {
             },
         ];
         for rule in cases {
-            assert!(validate_rules(&[rule.clone()]).is_err(), "{rule:?}");
+            assert!(
+                validate_rules(std::slice::from_ref(&rule)).is_err(),
+                "{rule:?}"
+            );
         }
         // A missing column is caught at resolution, also before scanning.
         let registry = JobRegistry::default();
