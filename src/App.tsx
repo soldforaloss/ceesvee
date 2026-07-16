@@ -7,6 +7,8 @@ import { CellEditorDialog } from "./components/CellEditorDialog";
 import { ColumnExplorerPanel } from "./components/ColumnExplorerPanel";
 import { CommandPalette } from "./components/CommandPalette";
 import { CompareDialog } from "./components/CompareDialog";
+import { CopyAsDialog } from "./components/CopyAsDialog";
+import { PasteSpecialDialog } from "./components/PasteSpecialDialog";
 import { DedupDialog } from "./components/DedupDialog";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { EmptyState } from "./components/EmptyState";
@@ -257,6 +259,8 @@ export default function App() {
       )}
       {activeModal === "compare" && <CompareDialog onClose={() => setModal(null)} />}
       {activeModal === "shortcuts" && <ShortcutsDialog onClose={() => setModal(null)} />}
+      {activeModal === "copyAs" && <CopyAsDialog onClose={() => setModal(null)} />}
+      {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       <CommandPalette />
       <CellEditorDialog />
       <ReopenDialog />

@@ -2,6 +2,7 @@
 //! exposed to the web front end through a small Tauri command surface.
 
 mod analyze;
+mod clipboard;
 mod commands;
 mod compare;
 mod dedup;
@@ -20,6 +21,7 @@ mod index;
 /// registry, progress plumbing and cancellation as a stable internal API.
 pub mod job;
 mod parse;
+mod paste;
 mod profile;
 mod reopen;
 mod save;
@@ -124,6 +126,9 @@ pub fn run() {
             commands::set_cell,
             commands::set_cells,
             commands::paste,
+            commands::copy_as,
+            commands::preview_paste_special,
+            commands::apply_paste_special,
             commands::insert_rows,
             commands::delete_rows,
             commands::move_row,

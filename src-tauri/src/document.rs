@@ -972,6 +972,113 @@ impl Document {
         Ok(())
     }
 
+    /// F14 Paste Special: apply a fully transformed block at the anchor as
+    /// ONE undoable operation. `first_row_headers` consumes the block's first
+    /// row as header renames for the target columns; `skip_blanks` leaves
+    /// destination cells untouched where the source cell is blank (overwrite
+    /// mode); `InsertRows` mode splices the block in as brand-new rows.
+    pub fn paste_special(
+        &mut self,
+        anchor_row: usize,
+        anchor_col: usize,
+        mut block: Vec<Vec<String>>,
+        mode: crate::paste::PasteMode,
+        skip_blanks: bool,
+        first_row_headers: bool,
+    ) -> AppResult<()> {
+        use crate::paste::PasteMode;
+        self.ensure_editable()?;
+        if anchor_col >= self.headers.len() {
+            return Err(AppError::invalid("column index out of range"));
+        }
+        if anchor_row > self.rows.len() {
+            return Err(AppError::invalid("row index out of range"));
+        }
+        let header_row = if first_row_headers && !block.is_empty() {
+            Some(block.remove(0))
+        } else {
+            None
+        };
+        let block_rows = block.len();
+        let block_cols = block
+            .iter()
+            .map(Vec::len)
+            .chain(header_row.iter().map(Vec::len))
+            .max()
+            .unwrap_or(0);
+        if block_cols == 0 {
+            return Ok(());
+        }
+
+        let mut sub: Vec<EditOp> = Vec::new();
+        let needed_cols = (anchor_col + block_cols).saturating_sub(self.headers.len());
+        for _ in 0..needed_cols {
+            let at = self.headers.len();
+            sub.push(self.op_insert_column(at, format!("Column {}", at + 1)));
+        }
+
+        match mode {
+            PasteMode::Overwrite => {
+                let needed_rows = (anchor_row + block_rows).saturating_sub(self.rows.len());
+                if needed_rows > 0 {
+                    let at = self.rows.len();
+                    sub.push(self.op_insert_rows(at, needed_rows));
+                }
+                let mut changes: Vec<(usize, usize, String)> = Vec::new();
+                for (dr, line) in block.into_iter().enumerate() {
+                    for (dc, value) in line.into_iter().enumerate() {
+                        if skip_blanks && value.trim().is_empty() {
+                            continue;
+                        }
+                        changes.push((anchor_row + dr, anchor_col + dc, value));
+                    }
+                }
+                if let Some(op) = self.op_set_cells(changes) {
+                    sub.push(op);
+                }
+            }
+            PasteMode::InsertRows => {
+                if block_rows > 0 {
+                    sub.push(self.op_insert_rows(anchor_row, block_rows));
+                    let mut changes: Vec<(usize, usize, String)> = Vec::new();
+                    for (dr, line) in block.into_iter().enumerate() {
+                        for (dc, value) in line.into_iter().enumerate() {
+                            if value.is_empty() {
+                                continue; // fresh rows are already blank
+                            }
+                            changes.push((anchor_row + dr, anchor_col + dc, value));
+                        }
+                    }
+                    if let Some(op) = self.op_set_cells(changes) {
+                        sub.push(op);
+                    }
+                }
+            }
+        }
+
+        if let Some(names) = header_row {
+            for (i, name) in names.into_iter().enumerate() {
+                let col = anchor_col + i;
+                if col < self.headers.len() && !name.is_empty() && self.headers[col] != name {
+                    let op = EditOp::RenameColumn {
+                        col,
+                        old: self.headers[col].clone(),
+                        new: name,
+                    };
+                    self.apply(&op);
+                    sub.push(op);
+                }
+            }
+        }
+
+        match sub.len() {
+            0 => {}
+            1 => self.register(sub.pop().expect("checked length")),
+            _ => self.register(EditOp::Composite(sub)),
+        }
+        Ok(())
+    }
+
     /// Replace a set of columns with freshly filled ones in ONE undoable
     /// operation (the split/merge transforms): removes `remove`, inserts the
     /// new columns at `insert_at` (a position in the post-removal layout) and
@@ -1852,6 +1959,56 @@ mod tests {
         let f1 = d.filter_revision();
         d.clear_filter();
         assert!(d.filter_revision() > f1);
+    }
+
+    #[test]
+    fn paste_special_is_one_undo_step_in_both_modes() {
+        use crate::paste::PasteMode;
+        // Overwrite with growth, skip-blanks, and a header rename: one undo
+        // restores EVERYTHING (values, structure, header).
+        let mut d = doc_from("a,b\n1,2\n3,4", true);
+        let block = vec![
+            vec!["NewB".to_string(), "NewC".to_string()],
+            vec!["x".to_string(), String::new()],
+            vec![String::new(), "z".to_string()],
+        ];
+        d.paste_special(1, 1, block, PasteMode::Overwrite, true, true)
+            .unwrap();
+        assert_eq!(d.headers(), &["a", "NewB", "NewC"]);
+        assert_eq!(d.cell(1, 1), "x");
+        assert_eq!(d.cell(1, 2), ""); // skipped blank left the (new) cell empty
+        assert_eq!(d.cell(2, 2), "z");
+        assert_eq!(d.n_rows(), 3); // grew by one row
+        d.undo().unwrap();
+        assert_eq!(d.headers(), &["a", "b"]);
+        assert_eq!(d.n_rows(), 2);
+        assert_eq!(d.n_cols(), 2);
+        assert_eq!(d.cell(1, 1), "4");
+        assert!(!d.can_undo(), "single composite operation");
+
+        // InsertRows mode splices new rows and undoes as one step.
+        let mut d = doc_from("a\n1\n2", true);
+        let block = vec![vec!["x".to_string()], vec!["y".to_string()]];
+        d.paste_special(1, 0, block, PasteMode::InsertRows, false, false)
+            .unwrap();
+        assert_eq!(d.n_rows(), 4);
+        assert_eq!(d.cell(1, 0), "x");
+        assert_eq!(d.cell(2, 0), "y");
+        assert_eq!(d.cell(3, 0), "2");
+        d.undo().unwrap();
+        assert_eq!(d.n_rows(), 2);
+        assert!(!d.can_undo());
+    }
+
+    #[test]
+    fn skip_blanks_preserves_existing_destination_values() {
+        use crate::paste::PasteMode;
+        let mut d = doc_from("a,b\nkeep,old", true);
+        let block = vec![vec![String::new(), "new".to_string()]];
+        d.paste_special(0, 0, block, PasteMode::Overwrite, true, false)
+            .unwrap();
+        assert_eq!(d.cell(0, 0), "keep", "blank source cell skipped");
+        assert_eq!(d.cell(0, 1), "new");
     }
 
     #[test]

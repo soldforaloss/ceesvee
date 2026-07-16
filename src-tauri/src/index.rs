@@ -1093,9 +1093,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(indexed.handle.read_records(0, 1).unwrap()[0], vec!["111"]);
-        // Ensure the rewrite lands in a different mtime millisecond.
-        std::thread::sleep(std::time::Duration::from_millis(15));
         fs::write(&source, b"a\n333\n444\n").unwrap();
+        // Force a different mtime explicitly — same-millisecond rewrites are
+        // real on fast filesystems and would make this test flaky.
+        let file = fs::OpenOptions::new().write(true).open(&source).unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_millis(50))
+            .unwrap();
+        drop(file);
         assert!(
             indexed.handle.read_records(0, 1).is_err(),
             "reads must reject a rewritten source even at the same length"
