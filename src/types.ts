@@ -323,6 +323,67 @@ export interface AppendReport {
   inputs: InputOutcome[];
 }
 
+/** A sort key referencing its column by NAME (F25 recipes). */
+export interface NamedSortKey {
+  column: string;
+  descending?: boolean;
+}
+
+/** The closed recipe step set (F25) — every step maps to an existing engine. */
+export type RecipeStep =
+  | {
+      type: "reparse";
+      delimiter: string | null;
+      encoding: string | null;
+      hasHeaderRow: boolean | null;
+    }
+  | { type: "validateProfile"; profileId: string; failOnIssues?: boolean }
+  | { type: "filter"; spec: FilterGroup }
+  | { type: "transform"; spec: TransformSpec; columns?: string[] }
+  | { type: "deduplicate"; spec: DedupSpec; keep: DuplicateKeepStrategy }
+  | { type: "selectColumns"; columns: string[] }
+  | { type: "sort"; keys: NamedSortKey[] }
+  | { type: "export"; options: ExportOptions };
+
+export interface Recipe {
+  version: number;
+  name: string;
+  steps: RecipeStep[];
+}
+
+export interface BatchOptions {
+  recipe: Recipe;
+  files: string[];
+  outputDir: string;
+  /** Tokens: {name} = input stem, {ext} = extension. */
+  filenameTemplate: string;
+  overwrite?: boolean;
+  continueOnError?: boolean;
+  dryRun?: boolean;
+  concurrency?: number;
+}
+
+export interface FileOutcome {
+  input: string;
+  output: string | null;
+  status: "ok" | "skipped" | "failed";
+  rowsIn: number;
+  rowsOut: number;
+  issues: number;
+  stepsApplied: number;
+  error: string | null;
+}
+
+/** Structured batch result: one entry per input file (F25). */
+export interface BatchReport {
+  recipeName: string;
+  dryRun: boolean;
+  ok: number;
+  skipped: number;
+  failed: number;
+  outcomes: FileOutcome[];
+}
+
 /** Pivot cell aggregation (F23). */
 export type PivotAgg =
   | "none"

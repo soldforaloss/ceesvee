@@ -281,6 +281,14 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("semantic"),
     },
     {
+      id: "data.recipes",
+      title: "Batch process files…",
+      keywords: ["recipe", "folder", "automation", "pipeline", "bulk", "many files"],
+      category: "Data",
+      unavailableReason: () => null,
+      run: () => openModal("recipes"),
+    },
+    {
       id: "data.append",
       title: "Append files…",
       keywords: ["concatenate", "combine", "merge files", "stack", "union"],

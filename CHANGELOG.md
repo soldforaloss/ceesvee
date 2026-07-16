@@ -8,6 +8,18 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Batch recipes** (palette → "Batch process files…"): apply a saved,
+  VERSIONED, declarative step sequence — parse settings, profile
+  validation, filter, transform, deduplicate, select columns, sort,
+  export — to many files or a whole folder. No scripting, no shell, no
+  network; inputs are only the explicitly selected files; outputs go only
+  into the chosen folder with a `{name}`/`{ext}` template validated
+  against path traversal; nothing is overwritten unless explicitly
+  allowed; dry runs perform every step but write nothing. Stop-on-error
+  or continue-with-report, a bounded parallel-file option, cancellation,
+  and a structured report covering EVERY input file with its exact
+  outcome. Recipes save and load as JSON with a clear version-migration
+  error.
 - **Pivot, unpivot, and transpose** (palette → "Pivot / unpivot /
   transpose…"): reshape between wide and long forms into a NEW document.
   Unpivot keeps chosen identifier columns and melts the rest into

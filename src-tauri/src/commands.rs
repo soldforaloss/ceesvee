@@ -37,6 +37,7 @@ use crate::outlier::{
 use crate::parse::{parse, ParseSettings, ParsedFile};
 use crate::paste::{self, PasteOptions, PastePreview};
 use crate::profile::{self, ColumnProfile, ProfileCache, ProfileOptions, ProfileScope};
+use crate::recipe::{self, BatchOptions, BatchReport, RecipeCache};
 use crate::reopen::{self, CurrentInterpretation};
 use crate::repair::{self, RepairPreview, RepairSpec};
 use crate::reshape::{self, ReshapePreview, ReshapeSpec};
@@ -1287,6 +1288,50 @@ pub async fn start_group_by(
         job_id,
         doc_id: new_doc_id,
     })
+}
+
+// ----- batch recipes (F25) ------------------------------------------------------
+
+/// Validate a batch (recipe version, steps, templates, distinct output
+/// names) without running anything.
+#[tauri::command]
+pub fn validate_recipe_batch(options: BatchOptions, app: tauri::AppHandle) -> AppResult<()> {
+    let profiles = settings::load_settings(&settings_dir(&app)?).profiles;
+    recipe::validate_batch(&options, &profiles)
+}
+
+/// Run a batch recipe as a cancellable job (kind "batch"). The structured
+/// report (one entry per input file) lands in the cache under the job id.
+/// A dry run performs every step but writes nothing.
+#[tauri::command]
+pub async fn start_recipe_batch(
+    options: BatchOptions,
+    app: tauri::AppHandle,
+    jobs: State<'_, JobRegistry>,
+    recipe_cache: State<'_, RecipeCache>,
+) -> AppResult<u64> {
+    let profiles = settings::load_settings(&settings_dir(&app)?).profiles;
+    recipe::validate_batch(&options, &profiles)?;
+    let sink = recipe_cache.share();
+    let ctx = jobs.begin_for_app(&app, "batch", None);
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let report = recipe::run_batch(&options, &profiles, ctx)?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(job_id, report);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// The report of a finished batch, by its job id.
+#[tauri::command]
+pub fn get_batch_report(job_id: u64, recipe_cache: State<'_, RecipeCache>) -> Option<BatchReport> {
+    recipe_cache.get(job_id)
 }
 
 // ----- pivot / unpivot / transpose (F23) ---------------------------------------
