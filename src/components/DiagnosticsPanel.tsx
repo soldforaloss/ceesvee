@@ -25,11 +25,13 @@ export function DiagnosticsPanel() {
   const stale = isReportStale(meta, report);
 
   // Scan automatically when the panel is shown for a document that has no
-  // usable report yet. Rescans after edits stay manual (the stale banner).
+  // usable report yet. Rescans after edits stay manual (the stale banner),
+  // and a user-cancelled scan stays cancelled until the Rescan button.
   useEffect(() => {
-    if (meta && !report && !scanning && !docState?.scanError) void runScan();
+    if (meta && !report && !scanning && !docState?.scanError && !docState?.cancelled)
+      void runScan();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meta?.id, report, scanning, docState?.scanError]);
+  }, [meta?.id, report, scanning, docState?.scanError, docState?.cancelled]);
 
   if (!meta) return null;
 

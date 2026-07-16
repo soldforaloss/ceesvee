@@ -11,10 +11,12 @@ export interface ColumnMenuState {
 interface ColumnMenuProps {
   state: ColumnMenuState;
   headers: string[];
+  /** Indexed read-only document (F10): only view operations are offered. */
+  readOnly?: boolean;
   onClose: () => void;
 }
 
-export function ColumnMenu({ state, headers, onClose }: ColumnMenuProps) {
+export function ColumnMenu({ state, headers, readOnly, onClose }: ColumnMenuProps) {
   const { col, x, y } = state;
   const ref = useRef<HTMLDivElement>(null);
   const [renaming, setRenaming] = useState(false);
@@ -88,33 +90,45 @@ export function ColumnMenu({ state, headers, onClose }: ColumnMenuProps) {
         </div>
       ) : (
         <>
-          <MenuItem onClick={() => run(() => void sortBy([{ column: col, descending: false }]))}>
-            Sort ascending
-          </MenuItem>
-          <MenuItem onClick={() => run(() => void sortBy([{ column: col, descending: true }]))}>
-            Sort descending
-          </MenuItem>
-          <Divider />
+          {!readOnly && (
+            <>
+              <MenuItem
+                onClick={() => run(() => void sortBy([{ column: col, descending: false }]))}
+              >
+                Sort ascending
+              </MenuItem>
+              <MenuItem onClick={() => run(() => void sortBy([{ column: col, descending: true }]))}>
+                Sort descending
+              </MenuItem>
+              <Divider />
+            </>
+          )}
           <MenuItem onClick={() => run(() => setFrozenCols(col + 1))}>Freeze up to here</MenuItem>
           {frozenCols > 0 && (
             <MenuItem onClick={() => run(() => setFrozenCols(0))}>Unfreeze columns</MenuItem>
           )}
-          <Divider />
-          <MenuItem onClick={() => setRenaming(true)}>Rename…</MenuItem>
-          <MenuItem
-            onClick={() => run(() => void insertColumn(col, `Column ${headers.length + 1}`))}
-          >
-            Insert column left
-          </MenuItem>
-          <MenuItem
-            onClick={() => run(() => void insertColumn(col + 1, `Column ${headers.length + 1}`))}
-          >
-            Insert column right
-          </MenuItem>
-          <Divider />
-          <MenuItem danger onClick={() => run(() => void deleteColumns([col]))}>
-            Delete column
-          </MenuItem>
+          {!readOnly && (
+            <>
+              <Divider />
+              <MenuItem onClick={() => setRenaming(true)}>Rename…</MenuItem>
+              <MenuItem
+                onClick={() => run(() => void insertColumn(col, `Column ${headers.length + 1}`))}
+              >
+                Insert column left
+              </MenuItem>
+              <MenuItem
+                onClick={() =>
+                  run(() => void insertColumn(col + 1, `Column ${headers.length + 1}`))
+                }
+              >
+                Insert column right
+              </MenuItem>
+              <Divider />
+              <MenuItem danger onClick={() => run(() => void deleteColumns([col]))}>
+                Delete column
+              </MenuItem>
+            </>
+          )}
         </>
       )}
     </div>

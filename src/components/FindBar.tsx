@@ -1,10 +1,11 @@
 import { useEffect, useRef } from "react";
 
-import { useStore } from "../store/useStore";
+import { INDEXED_FIND_LIMIT, useActiveMeta, useStore } from "../store/useStore";
 import { ChevronDown, ChevronUp, Close } from "./Icons";
 
 export function FindBar() {
   const find = useStore((s) => s.find);
+  const meta = useActiveMeta();
   const updateFind = useStore((s) => s.updateFind);
   const runFind = useStore((s) => s.runFind);
   const gotoMatch = useStore((s) => s.gotoMatch);
@@ -13,6 +14,9 @@ export function FindBar() {
   const setFindOpen = useStore((s) => s.setFindOpen);
   const selectionRect = useStore((s) => s.selectionRect);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Indexed read-only documents: replacement is a mutation, and matches cap
+  // at the streaming limit (F10).
+  const readOnly = meta?.backing === "indexedReadOnly";
 
   useEffect(() => {
     if (find.open) inputRef.current?.focus();
@@ -55,8 +59,16 @@ export function FindBar() {
           }}
           className="w-44 rounded border border-zinc-300 bg-white px-2 py-1 outline-none focus:border-violet-500 dark:border-zinc-700 dark:bg-zinc-950"
         />
-        <span className="w-16 shrink-0 text-center text-xs tabular-nums text-zinc-500">
+        <span
+          className="w-16 shrink-0 text-center text-xs tabular-nums text-zinc-500"
+          title={
+            readOnly && total >= INDEXED_FIND_LIMIT
+              ? `Showing the first ${INDEXED_FIND_LIMIT.toLocaleString()} matches`
+              : undefined
+          }
+        >
           {position} / {total}
+          {readOnly && total >= INDEXED_FIND_LIMIT ? "+" : ""}
         </span>
         <button
           onClick={() => gotoMatch(-1)}
@@ -101,28 +113,30 @@ export function FindBar() {
         />
       </div>
 
-      <div className="flex items-center gap-2">
-        <input
-          value={find.replacement}
-          placeholder="Replace with"
-          onChange={(e) => updateFind({ replacement: e.target.value })}
-          className="w-44 rounded border border-zinc-300 bg-white px-2 py-1 outline-none focus:border-violet-500 dark:border-zinc-700 dark:bg-zinc-950"
-        />
-        <button
-          onClick={() => void replaceCurrent()}
-          disabled={!total}
-          className="rounded border border-zinc-300 px-2 py-1 text-xs hover:bg-zinc-200 disabled:opacity-30 dark:border-zinc-700 dark:hover:bg-zinc-700"
-        >
-          Replace
-        </button>
-        <button
-          onClick={() => void replaceAllMatches()}
-          disabled={!find.query}
-          className="rounded bg-violet-600 px-2 py-1 text-xs text-white hover:bg-violet-500 disabled:opacity-30"
-        >
-          Replace all
-        </button>
-      </div>
+      {!readOnly && (
+        <div className="flex items-center gap-2">
+          <input
+            value={find.replacement}
+            placeholder="Replace with"
+            onChange={(e) => updateFind({ replacement: e.target.value })}
+            className="w-44 rounded border border-zinc-300 bg-white px-2 py-1 outline-none focus:border-violet-500 dark:border-zinc-700 dark:bg-zinc-950"
+          />
+          <button
+            onClick={() => void replaceCurrent()}
+            disabled={!total}
+            className="rounded border border-zinc-300 px-2 py-1 text-xs hover:bg-zinc-200 disabled:opacity-30 dark:border-zinc-700 dark:hover:bg-zinc-700"
+          >
+            Replace
+          </button>
+          <button
+            onClick={() => void replaceAllMatches()}
+            disabled={!find.query}
+            className="rounded bg-violet-600 px-2 py-1 text-xs text-white hover:bg-violet-500 disabled:opacity-30"
+          >
+            Replace all
+          </button>
+        </div>
+      )}
 
       <button
         onClick={() => setFindOpen(false)}

@@ -234,20 +234,24 @@ impl ColumnStats {
 /// Compute a full diagnostics report. Read-only; progress and cancellation
 /// via `ctx`.
 pub fn scan(doc: &Document, ctx: &JobCtx) -> AppResult<DiagnosticsReport> {
-    let rows = doc.rows();
+    let n_rows = doc.n_rows();
     let n_cols = doc.n_cols();
-    ctx.set_total(rows.len() as u64);
+    ctx.set_total(n_rows as u64);
 
     let mut stats: Vec<ColumnStats> = vec![ColumnStats::default(); n_cols];
-    for (chunk_index, chunk) in rows.chunks(ROW_CHUNK).enumerate() {
-        for (offset, row) in chunk.iter().enumerate() {
-            let row_index = chunk_index * ROW_CHUNK + offset;
-            for (col, cell) in row.iter().enumerate() {
-                stats[col].record(row_index, cell);
-            }
+    let mut pending = 0u64;
+    doc.visit_rows(0..n_rows, &mut |row_index, row| {
+        for (col, cell) in row.iter().enumerate().take(n_cols) {
+            stats[col].record(row_index, cell);
         }
-        ctx.advance(chunk.len() as u64)?;
-    }
+        pending += 1;
+        if pending >= ROW_CHUNK as u64 {
+            ctx.advance(pending)?;
+            pending = 0;
+        }
+        Ok(true)
+    })?;
+    ctx.advance(pending)?;
 
     let mut current = Vec::new();
     header_issues(doc, &mut current);
@@ -468,8 +472,7 @@ fn column_issues(
     ctx: &JobCtx,
     out: &mut Vec<DiagnosticIssue>,
 ) -> AppResult<()> {
-    let rows = doc.rows();
-    let total_rows = rows.len();
+    let total_rows = doc.n_rows();
 
     // Completely empty columns (single issue).
     let empty_cols: Vec<usize> = (0..stats.len())
@@ -649,8 +652,8 @@ fn minority_samples(
     ctx: &JobCtx,
 ) -> AppResult<Vec<DiagnosticSample>> {
     let mut samples = Vec::new();
-    for (row_index, row) in doc.rows().iter().enumerate() {
-        if row_index % ROW_CHUNK == 0 {
+    doc.visit_rows(0..doc.n_rows(), &mut |row_index, row| {
+        if row_index.is_multiple_of(ROW_CHUNK) {
             ctx.check()?;
         }
         let cell = &row[col];
@@ -666,11 +669,9 @@ fn minority_samples(
                     class_name(dominant)
                 )),
             });
-            if samples.len() >= SAMPLE_LIMIT {
-                break;
-            }
         }
-    }
+        Ok(samples.len() < SAMPLE_LIMIT)
+    })?;
     Ok(samples)
 }
 
@@ -693,35 +694,36 @@ pub fn issue_rows(doc: &Document, issue_id: &str) -> AppResult<Vec<usize>> {
         None => (issue_id, None),
     };
 
-    let rows = doc.rows();
-    let matching = |predicate: &dyn Fn(&[String]) -> bool| -> Vec<usize> {
-        rows.iter()
-            .enumerate()
-            .filter(|(_, row)| predicate(row))
-            .map(|(i, _)| i)
-            .collect()
+    let matching = |predicate: &dyn Fn(&[String]) -> bool| -> AppResult<Vec<usize>> {
+        let mut out = Vec::new();
+        doc.visit_rows(0..doc.n_rows(), &mut |i, row| {
+            if predicate(row) {
+                out.push(i);
+            }
+            Ok(true)
+        })?;
+        Ok(out)
     };
 
     match (kind, col) {
-        ("replacementChars", None) => {
-            Ok(matching(&|row| row.iter().any(|c| has_replacement_char(c))))
-        }
-        ("whitespace", Some(c)) => Ok(matching(&|row| has_edge_whitespace(&row[c]))),
-        ("blankHeavy", Some(c)) => Ok(matching(&|row| classify(&row[c]) == CellClass::Blank)),
+        ("replacementChars", None) => matching(&|row| row.iter().any(|c| has_replacement_char(c))),
+        ("whitespace", Some(c)) => matching(&|row| has_edge_whitespace(&row[c])),
+        ("blankHeavy", Some(c)) => matching(&|row| classify(&row[c]) == CellClass::Blank),
         ("mixedTypes", Some(c)) => {
             // Recompute the dominant class so the filter matches what a fresh
             // scan would report for the current data.
             let mut stat = ColumnStats::default();
-            for (i, row) in rows.iter().enumerate() {
+            doc.visit_rows(0..doc.n_rows(), &mut |i, row| {
                 stat.record(i, &row[c]);
-            }
+                Ok(true)
+            })?;
             let Some(dominant) = stat.dominant_class() else {
                 return Ok(Vec::new());
             };
-            Ok(matching(&|row| {
+            matching(&|row| {
                 let class = classify(&row[c]);
                 class != CellClass::Blank && class != dominant
-            }))
+            })
         }
         _ => Err(AppError::invalid(
             "this diagnostic does not support row filtering",

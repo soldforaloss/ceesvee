@@ -234,15 +234,13 @@ pub fn profile_column(
     options: &ProfileOptions,
     ctx: &JobCtx,
 ) -> AppResult<ColumnProfile> {
-    let rows = doc.rows();
-    let view: Vec<usize> = match scope {
-        ProfileScope::All => (0..rows.len()).collect(),
-        ProfileScope::VisibleRows => match doc.filter_view() {
-            Some(view) => view.to_vec(),
-            None => (0..rows.len()).collect(),
-        },
+    // `None` = every row (streamed without materialising an index list).
+    let view: Option<Vec<usize>> = match scope {
+        ProfileScope::All => None,
+        ProfileScope::VisibleRows => doc.filter_view().map(<[usize]>::to_vec),
     };
-    ctx.set_total(view.len() as u64);
+    let total_rows = view.as_ref().map(Vec::len).unwrap_or_else(|| doc.n_rows());
+    ctx.set_total(total_rows as u64);
 
     let mut blank = 0usize;
     let mut counts = TypeCounts {
@@ -265,53 +263,62 @@ pub fn profile_column(
     let mut len_sum = 0u64;
     let mut non_blank = 0usize;
 
-    for (i, &r) in view.iter().enumerate() {
-        if i % ROW_CHUNK == 0 {
-            ctx.advance(if i == 0 { 0 } else { ROW_CHUNK as u64 })?;
-        }
-        let cell = &rows[r][column];
-        let trimmed = cell.trim();
-        match analyze::classify(cell) {
-            CellClass::Blank => {
-                blank += 1;
-                continue;
+    {
+        let mut i = 0usize;
+        let mut visitor = |_r: usize, row: &[String]| -> AppResult<bool> {
+            if i.is_multiple_of(ROW_CHUNK) {
+                ctx.advance(if i == 0 { 0 } else { ROW_CHUNK as u64 })?;
             }
-            CellClass::Number => {
-                counts.number += 1;
-                if let Some(n) = analyze::as_number(trimmed) {
-                    numbers.push(n);
-                    sum += n;
+            i += 1;
+            let cell = row.get(column).map(String::as_str).unwrap_or("");
+            let trimmed = cell.trim();
+            match analyze::classify(cell) {
+                CellClass::Blank => {
+                    blank += 1;
+                    return Ok(true);
                 }
-            }
-            CellClass::Date => {
-                counts.date += 1;
-                if let Some(parsed) = analyze::parse_date(trimmed) {
-                    if earliest.as_ref().is_none_or(|(e, _)| parsed < *e) {
-                        earliest = Some((parsed, trimmed.to_string()));
-                    }
-                    if latest.as_ref().is_none_or(|(l, _)| parsed > *l) {
-                        latest = Some((parsed, trimmed.to_string()));
+                CellClass::Number => {
+                    counts.number += 1;
+                    if let Some(n) = analyze::as_number(trimmed) {
+                        numbers.push(n);
+                        sum += n;
                     }
                 }
+                CellClass::Date => {
+                    counts.date += 1;
+                    if let Some(parsed) = analyze::parse_date(trimmed) {
+                        if earliest.as_ref().is_none_or(|(e, _)| parsed < *e) {
+                            earliest = Some((parsed, trimmed.to_string()));
+                        }
+                        if latest.as_ref().is_none_or(|(l, _)| parsed > *l) {
+                            latest = Some((parsed, trimmed.to_string()));
+                        }
+                    }
+                }
+                CellClass::Bool => counts.bool += 1,
+                CellClass::Text => counts.text += 1,
             }
-            CellClass::Bool => counts.bool += 1,
-            CellClass::Text => counts.text += 1,
-        }
 
-        non_blank += 1;
-        let chars = trimmed.chars().count();
-        len_min = len_min.min(chars);
-        len_max = len_max.max(chars);
-        len_sum += chars as u64;
+            non_blank += 1;
+            let chars = trimmed.chars().count();
+            len_min = len_min.min(chars);
+            len_max = len_max.max(chars);
+            len_sum += chars as u64;
 
-        top.add(trimmed);
-        let hash = hash_value(trimmed);
-        hll.add_hash(hash);
-        if let Some(set) = exact_distinct.as_mut() {
-            set.insert(hash);
-            if set.len() > DISTINCT_EXACT_LIMIT {
-                exact_distinct = None; // fall back to the estimate
+            top.add(trimmed);
+            let hash = hash_value(trimmed);
+            hll.add_hash(hash);
+            if let Some(set) = exact_distinct.as_mut() {
+                set.insert(hash);
+                if set.len() > DISTINCT_EXACT_LIMIT {
+                    exact_distinct = None; // fall back to the estimate
+                }
             }
+            Ok(true)
+        };
+        match &view {
+            None => doc.visit_rows(0..doc.n_rows(), &mut visitor)?,
+            Some(v) => doc.visit_rows_at(v, &mut visitor)?,
         }
     }
     ctx.flush_progress();
@@ -342,7 +349,7 @@ pub fn profile_column(
         column,
         scope,
         revision: doc.revision(),
-        row_count: view.len(),
+        row_count: total_rows,
         blank_count: blank,
         inferred_kind,
         type_counts: counts,

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 import { scopeChoices } from "../lib/export";
 import * as api from "../lib/tauri";
@@ -37,25 +37,36 @@ export function TransformDialog({ onClose }: { onClose: () => void }) {
     [filtered, selectionRect, selectedRows, selectedCols],
   );
   const [scopeIdx, setScopeIdx] = useState(0);
-  const scope = (choices[scopeIdx] ?? choices[0]).scope;
+  // Structural transforms (split/merge) rework whole columns and hide the
+  // scope selector, so a row scope picked earlier must not silently apply.
+  const scope = def.structural ? { type: "all" as const } : (choices[scopeIdx] ?? choices[0]).scope;
 
   const [preview, setPreview] = useState<TransformPreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [working, setWorking] = useState(false);
+  // Monotonic id for preview requests: a response only lands if it is still
+  // the latest, so changing the operation/params/scope mid-flight can never
+  // resurrect a stale preview (whose revision Apply would then trust).
+  const previewRequest = useRef(0);
 
   if (!meta) return null;
+
+  const invalidatePreview = () => {
+    previewRequest.current += 1;
+    setPreview(null);
+  };
 
   const pickKind = (next: TransformKind) => {
     setKind(next);
     const nextDef = TRANSFORMS.find((t) => t.type === next)!;
     setValues(defaultValues(nextDef));
-    setPreview(null);
+    invalidatePreview();
     setPreviewError(null);
   };
 
   const setValue = (key: string, value: ParamValues[string]) => {
     setValues((v) => ({ ...v, [key]: value }));
-    setPreview(null);
+    invalidatePreview();
   };
 
   const spec = buildTransformSpec(kind, values);
@@ -63,15 +74,19 @@ export function TransformDialog({ onClose }: { onClose: () => void }) {
 
   const runPreview = async () => {
     if ("error" in spec) return;
+    const request = ++previewRequest.current;
     setWorking(true);
     setPreviewError(null);
     try {
-      setPreview(await api.previewTransform(meta.id, spec, scope, meta.revision));
+      const next = await api.previewTransform(meta.id, spec, scope, meta.revision);
+      if (previewRequest.current === request) setPreview(next);
     } catch (e) {
-      setPreview(null);
-      setPreviewError(String(e));
+      if (previewRequest.current === request) {
+        setPreview(null);
+        setPreviewError(String(e));
+      }
     } finally {
-      setWorking(false);
+      if (previewRequest.current === request) setWorking(false);
     }
   };
 
@@ -137,7 +152,7 @@ export function TransformDialog({ onClose }: { onClose: () => void }) {
               value={scopeIdx}
               onChange={(e) => {
                 setScopeIdx(Number(e.target.value));
-                setPreview(null);
+                invalidatePreview();
               }}
               className={selectCls}
             >

@@ -8,11 +8,18 @@ vi.mock("@tauri-apps/api/window", () => ({
 }));
 vi.mock("../lib/tauri", () => ({
   closeDocument: vi.fn().mockResolvedValue(undefined),
+  probeOpen: vi.fn(),
+  openFile: vi.fn(),
+  startOpenIndexed: vi.fn(),
+  getMeta: vi.fn(),
+  find: vi.fn().mockResolvedValue([]),
+  cancelJob: vi.fn().mockResolvedValue(true),
 }));
 
-import { useStore } from "./useStore";
+import * as api from "../lib/tauri";
+import { INDEXED_FIND_LIMIT, useStore } from "./useStore";
 
-function meta(id: number): DocumentMeta {
+function meta(id: number, backing: DocumentMeta["backing"] = "editable"): DocumentMeta {
   return {
     id,
     path: `C:/data/doc-${id}.csv`,
@@ -31,6 +38,7 @@ function meta(id: number): DocumentMeta {
     canUndo: false,
     canRedo: false,
     revision: 1,
+    backing,
   };
 }
 
@@ -145,5 +153,118 @@ describe("per-document UI state (F08)", () => {
     expect(now.activeId).toBe(1);
     expect(now.find.query).toBe("alpha");
     expect(now.uiStates[2]).toBeUndefined();
+  });
+});
+
+describe("indexed read-only open flow (F10)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useStore.setState({
+      tabs: [],
+      activeId: null,
+      uiStates: {},
+      openDecision: null,
+      indexing: null,
+      busy: false,
+      error: null,
+    });
+  });
+
+  const estimate = (needsDecision: boolean) => ({
+    fileSize: 2_000_000_000,
+    estimatedRows: 20_000_000,
+    estimatedMemory: 6_000_000_000,
+    needsDecision,
+    encoding: "UTF-8",
+  });
+
+  it("pauses large opens on the mode decision instead of loading", async () => {
+    vi.mocked(api.probeOpen).mockResolvedValue(estimate(true));
+    await useStore.getState().openPath("C:/data/huge.csv");
+    const s = useStore.getState();
+    expect(s.openDecision?.path).toBe("C:/data/huge.csv");
+    expect(s.busy).toBe(false);
+    expect(api.openFile).not.toHaveBeenCalled();
+  });
+
+  it("opens small files directly after the probe", async () => {
+    vi.mocked(api.probeOpen).mockResolvedValue(estimate(false));
+    vi.mocked(api.openFile).mockResolvedValue(meta(7));
+    await useStore.getState().openPath("C:/data/small.csv");
+    const s = useStore.getState();
+    expect(s.openDecision).toBeNull();
+    expect(s.tabs.map((t) => t.id)).toEqual([7]);
+    expect(api.openFile).toHaveBeenCalledWith("C:/data/small.csv");
+  });
+
+  it("confirmOpenEditable forces the in-memory load", async () => {
+    useStore.setState({ openDecision: { path: "C:/data/huge.csv", estimate: estimate(true) } });
+    vi.mocked(api.openFile).mockResolvedValue(meta(3));
+    await useStore.getState().confirmOpenEditable();
+    expect(api.openFile).toHaveBeenCalledWith("C:/data/huge.csv", { forceInMemory: true });
+    expect(useStore.getState().tabs.map((t) => t.id)).toEqual([3]);
+  });
+
+  it("confirmOpenIndexed tracks the job and adds the tab on finish", async () => {
+    useStore.setState({ openDecision: { path: "C:/data/huge.csv", estimate: estimate(true) } });
+    vi.mocked(api.startOpenIndexed).mockResolvedValue({ jobId: 41, docId: 9 });
+    await useStore.getState().confirmOpenIndexed();
+    let s = useStore.getState();
+    expect(s.openDecision).toBeNull();
+    expect(s.indexing).toMatchObject({ jobId: 41, docId: 9, kind: "openIndexed" });
+
+    const indexedMeta = meta(9, "indexedReadOnly");
+    vi.mocked(api.getMeta).mockResolvedValue(indexedMeta);
+    await useStore.getState().handleJobFinished({
+      jobId: 41,
+      docId: 9,
+      kind: "openIndexed",
+      status: "done",
+      error: null,
+    });
+    s = useStore.getState();
+    expect(s.indexing).toBeNull();
+    expect(s.tabs.map((t) => t.id)).toEqual([9]);
+    expect(s.activeId).toBe(9);
+    expect(s.tabs[0].backing).toBe("indexedReadOnly");
+  });
+
+  it("surfaces a failed indexing job as an error", async () => {
+    useStore.setState({
+      indexing: {
+        jobId: 5,
+        docId: 2,
+        kind: "openIndexed",
+        path: "C:/x.csv",
+        processed: 0,
+        total: null,
+      },
+    });
+    await useStore.getState().handleJobFinished({
+      jobId: 5,
+      docId: 2,
+      kind: "openIndexed",
+      status: "failed",
+      error: "disk error",
+    });
+    const s = useStore.getState();
+    expect(s.indexing).toBeNull();
+    expect(s.error).toBe("disk error");
+    expect(s.tabs).toHaveLength(0);
+  });
+
+  it("caps find matches for indexed documents only", async () => {
+    useStore.setState({
+      tabs: [meta(1, "indexedReadOnly"), meta(2)],
+      activeId: 1,
+      find: { ...useStore.getState().find, query: "x", open: true },
+    });
+    await useStore.getState().runFind();
+    expect(vi.mocked(api.find).mock.calls[0][1].limit).toBe(INDEXED_FIND_LIMIT);
+
+    useStore.getState().setActive(2);
+    useStore.setState({ find: { ...useStore.getState().find, query: "x" } });
+    await useStore.getState().runFind();
+    expect(vi.mocked(api.find).mock.calls[1][1].limit).toBeUndefined();
   });
 });

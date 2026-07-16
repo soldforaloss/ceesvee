@@ -239,7 +239,13 @@ pub fn validate_profile(doc: &Document, profile: &FileProfile) -> AppResult<Prof
             });
             continue;
         };
-        let blanks = doc.rows().iter().filter(|r| r[c].trim().is_empty()).count();
+        let mut blanks = 0usize;
+        doc.visit_rows(0..doc.n_rows(), &mut |_, row| {
+            if row[c].trim().is_empty() {
+                blanks += 1;
+            }
+            Ok(true)
+        })?;
         if blanks > 0 {
             issues.push(ProfileIssue {
                 kind: "requiredBlank".into(),
@@ -252,13 +258,16 @@ pub fn validate_profile(doc: &Document, profile: &FileProfile) -> AppResult<Prof
 
     for unique in &profile.unique_columns {
         let Some(c) = col_index(unique) else { continue };
-        let mut seen = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut dupes = 0usize;
-        for row in doc.rows() {
-            if !seen.insert(row[c].as_str()) {
+        doc.visit_rows(0..doc.n_rows(), &mut |_, row| {
+            if seen.contains(&row[c]) {
                 dupes += 1;
+            } else {
+                seen.insert(row[c].clone());
             }
-        }
+            Ok(true)
+        })?;
         if dupes > 0 {
             issues.push(ProfileIssue {
                 kind: "nonUnique".into(),
@@ -272,21 +281,21 @@ pub fn validate_profile(doc: &Document, profile: &FileProfile) -> AppResult<Prof
     for (name, expected) in &profile.expected_types {
         let Some(c) = col_index(name) else { continue };
         let mut bad = 0usize;
-        for row in doc.rows() {
+        doc.visit_rows(0..doc.n_rows(), &mut |_, row| {
             let cell = row[c].trim();
-            if cell.is_empty() {
-                continue;
+            if !cell.is_empty() {
+                let ok = match expected {
+                    ExpectedType::Number => analyze::as_number(cell).is_some(),
+                    ExpectedType::Date => analyze::is_date(cell),
+                    ExpectedType::Bool => analyze::is_bool(cell),
+                    ExpectedType::Text => true,
+                };
+                if !ok {
+                    bad += 1;
+                }
             }
-            let ok = match expected {
-                ExpectedType::Number => analyze::as_number(cell).is_some(),
-                ExpectedType::Date => analyze::is_date(cell),
-                ExpectedType::Bool => analyze::is_bool(cell),
-                ExpectedType::Text => true,
-            };
-            if !ok {
-                bad += 1;
-            }
-        }
+            Ok(true)
+        })?;
         if bad > 0 {
             issues.push(ProfileIssue {
                 kind: "typeMismatch".into(),
@@ -301,16 +310,19 @@ pub fn validate_profile(doc: &Document, profile: &FileProfile) -> AppResult<Prof
         let Some(c) = col_index(&rule.column) else {
             continue;
         };
-        let re = regex::Regex::new(&rule.pattern)
+        // The rule requires the WHOLE (trimmed) value to match, so anchor the
+        // user's pattern; a bare `is_match` would accept any substring hit
+        // (e.g. `\d{5}` passing "abc12345xyz").
+        let re = regex::Regex::new(&format!("^(?:{})$", rule.pattern))
             .map_err(|e| AppError::invalid(format!("profile regex is invalid: {e}")))?;
-        let bad = doc
-            .rows()
-            .iter()
-            .filter(|r| {
-                let cell = r[c].trim();
-                !cell.is_empty() && !re.is_match(cell)
-            })
-            .count();
+        let mut bad = 0usize;
+        doc.visit_rows(0..doc.n_rows(), &mut |_, row| {
+            let cell = row[c].trim();
+            if !cell.is_empty() && !re.is_match(cell) {
+                bad += 1;
+            }
+            Ok(true)
+        })?;
         if bad > 0 {
             issues.push(ProfileIssue {
                 kind: "regexMismatch".into(),
@@ -329,20 +341,22 @@ pub fn validate_profile(doc: &Document, profile: &FileProfile) -> AppResult<Prof
             continue;
         };
         let mut bad = 0usize;
-        for row in doc.rows() {
+        doc.visit_rows(0..doc.n_rows(), &mut |_, row| {
             let cell = row[c].trim();
-            if cell.is_empty() {
-                continue;
-            }
-            match analyze::as_number(cell) {
-                Some(n) => {
-                    if rule.min.is_some_and(|min| n < min) || rule.max.is_some_and(|max| n > max) {
-                        bad += 1;
+            if !cell.is_empty() {
+                match analyze::as_number(cell) {
+                    Some(n) => {
+                        if rule.min.is_some_and(|min| n < min)
+                            || rule.max.is_some_and(|max| n > max)
+                        {
+                            bad += 1;
+                        }
                     }
+                    None => bad += 1,
                 }
-                None => bad += 1,
             }
-        }
+            Ok(true)
+        })?;
         if bad > 0 {
             issues.push(ProfileIssue {
                 kind: "outOfRange".into(),
@@ -430,6 +444,25 @@ mod tests {
         assert!(kind("regexMismatch").is_some(), "bad-email");
         // 2000 exceeds max AND "oops" is non-numeric: both out of range.
         assert_eq!(kind("outOfRange").unwrap().affected_count, 2);
+    }
+
+    #[test]
+    fn regex_rules_require_a_full_match_not_a_substring() {
+        // An unanchored pattern must still validate the WHOLE value: "12345"
+        // embedded in surrounding text is a mismatch, not a pass.
+        let mut p = profile();
+        p.regex_rules = vec![RegexRule {
+            column: "email".into(),
+            pattern: r"\d{5}".into(),
+        }];
+        let d = doc_from("id,amount,email\n1,10,12345\n2,20,abc12345xyz");
+        let v = validate_profile(&d, &p).unwrap();
+        let issue = v.issues.iter().find(|i| i.kind == "regexMismatch");
+        assert_eq!(
+            issue.map(|i| i.affected_count),
+            Some(1),
+            "only the embedded value fails"
+        );
     }
 
     #[test]

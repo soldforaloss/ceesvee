@@ -84,6 +84,9 @@ export function Toolbar({
   const setExplorerOpen = useStore((s) => s.setExplorerOpen);
 
   const hasDoc = meta !== null;
+  // Indexed read-only documents (F10): every mutating tool is disabled; the
+  // analysis tools (find, filter, diagnostics, explorer, export, …) stay live.
+  const readOnly = meta?.backing === "indexedReadOnly";
 
   const addRow = () => {
     const { selectedRows } = useStore.getState();
@@ -109,9 +112,19 @@ export function Toolbar({
   // These two groups render inline on wide windows and collapse into the
   // "More tools" menu on narrow ones, so nothing gets clipped.
   const rowColumnTools: ToolItem[] = [
-    { label: "Insert row", icon: <RowPlus />, onClick: addRow, disabled: !hasDoc },
-    { label: "Delete selected rows", icon: <Trash />, onClick: removeRows, disabled: !hasDoc },
-    { label: "Add column", icon: <ColumnPlus />, onClick: addColumn, disabled: !hasDoc },
+    { label: "Insert row", icon: <RowPlus />, onClick: addRow, disabled: !hasDoc || readOnly },
+    {
+      label: "Delete selected rows",
+      icon: <Trash />,
+      onClick: removeRows,
+      disabled: !hasDoc || readOnly,
+    },
+    {
+      label: "Add column",
+      icon: <ColumnPlus />,
+      onClick: addColumn,
+      disabled: !hasDoc || readOnly,
+    },
   ];
 
   const dataTools: ToolItem[] = [
@@ -130,13 +143,13 @@ export function Toolbar({
       active: !!meta?.filtered,
       disabled: !hasDoc,
     },
-    { label: "Sort…", icon: <SortIcon />, onClick: onSort, disabled: !hasDoc },
+    { label: "Sort…", icon: <SortIcon />, onClick: onSort, disabled: !hasDoc || readOnly },
     {
       label: "Clean data…",
       title: "Previewable cleanup transformations",
       icon: <Wand />,
       onClick: onTransform,
-      disabled: !hasDoc,
+      disabled: !hasDoc || readOnly,
     },
     {
       label: "Find duplicates…",
@@ -219,7 +232,11 @@ export function Toolbar({
         )}
       </div>
 
-      <Tool title="Save (Ctrl+S)" onClick={() => void saveActive(false)} disabled={!hasDoc}>
+      <Tool
+        title={readOnly ? "Read-only (indexed) — use Export instead" : "Save (Ctrl+S)"}
+        onClick={() => void saveActive(false)}
+        disabled={!hasDoc || readOnly}
+      >
         <Save />
       </Tool>
 

@@ -240,6 +240,37 @@ fn key_of(spec: &CompareSpec, row: &[String], columns: &[usize]) -> Vec<String> 
     columns.iter().map(|&c| normalize(spec, &row[c])).collect()
 }
 
+/// Canonical form of one key part under EVERY enabled equivalence, so keyed
+/// matching pairs exactly the values [`cells_equal`] would call equal
+/// (`1`/`1.0` under numeric-equal, `03/01/2024`/`2024-03-01` under
+/// date-equal, any blanks under blanks-equal). The prefixes keep a canonical
+/// number/date from colliding with identical literal text. Display keys stay
+/// on [`key_of`]; this is for matching only.
+fn match_key_part(spec: &CompareSpec, value: &str) -> String {
+    if spec.blank_equal && value.trim().is_empty() {
+        return String::new();
+    }
+    if spec.numeric_equal {
+        if let Some(n) = analyze::as_number(value) {
+            return format!("\u{1}n{n}");
+        }
+    }
+    if spec.date_equal {
+        if let Some(d) = analyze::parse_date(value) {
+            return format!("\u{1}d{}", d.format("%Y-%m-%dT%H:%M:%S"));
+        }
+    }
+    normalize(spec, value)
+}
+
+/// The matching key for a row (see [`match_key_part`]).
+fn match_key_of(spec: &CompareSpec, row: &[String], columns: &[usize]) -> Vec<String> {
+    columns
+        .iter()
+        .map(|&c| match_key_part(spec, &row[c]))
+        .collect()
+}
+
 // ----- classification ----------------------------------------------------------------
 
 /// Run the comparison. Read-only; progress and cancellation via `ctx`.
@@ -250,47 +281,67 @@ pub fn compare(
     ctx: &JobCtx,
 ) -> AppResult<CompareResult> {
     let mapping = validate(spec, left, right)?;
-    let left_rows = left.rows();
-    let right_rows = right.rows();
-    ctx.set_total((left_rows.len() + right_rows.len()) as u64);
+    let n_left = left.n_rows();
+    let n_right = right.n_rows();
+    ctx.set_total((n_left + n_right) as u64);
 
     let mut entries: Vec<Entry> = Vec::new();
-    let row_changed = |l: usize, r: usize| -> bool {
+    // Compare a fetched pair of rows under the column mapping.
+    let pair_changed = |lrow: &[String], rrow: &[String]| -> bool {
         mapping
             .iter()
-            .any(|&(lc, rc)| !cells_equal(spec, &left_rows[l][lc], &right_rows[r][rc]))
+            .any(|&(lc, rc)| !cells_equal(spec, &lrow[lc], &rrow[rc]))
     };
 
     match spec.mode {
         CompareMode::Positional => {
-            let max = left_rows.len().max(right_rows.len());
-            for i in 0..max {
-                if i % ROW_CHUNK == 0 {
-                    ctx.advance(if i == 0 { 0 } else { ROW_CHUNK as u64 })?;
-                }
-                let entry = match (i < left_rows.len(), i < right_rows.len()) {
-                    (true, true) => Entry {
-                        status: if row_changed(i, i) {
-                            DiffStatus::Changed
-                        } else {
-                            DiffStatus::Unchanged
-                        },
-                        left_row: Some(i as u32),
-                        right_row: Some(i as u32),
-                    },
-                    (true, false) => Entry {
-                        status: DiffStatus::Removed,
-                        left_row: Some(i as u32),
-                        right_row: None,
-                    },
-                    (false, true) => Entry {
-                        status: DiffStatus::Added,
-                        left_row: None,
-                        right_row: Some(i as u32),
-                    },
-                    (false, false) => unreachable!(),
+            // Walk both documents in lockstep blocks so indexed backings read
+            // sequentially instead of row-by-row.
+            let max = n_left.max(n_right);
+            let mut i = 0usize;
+            while i < max {
+                let end = (i + ROW_CHUNK).min(max);
+                let l_end = end.min(n_left);
+                let r_end = end.min(n_right);
+                let lblock: Vec<Vec<String>> = if i < l_end {
+                    left.fetch_rows(&(i..l_end).collect::<Vec<_>>())?
+                } else {
+                    Vec::new()
                 };
-                entries.push(entry);
+                let rblock: Vec<Vec<String>> = if i < r_end {
+                    right.fetch_rows(&(i..r_end).collect::<Vec<_>>())?
+                } else {
+                    Vec::new()
+                };
+                for k in i..end {
+                    let lrow = (k < n_left).then(|| &lblock[k - i]);
+                    let rrow = (k < n_right).then(|| &rblock[k - i]);
+                    let entry = match (lrow, rrow) {
+                        (Some(lrow), Some(rrow)) => Entry {
+                            status: if pair_changed(lrow, rrow) {
+                                DiffStatus::Changed
+                            } else {
+                                DiffStatus::Unchanged
+                            },
+                            left_row: Some(k as u32),
+                            right_row: Some(k as u32),
+                        },
+                        (Some(_), None) => Entry {
+                            status: DiffStatus::Removed,
+                            left_row: Some(k as u32),
+                            right_row: None,
+                        },
+                        (None, Some(_)) => Entry {
+                            status: DiffStatus::Added,
+                            left_row: None,
+                            right_row: Some(k as u32),
+                        },
+                        (None, None) => unreachable!(),
+                    };
+                    entries.push(entry);
+                }
+                ctx.advance((end - i) as u64)?;
+                i = end;
             }
         }
         CompareMode::Keyed => {
@@ -306,86 +357,114 @@ pub fn compare(
                         .expect("validated: key columns are mapped")
                 })
                 .collect();
-            ctx.set_total((2 * left_rows.len() + right_rows.len()) as u64);
+            ctx.set_total((2 * n_left + n_right) as u64);
 
             let mut right_index: HashMap<Vec<String>, Vec<usize>> = HashMap::new();
-            for (r, row) in right_rows.iter().enumerate() {
-                if r % ROW_CHUNK == 0 {
+            right.visit_rows(0..n_right, &mut |r, row| {
+                if r.is_multiple_of(ROW_CHUNK) {
                     ctx.advance(if r == 0 { 0 } else { ROW_CHUNK as u64 })?;
                 }
                 right_index
-                    .entry(key_of(spec, row, &right_key_cols))
+                    .entry(match_key_of(spec, row, &right_key_cols))
                     .or_default()
                     .push(r);
-            }
+                Ok(true)
+            })?;
 
             // Count left keys up front so EVERY row of a duplicated key is a
             // conflict — including the first one, which must not be silently
             // paired.
             let mut left_counts: HashMap<Vec<String>, usize> = HashMap::new();
-            for (l, row) in left_rows.iter().enumerate() {
-                if l % ROW_CHUNK == 0 {
+            left.visit_rows(0..n_left, &mut |l, row| {
+                if l.is_multiple_of(ROW_CHUNK) {
                     ctx.advance(if l == 0 { 0 } else { ROW_CHUNK as u64 })?;
                 }
                 *left_counts
-                    .entry(key_of(spec, row, &spec.key_columns))
+                    .entry(match_key_of(spec, row, &spec.key_columns))
                     .or_insert(0) += 1;
+                Ok(true)
+            })?;
+
+            // Classify left rows block-by-block. Unique pairs defer their
+            // cell comparison until the block's right rows are fetched in one
+            // batched read.
+            let mut right_matched: Vec<bool> = vec![false; n_right];
+            let mut l = 0usize;
+            while l < n_left {
+                let end = (l + ROW_CHUNK).min(n_left);
+                let lblock = left.fetch_rows(&(l..end).collect::<Vec<_>>())?;
+                // (entry index, left row within block, right row) to hydrate.
+                let mut pending: Vec<(usize, usize, usize)> = Vec::new();
+                for (bi, lrow) in lblock.iter().enumerate() {
+                    let li = l + bi;
+                    let key = match_key_of(spec, lrow, &spec.key_columns);
+                    let left_dup = left_counts.get(&key).copied().unwrap_or(0) > 1;
+                    match right_index.get(&key) {
+                        Some(matches) => {
+                            if left_dup || matches.len() > 1 {
+                                // Duplicate keys on either side: surface as a
+                                // conflict rather than silently pairing rows.
+                                // Only the referenced right row is consumed;
+                                // the REMAINING right duplicates fall through
+                                // to the unmatched pass below so every record
+                                // is classified (as its own conflict).
+                                if let Some(&first) = matches.first() {
+                                    right_matched[first] = true;
+                                }
+                                entries.push(Entry {
+                                    status: DiffStatus::Conflict,
+                                    left_row: Some(li as u32),
+                                    right_row: matches.first().map(|&r| r as u32),
+                                });
+                            } else {
+                                let r = matches[0];
+                                right_matched[r] = true;
+                                pending.push((entries.len(), bi, r));
+                                entries.push(Entry {
+                                    status: DiffStatus::Unchanged, // provisional
+                                    left_row: Some(li as u32),
+                                    right_row: Some(r as u32),
+                                });
+                            }
+                        }
+                        None => {
+                            entries.push(Entry {
+                                status: if left_dup {
+                                    DiffStatus::Conflict
+                                } else {
+                                    DiffStatus::Removed
+                                },
+                                left_row: Some(li as u32),
+                                right_row: None,
+                            });
+                        }
+                    }
+                }
+                let wanted: Vec<usize> = pending.iter().map(|&(_, _, r)| r).collect();
+                let rrows = right.fetch_rows(&wanted)?;
+                for (&(entry_idx, bi, _), rrow) in pending.iter().zip(&rrows) {
+                    if pair_changed(&lblock[bi], rrow) {
+                        entries[entry_idx].status = DiffStatus::Changed;
+                    }
+                }
+                ctx.advance((end - l) as u64)?;
+                l = end;
             }
 
-            let mut right_matched: Vec<bool> = vec![false; right_rows.len()];
-            for (l, row) in left_rows.iter().enumerate() {
-                if l % ROW_CHUNK == 0 {
-                    ctx.advance(if l == 0 { 0 } else { ROW_CHUNK as u64 })?;
-                }
-                let key = key_of(spec, row, &spec.key_columns);
-                let left_dup = left_counts.get(&key).copied().unwrap_or(0) > 1;
-                match right_index.get(&key) {
-                    Some(matches) => {
-                        for &r in matches {
-                            right_matched[r] = true;
-                        }
-                        if left_dup || matches.len() > 1 {
-                            // Duplicate keys on either side: surface as a
-                            // conflict rather than silently pairing rows.
-                            entries.push(Entry {
-                                status: DiffStatus::Conflict,
-                                left_row: Some(l as u32),
-                                right_row: matches.first().map(|&r| r as u32),
-                            });
-                        } else {
-                            let r = matches[0];
-                            entries.push(Entry {
-                                status: if row_changed(l, r) {
-                                    DiffStatus::Changed
-                                } else {
-                                    DiffStatus::Unchanged
-                                },
-                                left_row: Some(l as u32),
-                                right_row: Some(r as u32),
-                            });
-                        }
-                    }
-                    None => {
-                        entries.push(Entry {
-                            status: if left_dup {
-                                DiffStatus::Conflict
-                            } else {
-                                DiffStatus::Removed
-                            },
-                            left_row: Some(l as u32),
-                            right_row: None,
-                        });
+            // Unmatched right rows: added — unless their key is duplicated on
+            // the right, which is a conflict. Derived from the key index (no
+            // second scan of the right document).
+            let mut unmatched: Vec<(usize, bool)> = Vec::new();
+            for indices in right_index.values() {
+                let dup_on_right = indices.len() > 1;
+                for &r in indices {
+                    if !right_matched[r] {
+                        unmatched.push((r, dup_on_right));
                     }
                 }
             }
-            // Unmatched right rows: added — unless their key is duplicated on
-            // the right, which is a conflict.
-            for (r, row) in right_rows.iter().enumerate() {
-                if right_matched[r] {
-                    continue;
-                }
-                let key = key_of(spec, row, &right_key_cols);
-                let dup_on_right = right_index.get(&key).is_some_and(|v| v.len() > 1);
+            unmatched.sort_unstable();
+            for (r, dup_on_right) in unmatched {
                 entries.push(Entry {
                     status: if dup_on_right {
                         DiffStatus::Conflict
@@ -449,20 +528,36 @@ pub fn results_page(
     let total_filtered = result.entries.iter().filter(|e| matches_filter(e)).count();
 
     let mapping = effective_mapping(&result.spec, left, right);
-    let left_rows = left.rows();
-    let right_rows = right.rows();
-
-    let records = result
+    let page: Vec<&Entry> = result
         .entries
         .iter()
         .filter(|e| matches_filter(e))
         .skip(offset)
         .take(count)
+        .collect();
+
+    // Hydrate every row this page touches in two batched reads (one per side).
+    let fetch_side = |doc: &Document, pick: fn(&Entry) -> Option<u32>| {
+        let mut need: Vec<usize> = page
+            .iter()
+            .filter_map(|e| pick(e))
+            .map(|v| v as usize)
+            .collect();
+        need.sort_unstable();
+        need.dedup();
+        let rows = doc.fetch_rows(&need)?;
+        Ok::<HashMap<usize, Vec<String>>, AppError>(need.into_iter().zip(rows).collect())
+    };
+    let left_rows = fetch_side(left, |e| e.left_row)?;
+    let right_rows = fetch_side(right, |e| e.right_row)?;
+
+    let records = page
+        .into_iter()
         .map(|e| {
             let key = match (result.spec.mode, e.left_row, e.right_row) {
                 (CompareMode::Keyed, Some(l), _) => key_of(
                     &result.spec,
-                    &left_rows[l as usize],
+                    &left_rows[&(l as usize)],
                     &result.spec.key_columns,
                 ),
                 (CompareMode::Keyed, None, Some(r)) => {
@@ -474,7 +569,7 @@ pub fn results_page(
                             mapping.iter().find(|&&(lc, _)| lc == k).map(|&(_, rc)| rc)
                         })
                         .collect();
-                    key_of(&result.spec, &right_rows[r as usize], &right_key_cols)
+                    key_of(&result.spec, &right_rows[&(r as usize)], &right_key_cols)
                 }
                 (CompareMode::Positional, l, r) => {
                     vec![format!("row {}", l.or(r).map(|i| i + 1).unwrap_or(0))]
@@ -482,22 +577,20 @@ pub fn results_page(
                 _ => Vec::new(),
             };
             let cells = match (e.status, e.left_row, e.right_row) {
-                (DiffStatus::Changed, Some(l), Some(r)) => mapping
-                    .iter()
-                    .filter(|&&(lc, rc)| {
-                        !cells_equal(
-                            &result.spec,
-                            &left_rows[l as usize][lc],
-                            &right_rows[r as usize][rc],
-                        )
-                    })
-                    .map(|&(lc, rc)| CellDifference {
-                        left_col: lc,
-                        right_col: rc,
-                        left: left_rows[l as usize][lc].clone(),
-                        right: right_rows[r as usize][rc].clone(),
-                    })
-                    .collect(),
+                (DiffStatus::Changed, Some(l), Some(r)) => {
+                    let lrow = &left_rows[&(l as usize)];
+                    let rrow = &right_rows[&(r as usize)];
+                    mapping
+                        .iter()
+                        .filter(|&&(lc, rc)| !cells_equal(&result.spec, &lrow[lc], &rrow[rc]))
+                        .map(|&(lc, rc)| CellDifference {
+                            left_col: lc,
+                            right_col: rc,
+                            left: lrow[lc].clone(),
+                            right: rrow[rc].clone(),
+                        })
+                        .collect()
+                }
                 _ => Vec::new(),
             };
             DiffRecord {
@@ -667,6 +760,45 @@ mod tests {
         assert_eq!(s[3], DiffStatus::Conflict);
         assert_eq!(s[4], DiffStatus::Conflict);
         assert_eq!(result.summary.conflicts, 4);
+    }
+
+    #[test]
+    fn every_right_duplicate_of_a_matched_key_is_classified() {
+        // One left row, two right rows with the same key: the pair entry
+        // consumes only the referenced right row; the OTHER right duplicate
+        // must still surface as its own conflict instead of vanishing.
+        let left = doc(1, "id,v\n1,a");
+        let right = doc(2, "id,v\n1,x\n1,y");
+        let (_r, ctx) = ctx();
+        let result = compare(&left, &right, &keyed_spec(vec![0]), &ctx).unwrap();
+        assert_eq!(result.summary.conflicts, 2, "{:?}", statuses(&result));
+        assert_eq!(result.summary.total, 2);
+        // Both right rows appear across the entries.
+        let right_rows: Vec<Option<u32>> = result.entries.iter().map(|e| e.right_row).collect();
+        assert!(right_rows.contains(&Some(0)));
+        assert!(right_rows.contains(&Some(1)));
+    }
+
+    #[test]
+    fn keyed_matching_honours_numeric_and_date_equivalence() {
+        // With numeric/date equivalence on, `1` and `1.0` (and the two date
+        // spellings) must PAIR as the same key, not classify as added+removed.
+        let left = doc(1, "id,v\n1,a\n2024-03-01,b");
+        let right = doc(2, "id,v\n1.0,a\n03/01/2024,b");
+        let mut spec = keyed_spec(vec![0]);
+        spec.numeric_equal = true;
+        spec.date_equal = true;
+        let (_r, equivalent_ctx) = ctx();
+        let result = compare(&left, &right, &spec, &equivalent_ctx).unwrap();
+        assert_eq!(result.summary.unchanged, 2, "{:?}", statuses(&result));
+        assert_eq!(result.summary.added, 0);
+        assert_eq!(result.summary.removed, 0);
+
+        // Without the toggles the same rows do NOT pair.
+        let (_r2, strict_ctx) = ctx();
+        let strict = compare(&left, &right, &keyed_spec(vec![0]), &strict_ctx).unwrap();
+        assert_eq!(strict.summary.removed, 2);
+        assert_eq!(strict.summary.added, 2);
     }
 
     #[test]

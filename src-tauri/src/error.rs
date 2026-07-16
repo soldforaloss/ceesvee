@@ -35,6 +35,13 @@ pub enum AppError {
     #[error("stale revision: the document changed since this operation was prepared (expected revision {expected}, document is at {actual})")]
     StaleRevision { expected: u64, actual: u64 },
 
+    /// A mutation was attempted on a document opened in indexed read-only
+    /// mode (F10). Convert it to editable first.
+    #[error(
+        "this document is open in read-only (indexed) mode; convert it to editable to make changes"
+    )]
+    ReadOnly,
+
     #[error("{0}")]
     Other(String),
 }

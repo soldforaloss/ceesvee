@@ -252,6 +252,10 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
 
   // ----- cell rendering & editing ----------------------------------------
 
+  // Indexed read-only documents (F10): cells render but never open an editor,
+  // and paste/fill are inert (the backend refuses them anyway).
+  const readOnly = meta.backing === "indexedReadOnly";
+
   const getCellContent = useCallback(
     ([col, row]: Item): GridCell => {
       const rowData = rowCache.current.get(row);
@@ -264,7 +268,7 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         kind: GridCellKind.Text,
         data: value,
         displayData: value,
-        allowOverlay: true,
+        allowOverlay: !readOnly,
         contentAlign: columnKinds[col] === "number" ? "right" : undefined,
         themeOverride: isDirty ? dirtyCellOverride : undefined,
       };
@@ -272,26 +276,34 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     // Cell data is read from refs; recreated only when column types change so
     // numeric columns re-render right-aligned. Structural refreshes still go
     // through `updateCells`.
-    [columnKinds],
+    [columnKinds, readOnly],
   );
 
-  const onCellEdited = useCallback(([col, row]: Item, newValue: EditableGridCell) => {
-    if (newValue.kind !== GridCellKind.Text) return;
-    const value = newValue.data;
-    const rowData = rowCache.current.get(row);
-    if (rowData) rowData[col] = value;
-    const dirtyRow = dirtyCache.current.get(row);
-    if (dirtyRow) dirtyRow[col] = true;
-    gridRef.current?.updateCells([{ cell: [col, row] }]);
-    void useStore.getState().setCell(row, col, value);
-  }, []);
+  const onCellEdited = useCallback(
+    ([col, row]: Item, newValue: EditableGridCell) => {
+      if (readOnly) return;
+      if (newValue.kind !== GridCellKind.Text) return;
+      const value = newValue.data;
+      const rowData = rowCache.current.get(row);
+      if (rowData) rowData[col] = value;
+      const dirtyRow = dirtyCache.current.get(row);
+      if (dirtyRow) dirtyRow[col] = true;
+      gridRef.current?.updateCells([{ cell: [col, row] }]);
+      void useStore.getState().setCell(row, col, value);
+    },
+    [readOnly],
+  );
 
-  const onPaste = useCallback((target: Item, values: readonly (readonly string[])[]) => {
-    const [col, row] = target;
-    const block = values.map((line) => Array.from(line));
-    void useStore.getState().pasteBlock(row, col, block);
-    return false; // applied via the backend, which triggers a reload
-  }, []);
+  const onPaste = useCallback(
+    (target: Item, values: readonly (readonly string[])[]) => {
+      if (readOnly) return false;
+      const [col, row] = target;
+      const block = values.map((line) => Array.from(line));
+      void useStore.getState().pasteBlock(row, col, block);
+      return false; // applied via the backend, which triggers a reload
+    },
+    [readOnly],
+  );
 
   const onColumnResize = useCallback(
     (_col: GridColumn, newSize: number, colIndex: number) => {
@@ -392,12 +404,19 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         rowSelect="multi"
         smoothScrollX
         smoothScrollY
-        fillHandle
+        fillHandle={!readOnly}
         keybindings={{ search: false }}
         width="100%"
         height="100%"
       />
-      {menu && <ColumnMenu state={menu} headers={meta.headers} onClose={() => setMenu(null)} />}
+      {menu && (
+        <ColumnMenu
+          state={menu}
+          headers={meta.headers}
+          readOnly={readOnly}
+          onClose={() => setMenu(null)}
+        />
+      )}
     </div>
   );
 }

@@ -34,6 +34,14 @@ export function SummaryPanel({ onClose }: { onClose: () => void }) {
           rows, not just the visible ones.
         </p>
       )}
+      {rows?.some((cs) => cs.sampled) && (
+        <p className="mb-3 rounded bg-amber-50 px-2 py-1.5 text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+          Read-only (indexed) document: these statistics cover the first{" "}
+          {(rows[0]?.count ?? 0).toLocaleString()} rows, not all{" "}
+          {meta.totalRowCount.toLocaleString()}. Use the column explorer for an exact,
+          whole-document profile.
+        </p>
+      )}
       {!rows ? (
         <p className="py-8 text-center text-sm text-zinc-400">Analysing columns…</p>
       ) : (

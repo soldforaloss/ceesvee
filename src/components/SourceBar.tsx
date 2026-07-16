@@ -9,13 +9,27 @@ export function SourceBar() {
   const meta = useActiveMeta();
   const openReopenDialog = useStore((s) => s.openReopenDialog);
   const setHeaderMode = useStore((s) => s.setHeaderMode);
+  const convertToEditable = useStore((s) => s.convertActiveToEditable);
+  const indexing = useStore((s) => s.indexing);
 
   const standard = DELIMITER_OPTIONS.some((o) => o.value === meta?.delimiter);
   const [customMode, setCustomMode] = useState(false);
   const [customValue, setCustomValue] = useState("");
+  // After a refused convert (memory estimate), offer "convert anyway".
+  const [offerForce, setOfferForce] = useState(false);
 
   if (!meta) return null;
-  const canReparse = meta.path !== null;
+  const readOnly = meta.backing === "indexedReadOnly";
+  // Reparse materialises the whole file, so indexed documents change their
+  // source settings by re-opening instead.
+  const canReparse = meta.path !== null && !readOnly;
+  const converting = indexing?.kind === "convertEditable" && indexing.docId === meta.id;
+
+  const onConvert = async (force: boolean) => {
+    await convertToEditable(force);
+    const failed = useStore.getState().error;
+    setOfferForce(!force && !!failed && failed.includes("convert anyway"));
+  };
 
   // Source-setting changes re-read the file, so they never apply directly:
   // they open the "Reopen with settings" preview (F02), which handles dirty
@@ -90,15 +104,47 @@ export function SourceBar() {
         />
       </Field>
 
-      <label className="flex cursor-pointer items-center gap-1.5 select-none">
+      <label
+        className={`flex items-center gap-1.5 select-none ${readOnly ? "opacity-40" : "cursor-pointer"}`}
+      >
         <input
           type="checkbox"
           checked={meta.hasHeaderRow}
+          disabled={readOnly}
           onChange={(e) => onHeaderToggle(e.target.checked)}
           className="accent-violet-600"
         />
         First row is header
       </label>
+
+      {readOnly && (
+        <span className="flex items-center gap-2">
+          <span
+            title="This document is served from a streaming record index instead of memory, so it can be huge — browsing, find, filter, export, diagnostics and profiling all work, but cells cannot be edited."
+            className="rounded-full bg-amber-100 px-2 py-0.5 font-medium text-amber-800 dark:bg-amber-500/15 dark:text-amber-300"
+          >
+            Read-only (indexed)
+          </span>
+          {converting ? (
+            <span className="text-zinc-400">
+              Converting…{" "}
+              {indexing.total ? `${Math.round((indexing.processed / indexing.total) * 100)}%` : ""}
+            </span>
+          ) : (
+            <button
+              onClick={() => void onConvert(offerForce)}
+              className="rounded border border-zinc-300 px-1.5 py-0.5 hover:border-violet-500 hover:text-violet-600 dark:border-zinc-600 dark:hover:text-violet-300"
+              title={
+                offerForce
+                  ? "The estimate says this may exhaust memory — convert anyway?"
+                  : "Load the whole file into memory to enable editing"
+              }
+            >
+              {offerForce ? "Convert anyway" : "Convert to editable"}
+            </button>
+          )}
+        </span>
+      )}
 
       {meta.path && (
         <span

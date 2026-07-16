@@ -30,6 +30,7 @@ import type {
   DedupSpec,
   DuplicateKeepStrategy,
   DuplicateReport,
+  OpenEstimate,
   OpenOptions,
   ProfileScope,
   ProfileValidation,
@@ -50,6 +51,9 @@ const MAX_RECENT = 10;
 let statsTimer: ReturnType<typeof setTimeout> | null = null;
 // Debounce timer for the (backend-computed) per-column summaries.
 let summariesTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Find-match cap for indexed read-only documents (F10). */
+export const INDEXED_FIND_LIMIT = 5000;
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
@@ -105,6 +109,11 @@ export interface DiagnosticsDocState {
   total: number | null;
   /** Terminal error of the last scan, if it failed. */
   scanError: string | null;
+  /**
+   * The user cancelled the last scan. Suppresses the panel's auto-scan so
+   * Cancel actually sticks; cleared when a scan is explicitly started.
+   */
+  cancelled: boolean;
 }
 
 const initialDiagnosticsDocState: DiagnosticsDocState = {
@@ -113,6 +122,7 @@ const initialDiagnosticsDocState: DiagnosticsDocState = {
   processed: 0,
   total: null,
   scanError: null,
+  cancelled: false,
 };
 
 /** One-shot request for the grid to scroll to and select a cell. */
@@ -176,12 +186,37 @@ export interface EncodingIssuesPrompt {
 // promise callbacks don't belong in reactive state.
 const jobWaiters = new Map<number, (finished: JobFinished) => void>();
 
+// Fast jobs can emit `job-finished` BEFORE the invoke that started them
+// resolves with the job id (the backend spawns the worker and returns
+// immediately). Buffer recent terminal events so late subscribers — awaitJob
+// and the kind-specific tracking below — reconcile instead of waiting
+// forever. Bounded FIFO; job ids are never reused within a session.
+const finishedEarly = new Map<number, JobFinished>();
+const FINISHED_EARLY_LIMIT = 64;
+
+function rememberFinished(finished: JobFinished) {
+  finishedEarly.set(finished.jobId, finished);
+  if (finishedEarly.size > FINISHED_EARLY_LIMIT) {
+    const oldest = finishedEarly.keys().next().value;
+    if (oldest !== undefined) finishedEarly.delete(oldest);
+  }
+}
+
 function awaitJob(jobId: number): Promise<JobFinished> {
+  const early = finishedEarly.get(jobId);
+  if (early) {
+    finishedEarly.delete(jobId);
+    return Promise.resolve(early);
+  }
   return new Promise((resolve) => jobWaiters.set(jobId, resolve));
 }
 
-// Trailing-debounce timer for persisting the grid scroll position.
+// Trailing-debounce timer for persisting the grid scroll position, plus the
+// value it will write. Kept module-level so a tab switch inside the debounce
+// window can flush the pending position into the OUTGOING tab's snapshot
+// instead of leaking it into the next tab's live state.
 let scrollTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingScroll: { row: number; column: number } | null = null;
 
 /**
  * Everything document-specific about the UI (F08), snapshotted and restored
@@ -224,6 +259,23 @@ const initialCompare: CompareState = {
   info: null,
   error: null,
 };
+
+/** A large-file open awaiting the user's mode choice (F10). */
+export interface OpenDecisionState {
+  path: string;
+  estimate: OpenEstimate;
+}
+
+/** A running index-related job (open, convert, or reload; F10). */
+export interface IndexingState {
+  jobId: number;
+  docId: number;
+  kind: "openIndexed" | "convertEditable" | "reindex";
+  path: string | null;
+  /** Bytes scanned (open/reindex) or rows materialised (convert). */
+  processed: number;
+  total: number | null;
+}
 
 /** Duplicate-finder state (F07), for the ACTIVE document. */
 export interface DedupState {
@@ -336,6 +388,10 @@ interface Store {
   dedup: DedupState;
   /** Compare state (F09). */
   compare: CompareState;
+  /** Large-file open awaiting a mode choice (F10). */
+  openDecision: OpenDecisionState | null;
+  /** Running index build / conversion / re-index job (F10). */
+  indexing: IndexingState | null;
 
   // lifecycle / chrome
   init: () => void;
@@ -355,6 +411,16 @@ interface Store {
   newDoc: () => Promise<void>;
   closeTab: (id: number) => Promise<void>;
   setHeaderMode: (hasHeader: boolean) => Promise<void>;
+
+  // indexed read-only mode (F10)
+  /** "Open editable" in the open-mode dialog: load fully despite the estimate. */
+  confirmOpenEditable: () => Promise<void>;
+  /** "Open read-only" in the open-mode dialog: start the indexing job. */
+  confirmOpenIndexed: () => Promise<void>;
+  dismissOpenDecision: () => void;
+  /** Materialise the active indexed document into an editable one. */
+  convertActiveToEditable: (force: boolean) => Promise<void>;
+  cancelIndexing: () => Promise<void>;
 
   // reopen with settings (F02)
   openReopenDialog: (initial?: OpenOptions) => void;
@@ -524,6 +590,16 @@ export const useStore = create<Store>((set, get) => {
    * Nothing document-specific survives the switch outside its snapshot.
    */
   const switchPatch = (s: Store, id: number | null): Partial<Store> => {
+    // Flush a scroll update still sitting in the debounce window: it belongs
+    // to the OUTGOING document, so snapshot it there rather than letting the
+    // timer fire later and pollute the incoming tab's live state.
+    if (scrollTimer !== null) {
+      clearTimeout(scrollTimer);
+      scrollTimer = null;
+    }
+    const flushedScroll = pendingScroll ?? s.scrollPosition;
+    pendingScroll = null;
+
     const uiStates = { ...s.uiStates };
     if (s.activeId != null && s.tabs.some((t) => t.id === s.activeId)) {
       uiStates[s.activeId] = {
@@ -534,7 +610,7 @@ export const useStore = create<Store>((set, get) => {
         selection: s.selectionRect,
         selectedRows: s.selectedRows,
         selectedColumns: s.selectedCols,
-        scrollPosition: s.scrollPosition,
+        scrollPosition: flushedScroll,
         activeExplorerColumn: s.activeExplorerColumn,
         lastExportOptions: s.lastExportOptions,
       };
@@ -579,11 +655,14 @@ export const useStore = create<Store>((set, get) => {
     if (!meta.path) return;
     const matches = matchingProfiles(profiles, meta.path);
     if (matches.length === 0) return;
-    const profile = matches[0];
 
     const current = get().tabs.find((t) => t.id === meta.id);
     if (!current) return;
-    if (!profileSettingsDiffer(profile, current)) return; // already interpreted this way
+    // First matching profile that would actually CHANGE the interpretation:
+    // a broad already-satisfied profile must not shadow a later, more
+    // specific one that differs.
+    const profile = matches.find((m) => profileSettingsDiffer(m, current));
+    if (!profile) return; // already interpreted this way
 
     // Automatic application requires the profile's explicit opt-in AND a
     // clean document — a dirty document is never silently reparsed.
@@ -652,6 +731,19 @@ export const useStore = create<Store>((set, get) => {
   };
 
   /**
+   * A tracked job may have finished before its id was recorded (fast jobs
+   * race the invoke's round trip). Call right after storing a job id: if the
+   * terminal event already arrived, replay it through the normal handler.
+   */
+  const consumeEarlyFinish = (jobId: number) => {
+    const finished = finishedEarly.get(jobId);
+    if (finished) {
+      finishedEarly.delete(jobId);
+      void get().handleJobFinished(finished);
+    }
+  };
+
+  /**
    * Run one atomic streaming save job to completion. Returns whether the file
    * was written (progress streams over the job events into `fileJobs`).
    */
@@ -714,7 +806,12 @@ export const useStore = create<Store>((set, get) => {
     // between UTF-8, another encoding, or cancelling — never silent loss.
     if (isLegacyEncoding(options.encoding)) {
       try {
-        const compat = await api.checkEncodingCompatibility(id, options.encoding);
+        const compat = await api.checkEncodingCompatibility(
+          id,
+          options.encoding,
+          undefined,
+          options.includeHeaders,
+        );
         if (!compat.compatible) {
           set({
             encodingIssues: { docId: id, path, options, compat, action: { type: "save" } },
@@ -788,6 +885,8 @@ export const useStore = create<Store>((set, get) => {
     diagnostics: {},
     jumpTarget: null,
     reopen: initialReopen,
+    openDecision: null,
+    indexing: null,
     externalPrompt: null,
     ignoredFingerprints: {},
     quitPromptOpen: false,
@@ -858,11 +957,16 @@ export const useStore = create<Store>((set, get) => {
 
     setScrollPosition: (row, column) => {
       // Trailing debounce: visible-region events fire on every scroll frame.
+      pendingScroll = { row, column };
       if (scrollTimer !== null) clearTimeout(scrollTimer);
       scrollTimer = setTimeout(() => {
+        scrollTimer = null;
+        const latest = pendingScroll;
+        pendingScroll = null;
+        if (!latest) return;
         const current = get().scrollPosition;
-        if (current.row !== row || current.column !== column) {
-          set({ scrollPosition: { row, column } });
+        if (current.row !== latest.row || current.column !== latest.column) {
+          set({ scrollPosition: latest });
         }
       }, 250);
     },
@@ -899,6 +1003,13 @@ export const useStore = create<Store>((set, get) => {
       }
       set({ busy: true, error: null });
       try {
+        // F10: estimate the in-memory cost first. Large files pause here and
+        // let the user pick editable vs indexed read-only.
+        const estimate = await api.probeOpen(path);
+        if (estimate.needsDecision) {
+          set({ busy: false, openDecision: { path, estimate } });
+          return;
+        }
         const meta = await api.openFile(path);
         set((s) => ({
           ...switchPatch(s, meta.id),
@@ -910,6 +1021,78 @@ export const useStore = create<Store>((set, get) => {
       } catch (e) {
         set({ error: String(e), busy: false });
       }
+    },
+
+    // ----- indexed read-only mode (F10) --------------------------------------
+
+    confirmOpenEditable: async () => {
+      const decision = get().openDecision;
+      if (!decision) return;
+      set({ openDecision: null, busy: true, error: null });
+      try {
+        const meta = await api.openFile(decision.path, { forceInMemory: true });
+        set((s) => ({
+          ...switchPatch(s, meta.id),
+          tabs: [...s.tabs, meta],
+          busy: false,
+        }));
+        pushRecent(decision.path);
+        void suggestProfileFor(meta);
+      } catch (e) {
+        set({ error: String(e), busy: false });
+      }
+    },
+
+    confirmOpenIndexed: async () => {
+      const decision = get().openDecision;
+      if (!decision) return;
+      set({ openDecision: null, error: null });
+      try {
+        const started = await api.startOpenIndexed(decision.path);
+        set({
+          indexing: {
+            jobId: started.jobId,
+            docId: started.docId,
+            kind: "openIndexed",
+            path: decision.path,
+            processed: 0,
+            total: decision.estimate.fileSize,
+          },
+        });
+        consumeEarlyFinish(started.jobId);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    dismissOpenDecision: () => set({ openDecision: null }),
+
+    convertActiveToEditable: async (force) => {
+      const id = get().activeId;
+      if (id == null || get().indexing) return;
+      try {
+        const jobId = await api.startConvertToEditable(id, force);
+        set({
+          indexing: {
+            jobId,
+            docId: id,
+            kind: "convertEditable",
+            path: null,
+            processed: 0,
+            total: null,
+          },
+          error: null,
+        });
+        consumeEarlyFinish(jobId);
+      } catch (e) {
+        // Typically the memory-estimate refusal; the SourceBar offers force.
+        set({ error: String(e) });
+      }
+    },
+
+    cancelIndexing: async () => {
+      const indexing = get().indexing;
+      if (indexing) await api.cancelJob(indexing.jobId).catch(() => undefined);
     },
 
     newDoc: async () => {
@@ -1011,17 +1194,21 @@ export const useStore = create<Store>((set, get) => {
 
     runFind: async () => {
       const id = get().activeId;
-      const { find, selectionRect } = get();
+      const { find, selectionRect, tabs } = get();
       if (id == null || find.query === "") {
         set((s) => ({ find: { ...s.find, matches: [], index: 0 } }));
         return;
       }
+      const activeTab = tabs.find((t) => t.id === id);
       const options: FindOptions = {
         query: find.query,
         regex: find.regex,
         caseSensitive: find.caseSensitive,
         wholeCell: find.wholeCell,
         selection: find.inSelection && selectionRect ? selectionRect : undefined,
+        // Indexed documents can be enormous: cap the match list so a broad
+        // query cannot materialise millions of hits (F10).
+        limit: activeTab?.backing === "indexedReadOnly" ? INDEXED_FIND_LIMIT : undefined,
       };
       try {
         const matches = await api.find(id, options);
@@ -1126,7 +1313,14 @@ export const useStore = create<Store>((set, get) => {
       if (existing?.jobId != null) return; // a scan is already running
       try {
         const jobId = await api.startDiagnosticsScan(meta.id, meta.revision);
-        patchDiagnostics(meta.id, { jobId, processed: 0, total: null, scanError: null });
+        patchDiagnostics(meta.id, {
+          jobId,
+          processed: 0,
+          total: null,
+          scanError: null,
+          cancelled: false,
+        });
+        consumeEarlyFinish(jobId);
       } catch (e) {
         patchDiagnostics(meta.id, { scanError: String(e) });
       }
@@ -1217,6 +1411,22 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
+      if (
+        progress.kind === "openIndexed" ||
+        progress.kind === "convertEditable" ||
+        progress.kind === "reindex"
+      ) {
+        if (get().indexing?.jobId !== progress.jobId) return;
+        set((s) => ({
+          indexing: s.indexing && {
+            ...s.indexing,
+            processed: progress.processed,
+            total: progress.total,
+          },
+        }));
+        return;
+      }
+
       if (progress.kind !== "diagnostics") return;
       // Only track the scan we started (guards against reused ids after e.g.
       // an app-side restart of the job system).
@@ -1225,6 +1435,10 @@ export const useStore = create<Store>((set, get) => {
     },
 
     handleJobFinished: async (finished) => {
+      // Buffer first: a start-job invoke that has not resolved yet finds the
+      // event here (see rememberFinished). Ids are unique, so a consumed
+      // entry lingering until FIFO eviction is harmless.
+      rememberFinished(finished);
       // Resolve any promise waiting on this job (save/export flows).
       const waiter = jobWaiters.get(finished.jobId);
       if (waiter) {
@@ -1237,6 +1451,44 @@ export const useStore = create<Store>((set, get) => {
           delete fileJobs[finished.jobId];
           return { fileJobs };
         });
+        return;
+      }
+
+      if (
+        finished.kind === "openIndexed" ||
+        finished.kind === "convertEditable" ||
+        finished.kind === "reindex"
+      ) {
+        const indexing = get().indexing;
+        if (indexing?.jobId !== finished.jobId) return;
+        set({ indexing: null });
+        if (finished.status !== "done") {
+          if (finished.status === "failed") {
+            set({ error: finished.error ?? "indexing failed" });
+          }
+          return;
+        }
+        try {
+          const meta = await api.getMeta(indexing.docId);
+          if (finished.kind === "openIndexed") {
+            set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] }));
+            if (indexing.path) pushRecent(indexing.path);
+          } else {
+            // Conversion / re-index changed the document in place.
+            reloadDoc(meta);
+            if (finished.kind === "reindex" && get().activeId === meta.id) {
+              // Reload replaced the contents; derived state (find matches,
+              // cached summaries) points at rows that may be gone.
+              set((s) => ({
+                find: { ...s.find, matches: [], index: 0 },
+                summaries: null,
+                summariesDocId: null,
+              }));
+            }
+          }
+        } catch (e) {
+          set({ error: String(e) });
+        }
         return;
       }
 
@@ -1302,11 +1554,14 @@ export const useStore = create<Store>((set, get) => {
       if (get().diagnostics[docId]?.jobId !== finished.jobId) return;
       if (finished.status === "done") {
         const report = await api.getDiagnostics(docId).catch(() => null);
-        patchDiagnostics(docId, { jobId: null, report, scanError: null });
+        patchDiagnostics(docId, { jobId: null, report, scanError: null, cancelled: false });
       } else {
         patchDiagnostics(docId, {
           jobId: null,
           scanError: finished.status === "failed" ? (finished.error ?? "scan failed") : null,
+          // Remember an explicit cancel so the panel does not immediately
+          // auto-start another scan of the same document.
+          cancelled: finished.status === "cancelled",
         });
       }
     },
@@ -1357,14 +1612,23 @@ export const useStore = create<Store>((set, get) => {
       if (!meta || !preview) return;
 
       // A dirty document must be saved (or explicitly discarded) first.
+      let expectedRevision = preview.expectedRevision;
       if (meta.dirty && !discard) {
         const saved = await saveDocById(meta.id, false);
         if (!saved) return; // save cancelled or failed: abort, keep the dialog
+        // The save just wrote the CURRENT document, so the preview (parsed
+        // from the pre-save bytes) may no longer describe what a reparse
+        // loads. Re-parse the fresh bytes and apply against that instead.
+        await get().refreshReopenPreview();
+        const fresh = get().reopen.preview;
+        if (!fresh) return; // refresh failed; its error is already showing
+        expectedRevision = fresh.expectedRevision;
       }
 
       try {
-        // Saving does not bump the revision, so the preview stays valid here.
-        const updated = await api.applyReparse(meta.id, reopen.options, preview.expectedRevision);
+        // Saving does not bump the revision, so the (possibly refreshed)
+        // preview stays valid here.
+        const updated = await api.applyReparse(meta.id, reopen.options, expectedRevision);
         reloadDoc(updated);
         set({
           reopen: initialReopen,
@@ -1385,9 +1649,11 @@ export const useStore = create<Store>((set, get) => {
     // ----- external changes (F02) -------------------------------------------
 
     checkExternalChanges: async () => {
-      const { tabs, externalPrompt, ignoredFingerprints, reopen, quitPromptOpen } = get();
+      const { tabs, externalPrompt, ignoredFingerprints, reopen, quitPromptOpen, indexing } = get();
       // One dialog at a time; don't stack prompts over other modal flows.
-      if (externalPrompt || reopen.open || quitPromptOpen) return;
+      // A running index job (open/convert/reload) also suppresses checks: a
+      // reindex refreshes the fingerprint only when it finishes.
+      if (externalPrompt || reopen.open || quitPromptOpen || indexing) return;
       for (const tab of tabs) {
         if (!tab.path) continue;
         try {
@@ -1412,6 +1678,26 @@ export const useStore = create<Store>((set, get) => {
       switch (action) {
         case "reload": {
           try {
+            if (meta.backing === "indexedReadOnly") {
+              // Indexed documents reload by re-scanning the file (job-based);
+              // the meta refreshes when the job finishes.
+              const jobId = await api.startReindex(meta.id);
+              set({
+                indexing: {
+                  jobId,
+                  docId: meta.id,
+                  kind: "reindex",
+                  path: meta.path,
+                  processed: 0,
+                  total: null,
+                },
+              });
+              consumeEarlyFinish(jobId);
+              // Return (not break): the shared tail would immediately re-run
+              // checkExternalChanges, and the still-old fingerprint would
+              // re-surface this same prompt while the reload job runs.
+              return;
+            }
             // Reload keeps the current parse settings; never offered (or
             // valid) for dirty documents.
             const updated = await api.applyReparse(
@@ -1420,6 +1706,13 @@ export const useStore = create<Store>((set, get) => {
               meta.revision,
             );
             reloadDoc(updated);
+            // The disk contents replaced the document: derived state (find
+            // matches, cached summaries) points at rows that may be gone.
+            set((s) => ({
+              find: { ...s.find, matches: [], index: 0 },
+              summaries: null,
+              summariesDocId: null,
+            }));
           } catch (e) {
             set({ error: String(e) });
           }
@@ -1498,7 +1791,12 @@ export const useStore = create<Store>((set, get) => {
       // Re-run the gate for the new encoding (a no-op for Unicode targets).
       if (isLegacyEncoding(retryEncoding)) {
         try {
-          const compat = await api.checkEncodingCompatibility(prompt.docId, retryEncoding, scope);
+          const compat = await api.checkEncodingCompatibility(
+            prompt.docId,
+            retryEncoding,
+            scope,
+            options.includeHeaders,
+          );
           if (!compat.compatible) {
             set({ encodingIssues: { ...prompt, options, compat } });
             return;
@@ -1532,7 +1830,12 @@ export const useStore = create<Store>((set, get) => {
       // Gate lossy encodings against exactly the cells this export writes.
       if (isLegacyEncoding(options.encoding)) {
         try {
-          const compat = await api.checkEncodingCompatibility(meta.id, options.encoding, scope);
+          const compat = await api.checkEncodingCompatibility(
+            meta.id,
+            options.encoding,
+            scope,
+            options.includeHeaders,
+          );
           if (!compat.compatible) {
             set({
               encodingIssues: {
@@ -1573,6 +1876,7 @@ export const useStore = create<Store>((set, get) => {
         set({
           compare: { ...initialCompare, jobId },
         });
+        consumeEarlyFinish(jobId);
       } catch (e) {
         set((s) => ({ compare: { ...s.compare, error: String(e) } }));
       }
@@ -1632,6 +1936,7 @@ export const useStore = create<Store>((set, get) => {
         set((s) => ({
           dedup: { ...s.dedup, scanJobId: jobId, processed: 0, total: null, error: null },
         }));
+        consumeEarlyFinish(jobId);
       } catch (e) {
         set((s) => ({ dedup: { ...s.dedup, error: String(e) } }));
       }
@@ -1683,6 +1988,10 @@ export const useStore = create<Store>((set, get) => {
       const meta = activeMeta();
       if (!meta) return false;
       const hadFilter = meta.filtered;
+      // Capture THIS document's filter spec now: by the time the job ends the
+      // user may have switched tabs (restoring another document's filter
+      // state) or closed the dialog.
+      const filterSpec = get().filter.spec;
       try {
         const jobId = await api.applyTransform(meta.id, spec, scope, policy, expectedRevision);
         const finished = await awaitJob(jobId);
@@ -1695,10 +2004,10 @@ export const useStore = create<Store>((set, get) => {
         const updated = await api.getMeta(meta.id);
         reloadDoc(updated);
         // The backend dropped the filter view before committing; recompute it
-        // from the (kept) filter spec so the user's view survives the edit.
+        // from the captured filter spec so the user's view survives the edit.
         if (hadFilter) {
           try {
-            const refiltered = await api.setFilter(meta.id, get().filter.spec);
+            const refiltered = await api.setFilter(meta.id, filterSpec);
             reloadDoc(refiltered);
           } catch {
             // The spec may reference a column the transform removed.
@@ -1750,6 +2059,7 @@ export const useStore = create<Store>((set, get) => {
         set((s) => ({
           explorer: { ...s.explorer, jobId, processed: 0, total: null, error: null },
         }));
+        consumeEarlyFinish(jobId);
       } catch (e) {
         set((s) => ({ explorer: { ...s.explorer, error: String(e), jobId: null } }));
       }

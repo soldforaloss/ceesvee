@@ -6,7 +6,9 @@ authors = ["CEESVEE contributors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/soldforaloss/ceesvee"
-rust-version = "1.82"
+# 1.89 for std file locking (File::try_lock), used by the F10 index-cache
+# stale-directory sweep instead of an extra locking dependency.
+rust-version = "1.89"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

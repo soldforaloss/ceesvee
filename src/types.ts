@@ -27,7 +27,11 @@ export interface DocumentMeta {
    * by the backend when the document has moved on.
    */
   revision: number;
+  /** Row storage: "editable" (in memory) or "indexedReadOnly" (F10). */
+  backing: DocumentBacking;
 }
+
+export type DocumentBacking = "editable" | "indexedReadOnly";
 
 /** Incremental progress for a background job (event: "job-progress"). */
 export interface JobProgress {
@@ -151,6 +155,26 @@ export interface OpenOptions {
   delimiter?: string;
   encoding?: string;
   hasHeaderRow?: boolean;
+  /**
+   * Open fully in memory even when the size estimate recommends asking (the
+   * "Open editable" choice in the F10 open-mode dialog).
+   */
+  forceInMemory?: boolean;
+}
+
+/** What `probe_open` reports so the UI can offer indexed mode (F10). */
+export interface OpenEstimate {
+  fileSize: number;
+  estimatedRows: number;
+  estimatedMemory: number;
+  needsDecision: boolean;
+  encoding: string;
+}
+
+/** Handles returned by `start_open_indexed`. */
+export interface IndexedOpenStart {
+  jobId: number;
+  docId: number;
 }
 
 export interface SortKey {
@@ -171,6 +195,8 @@ export interface FindOptions {
   caseSensitive?: boolean;
   wholeCell?: boolean;
   selection?: CellRect;
+  /** Stop after this many matches (used for indexed documents). */
+  limit?: number;
 }
 
 export interface FindMatch {
@@ -201,6 +227,11 @@ export interface NumericSummary {
 }
 
 export interface ColumnSummary {
+  /**
+   * True when the statistics cover only a leading sample of the rows
+   * (indexed documents over the sample limit), not the whole document.
+   */
+  sampled: boolean;
   column: number;
   kind: ColumnKind;
   count: number;
