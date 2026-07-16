@@ -85,7 +85,8 @@ export type ModalName =
   | "outlier"
   | "append"
   | "join"
-  | "groupBy";
+  | "groupBy"
+  | "reshape";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },

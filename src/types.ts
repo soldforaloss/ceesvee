@@ -323,6 +323,50 @@ export interface AppendReport {
   inputs: InputOutcome[];
 }
 
+/** Pivot cell aggregation (F23). */
+export type PivotAgg =
+  | "none"
+  | "count"
+  | "countNonBlank"
+  | "sum"
+  | "mean"
+  | "median"
+  | "min"
+  | "max"
+  | "first"
+  | "last";
+
+/** The three reshape operations (F23). */
+export type ReshapeSpec =
+  | {
+      type: "unpivot";
+      idColumns: number[];
+      valueColumns: number[];
+      attributeName: string;
+      valueName: string;
+      omitBlanks?: boolean;
+      addSourceRow?: boolean;
+    }
+  | {
+      type: "pivot";
+      rowKeys: number[];
+      headerColumn: number;
+      valueColumn: number;
+      aggregation: PivotAgg;
+      maxColumns?: number;
+    }
+  | { type: "transpose"; maxColumns?: number };
+
+/** Preview of a reshape (F23). */
+export interface ReshapePreview {
+  outputColumns: number;
+  projectedRows: number;
+  columnSample: string[];
+  duplicateCoordinates: number;
+  blanksOmitted: number;
+  overColumnLimit: boolean;
+}
+
 /** The closed aggregate set (F22). */
 export type Aggregate =
   | "count"

@@ -32,6 +32,7 @@ import { OutlierDialog } from "./components/OutlierDialog";
 import { QuitDialog } from "./components/QuitDialog";
 import { ReopenDialog } from "./components/ReopenDialog";
 import { RepairDialog } from "./components/RepairDialog";
+import { ReshapeDialog } from "./components/ReshapeDialog";
 import { SemanticDialog } from "./components/SemanticDialog";
 import { ShortcutsDialog } from "./components/ShortcutsDialog";
 import { SortDialog } from "./components/SortDialog";
@@ -277,6 +278,7 @@ export default function App() {
       {activeModal === "append" && <AppendDialog onClose={() => setModal(null)} />}
       {activeModal === "join" && <JoinDialog onClose={() => setModal(null)} />}
       {activeModal === "groupBy" && <GroupByDialog onClose={() => setModal(null)} />}
+      {activeModal === "reshape" && <ReshapeDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       <CommandPalette />
       <CellEditorDialog />
