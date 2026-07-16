@@ -146,13 +146,17 @@ export function SourceBar() {
         </span>
       )}
 
-      {meta.path && (
+      {(meta.path ?? meta.archive) && (
         <span
           className="ml-auto truncate text-zinc-400 dark:text-zinc-600"
           dir="rtl"
-          title={meta.path}
+          title={
+            meta.path ??
+            `${meta.archive!.archivePath}${meta.archive!.entryName ? ` → ${meta.archive!.entryName}` : ""}`
+          }
         >
-          {meta.path}
+          {meta.path ??
+            `${meta.archive!.archivePath}${meta.archive!.entryName ? ` → ${meta.archive!.entryName}` : ""}`}
         </span>
       )}
     </div>

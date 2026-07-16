@@ -15,7 +15,7 @@ use crate::dto::{
     RowsResponse, SelectionStats, SortKey,
 };
 use crate::error::{AppError, AppResult};
-use crate::index::{IndexHandle, IndexedFile};
+use crate::index::{IndexDirGuard, IndexHandle, IndexedFile};
 use crate::parse::{ImportInfo, ParsedFile};
 
 /// Rows scanned for [`Document::column_summaries`] on an INDEXED document.
@@ -246,6 +246,14 @@ pub struct Document {
     fingerprint: Option<FileFingerprint>,
     /// Row storage: in-memory (editable) or a streaming record index (F10).
     backing: Backing,
+    /// F17: where the document came from when opened out of an archive.
+    /// Archive-backed documents have no `path` (no in-place saving); Save As
+    /// clears this and turns them into ordinary file documents.
+    archive: Option<crate::archive::ArchiveOrigin>,
+    /// Keeps the extracted archive entry alive while an INDEXED document
+    /// reads it directly (editable documents parse and release the file).
+    #[allow(dead_code)] // held for its Drop effect
+    archive_guard: Option<IndexDirGuard>,
 }
 
 impl Document {
@@ -304,6 +312,8 @@ impl Document {
             import_info: import,
             fingerprint: None,
             backing: Backing::Memory,
+            archive: None,
+            archive_guard: None,
         }
     }
 
@@ -337,6 +347,8 @@ impl Document {
             import_info: ImportInfo::default(),
             fingerprint: None,
             backing: Backing::Memory,
+            archive: None,
+            archive_guard: None,
         }
     }
 
@@ -377,6 +389,8 @@ impl Document {
             import_info: import,
             fingerprint: None,
             backing: Backing::Indexed(handle),
+            archive: None,
+            archive_guard: None,
         }
     }
 
@@ -524,6 +538,18 @@ impl Document {
     /// Record the backing file's identity (after an open, reparse or save).
     pub fn set_fingerprint(&mut self, fingerprint: Option<FileFingerprint>) {
         self.fingerprint = fingerprint;
+    }
+
+    /// Record that this document was opened out of an archive (F17). The
+    /// guard, when present, keeps the extracted entry alive for indexed
+    /// documents that read it directly.
+    pub fn set_archive_origin(
+        &mut self,
+        origin: crate::archive::ArchiveOrigin,
+        guard: Option<IndexDirGuard>,
+    ) {
+        self.archive = Some(origin);
+        self.archive_guard = guard;
     }
 
     /// Current document revision (see the field docs for what bumps it).
@@ -752,6 +778,23 @@ impl Document {
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
+            .or_else(|| {
+                // Archive-backed documents (F17) have no path; show where
+                // they came from instead of "Untitled".
+                self.archive.as_ref().map(|a| {
+                    let archive_name = std::path::Path::new(&a.archive_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| a.archive_path.clone());
+                    match &a.entry_name {
+                        Some(entry) => {
+                            let entry_base = entry.rsplit(['/', '\\']).next().unwrap_or(entry);
+                            format!("{archive_name} → {entry_base}")
+                        }
+                        None => archive_name,
+                    }
+                })
+            })
             .unwrap_or_else(|| "Untitled".to_string());
 
         DocumentMeta {
@@ -773,6 +816,7 @@ impl Document {
             can_redo: self.can_redo(),
             revision: self.revision,
             backing: self.backing_name().to_string(),
+            archive: self.archive.clone(),
         }
     }
 
@@ -781,6 +825,10 @@ impl Document {
     pub fn mark_saved(&mut self, path: Option<PathBuf>) {
         if let Some(p) = path {
             self.path = Some(p);
+            // Save As turns an archive-backed document into an ordinary file
+            // document; the extracted temp (if any) is no longer needed.
+            self.archive = None;
+            self.archive_guard = None;
         }
         self.saved_marker = self.undo_stack.len();
         self.dirty_cells.clear();

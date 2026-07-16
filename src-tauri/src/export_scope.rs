@@ -327,14 +327,31 @@ pub fn run_export(
                 inner: file,
                 hasher: Sha256::new(),
             };
-            let bytes = export::write_view(
-                doc,
-                &output.rows,
-                &resolved.cols,
-                options,
-                &mut hashing,
-                Some(ctx),
-            )?;
+            // F17: *.gz outputs stream through gzip INSIDE the hasher, so
+            // the manifest hash covers the exact bytes on disk.
+            let bytes = if crate::archive::is_gzip_path(&output.path) {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(&mut hashing, flate2::Compression::default());
+                let bytes = export::write_view(
+                    doc,
+                    &output.rows,
+                    &resolved.cols,
+                    options,
+                    &mut encoder,
+                    Some(ctx),
+                )?;
+                encoder.finish()?;
+                bytes
+            } else {
+                export::write_view(
+                    doc,
+                    &output.rows,
+                    &resolved.cols,
+                    options,
+                    &mut hashing,
+                    Some(ctx),
+                )?
+            };
             hash_hex = format!("{:x}", hashing.hasher.finalize());
             Ok(bytes)
         })?;
@@ -410,6 +427,39 @@ mod tests {
         let registry = JobRegistry::default();
         let ctx = registry.begin("export", Some(1), |_| {});
         (registry, ctx)
+    }
+
+    #[test]
+    fn gzip_export_round_trips_through_the_atomic_pipeline() {
+        // F17: a *.gz destination compresses inside the same atomic write;
+        // decompressing and reparsing must reproduce the data exactly, and
+        // the manifest hash must match the bytes on disk (compressed).
+        let d = doc_from("a,b\n1,2\ncafé,\"x,y\"", true);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.csv.gz");
+        let (_r, ctx) = ctx();
+        let manifest = run_export(
+            &d,
+            &dest,
+            &options(),
+            &ExportScope::All,
+            &SplitOptions::None,
+            false,
+            &ctx,
+        )
+        .unwrap();
+
+        let mut decoder = flate2::read::GzDecoder::new(std::fs::File::open(&dest).unwrap());
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut bytes).unwrap();
+        let reparsed = parse(&bytes, &ParseSettings::default()).unwrap();
+        assert_eq!(reparsed.records[0], vec!["a", "b"]);
+        assert_eq!(reparsed.records[2], vec!["café", "x,y"]);
+
+        // Manifest hash covers the compressed file as written.
+        let disk = std::fs::read(&dest).unwrap();
+        let expected = format!("{:x}", Sha256::digest(&disk));
+        assert_eq!(manifest.outputs[0].sha256, expected);
     }
 
     #[test]

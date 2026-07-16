@@ -3,6 +3,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useState } from "react";
 
+import { ArchiveEntryDialog } from "./components/ArchiveEntryDialog";
 import { CellEditorDialog } from "./components/CellEditorDialog";
 import { ColumnExplorerPanel } from "./components/ColumnExplorerPanel";
 import { CommandPalette } from "./components/CommandPalette";
@@ -266,6 +267,7 @@ export default function App() {
       <ReopenDialog />
       <ExternalChangeDialog />
       <OpenModeDialog />
+      <ArchiveEntryDialog />
       <QuitDialog />
       <EncodingIssuesDialog />
 

@@ -29,9 +29,35 @@ export interface DocumentMeta {
   revision: number;
   /** Row storage: "editable" (in memory) or "indexedReadOnly" (F10). */
   backing: DocumentBacking;
+  /** Where the document came from when opened out of an archive (F17). */
+  archive: ArchiveOrigin | null;
 }
 
 export type DocumentBacking = "editable" | "indexedReadOnly";
+
+/** Archive provenance for a document opened from .gz / .zip (F17). */
+export interface ArchiveOrigin {
+  archivePath: string;
+  entryName: string | null;
+  archiveFingerprint: FileFingerprint | null;
+}
+
+/** One candidate entry inside a ZIP archive (F17). */
+export interface ZipEntryInfo {
+  name: string;
+  compressedSize: number;
+  uncompressedSize: number;
+  ratio: number;
+  encrypted: boolean;
+  likelyDelimiter: string | null;
+  likelyEncoding: string | null;
+}
+
+/** Handles returned by start_archive_extract (F17). */
+export interface ArchiveExtractStart {
+  jobId: number;
+  token: number;
+}
 
 /** Incremental progress for a background job (event: "job-progress"). */
 export interface JobProgress {

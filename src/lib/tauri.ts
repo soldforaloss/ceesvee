@@ -5,6 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppSettings,
+  ArchiveExtractStart,
   CellRect,
   ColumnProfile,
   ColumnSummary,
@@ -44,6 +45,7 @@ import type {
   TransformErrorPolicy,
   TransformPreview,
   TransformSpec,
+  ZipEntryInfo,
 } from "../types";
 
 export const openFile = (path: string, options?: OpenOptions) =>
@@ -109,6 +111,28 @@ export const applyPasteSpecial = (
 
 /** Estimate the in-memory cost of opening a file editable (F10). */
 export const probeOpen = (path: string) => invoke<OpenEstimate>("probe_open", { path });
+
+/** List the entries of a ZIP archive (F17). */
+export const listArchiveEntries = (path: string) =>
+  invoke<ZipEntryInfo[]>("list_archive_entries", { path });
+
+/** Extract a gzip member or ZIP entry as a cancellable job (F17). */
+export const startArchiveExtract = (path: string, entry: string | null, allowLarge: boolean) =>
+  invoke<ArchiveExtractStart>("start_archive_extract", { path, entry, allowLarge });
+
+/** Estimate the extracted entry's in-memory cost (F17). */
+export const pendingArchiveEstimate = (token: number) =>
+  invoke<OpenEstimate>("pending_archive_estimate", { token });
+
+/** Open a parked extraction as a document (F17). */
+export const openArchiveDocument = (
+  token: number,
+  mode: "editable" | "indexed",
+  options?: OpenOptions,
+) => invoke<IndexedOpenStart>("open_archive_document", { token, mode, options });
+
+/** Drop a parked extraction and delete its cache (F17). */
+export const discardArchive = (token: number) => invoke<void>("discard_archive", { token });
 
 /**
  * Open a file in indexed read-only mode (F10). The document registers under

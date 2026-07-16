@@ -17,6 +17,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "Keyboard shortcuts…") records new bindings per command, warns before
   reassigning a chord that another command already uses, and persists
   overrides in the settings file. Changes apply immediately.
+- **Compressed CSV support**: open `.csv.gz` / `.tsv.gz` files and `.zip`
+  archives directly. ZIPs with several files show an entry chooser (sizes,
+  compression ratio, sniffed delimiter and encoding); extraction streams with
+  progress and cancellation, huge entries flow into indexed read-only mode,
+  and suspicious compression ratios (decompression bombs) require explicit
+  confirmation with a hard 8 GiB cap. Encrypted entries are rejected clearly.
+  Archives are never edited in place — use Save As or Export — and exports
+  or saves to a `*.gz` destination stream through gzip inside the same
+  atomic-write pipeline.
 - **Copy As** (`Ctrl/Cmd+Shift+C`): copy the selection or all visible rows as
   TSV, CSV (current or custom settings), JSON (objects, arrays, or JSON
   Lines), a Markdown table, or SQL `VALUES` rows — with or without headers.
