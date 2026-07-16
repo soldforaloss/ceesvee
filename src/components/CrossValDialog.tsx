@@ -49,11 +49,17 @@ export function CrossValDialog({ onClose }: { onClose: () => void }) {
 
   if (!meta) return null;
   const stale = report !== null && report.revision !== meta.revision;
-  const headers = meta.headers.map((h, i) => h || `Column ${i + 1}`);
+  // Rules reference columns by their RAW backend name (a blank header stays
+  // ""); the placeholder is display-only, so resolution never breaks.
+  const columnOptions = meta.headers.map((h, i) => ({
+    value: h,
+    label: h || `Column ${i + 1}`,
+  }));
+  const clearReport = useStore.getState().clearCrossvalReport;
 
   const beginDraft = (type: CrossRule["type"]) => {
     setDraftType(type);
-    setDraft(emptyRule(type, headers));
+    setDraft(emptyRule(type, meta.headers));
     setCombosText("");
   };
 
@@ -66,9 +72,15 @@ export function CrossValDialog({ onClose }: { onClose: () => void }) {
     if (ruleProblem(finished)) return;
     setRules((r) => [...r, finished]);
     setDraft(null);
+    // The report pairs results with rules BY INDEX; an edited rule list
+    // would misattribute violations, so results are cleared until rescan.
+    clearReport();
   };
 
-  const removeRule = (index: number) => setRules((r) => r.filter((_, i) => i !== index));
+  const removeRule = (index: number) => {
+    setRules((r) => r.filter((_, i) => i !== index));
+    clearReport();
+  };
 
   const saveToProfile = () => {
     if (!profile) return;
@@ -209,7 +221,7 @@ export function CrossValDialog({ onClose }: { onClose: () => void }) {
             <div className="font-medium">{RULE_TYPE_LABELS[draft.type]}</div>
             <RuleFields
               draft={draft}
-              headers={headers}
+              columns={columnOptions}
               onChange={setDraft}
               combosText={combosText}
               onCombosChange={setCombosText}
@@ -318,22 +330,23 @@ export function CrossValDialog({ onClose }: { onClose: () => void }) {
 /** Type-specific editor fields for the rule being built. */
 function RuleFields({
   draft,
-  headers,
+  columns: columnOptions,
   onChange,
   combosText,
   onCombosChange,
 }: {
   draft: CrossRule;
-  headers: string[];
+  /** Raw backend column name + display label (blank headers get one). */
+  columns: { value: string; label: string }[];
   onChange: (rule: CrossRule) => void;
   combosText: string;
   onCombosChange: (text: string) => void;
 }) {
   const colSelect = (value: string, set: (next: string) => void) => (
     <select value={value} onChange={(e) => set(e.target.value)} className={selectCls}>
-      {headers.map((h) => (
-        <option key={h} value={h} className="dark:bg-zinc-800">
-          {h}
+      {columnOptions.map((c, i) => (
+        <option key={i} value={c.value} className="dark:bg-zinc-800">
+          {c.label}
         </option>
       ))}
     </select>
@@ -341,17 +354,17 @@ function RuleFields({
 
   const multiCols = (columns: string[], set: (next: string[]) => void) => (
     <div className="flex flex-wrap gap-x-3 gap-y-1">
-      {headers.map((h) => (
-        <label key={h} className="flex items-center gap-1">
+      {columnOptions.map((c, i) => (
+        <label key={i} className="flex items-center gap-1">
           <input
             type="checkbox"
-            checked={columns.includes(h)}
+            checked={columns.includes(c.value)}
             onChange={(e) =>
-              set(e.target.checked ? [...columns, h] : columns.filter((c) => c !== h))
+              set(e.target.checked ? [...columns, c.value] : columns.filter((x) => x !== c.value))
             }
             className="accent-violet-600"
           />
-          {h}
+          {c.label}
         </label>
       ))}
     </div>
