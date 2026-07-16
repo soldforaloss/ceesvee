@@ -264,6 +264,13 @@ pub struct Document {
     next_op_id: u64,
     /// Append-only crash-recovery journal (F16), when journaling is on.
     journal: Option<crate::journal::JournalWriter>,
+    /// Read-only follow/tail mode (F19).
+    follow: bool,
+    /// F19 "only new rows": when set, the filter view is a LIVE range from
+    /// this absolute row onward — `append_follow_rows` extends it so newly
+    /// appended records stay visible while filtered. Cleared by an ordinary
+    /// filter or clear-filter.
+    follow_range_from: Option<usize>,
     /// `undo_stack.len()` at the last save; the document is dirty when it differs.
     saved_marker: usize,
     /// Absolute indices of the rows matching the active filter, in order; `None`
@@ -354,6 +361,8 @@ impl Document {
             redo_meta: Vec::new(),
             next_op_id: 0,
             journal: None,
+            follow: false,
+            follow_range_from: None,
             saved_marker: 0,
             filter_view: None,
             revision: 1,
@@ -393,6 +402,8 @@ impl Document {
             redo_meta: Vec::new(),
             next_op_id: 0,
             journal: None,
+            follow: false,
+            follow_range_from: None,
             saved_marker: 0,
             filter_view: None,
             revision: 1,
@@ -439,6 +450,8 @@ impl Document {
             redo_meta: Vec::new(),
             next_op_id: 0,
             journal: None,
+            follow: false,
+            follow_range_from: None,
             saved_marker: 0,
             filter_view: None,
             revision: 1,
@@ -485,11 +498,48 @@ impl Document {
     /// Guard for mutation paths: fail with [`AppError::ReadOnly`] on an
     /// indexed document.
     pub fn ensure_editable(&self) -> AppResult<()> {
+        if self.follow {
+            return Err(AppError::invalid(
+                "follow mode is read-only — stop following to edit",
+            ));
+        }
         if self.is_editable() {
             Ok(())
         } else {
             Err(AppError::ReadOnly)
         }
+    }
+
+    // ----- follow mode (F19) -------------------------------------------------
+
+    /// Put the document into read-only follow mode (F19).
+    pub fn set_follow(&mut self, follow: bool) {
+        self.follow = follow;
+    }
+
+    /// Append rows arriving from the follow watcher (F19). Bypasses the
+    /// editable gate deliberately — follow documents have no undo history,
+    /// and the rows come from the file itself.
+    pub fn append_follow_rows(&mut self, rows: Vec<Vec<String>>) {
+        let width = self.headers.len();
+        for mut row in rows {
+            row.resize(width, String::new());
+            self.rows.push(row);
+        }
+        self.revision += 1;
+        self.touch_all_columns();
+        // A live "only new rows" range keeps following the file: extend the
+        // view to include what was just appended.
+        if let Some(from) = self.follow_range_from {
+            let rows: Vec<usize> = (from.min(self.rows.len())..self.rows.len()).collect();
+            self.set_filter(rows);
+        }
+    }
+
+    /// Mark (or clear) the F19 live "only new rows" range. The caller still
+    /// applies the initial filter; appends keep it extended.
+    pub fn set_follow_range(&mut self, from: Option<usize>) {
+        self.follow_range_from = from;
     }
 
     /// Wire name of the backing, carried on [`DocumentMeta`].
@@ -690,6 +740,8 @@ impl Document {
     }
 
     pub fn clear_filter(&mut self) {
+        // A cleared filter also ends the F19 live "only new rows" range.
+        self.follow_range_from = None;
         if self.filter_view.take().is_some() {
             self.revision += 1;
             self.filter_revision = self.revision;
@@ -890,6 +942,7 @@ impl Document {
             revision: self.revision,
             backing: self.backing_name().to_string(),
             archive: self.archive.clone(),
+            follow: self.follow,
         }
     }
 
@@ -2492,6 +2545,26 @@ mod tests {
         });
         assert_bumps(&mut d, "set_filter", |d| d.set_filter(vec![0]));
         assert_bumps(&mut d, "clear_filter", |d| d.clear_filter());
+    }
+
+    #[test]
+    fn follow_range_filter_extends_on_append() {
+        // F19 "only new rows": the range is LIVE — records appended by the
+        // watcher become visible without reapplying the filter.
+        let mut d = doc_from("a\n1\n2", true);
+        d.set_follow(true);
+        d.set_follow_range(Some(2));
+        d.set_filter(Vec::new()); // rows 0..2 are old; nothing new yet
+        assert_eq!(d.visible_len(), 0);
+
+        d.append_follow_rows(vec![vec!["3".into()]]);
+        assert_eq!(d.visible_len(), 1, "the appended row entered the range");
+        assert_eq!(d.get_rows(0, 10).unwrap().rows[0][0], "3");
+
+        // Clearing the filter ends the live range.
+        d.clear_filter();
+        d.append_follow_rows(vec![vec!["4".into()]]);
+        assert_eq!(d.visible_len(), 4);
     }
 
     #[test]

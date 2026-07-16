@@ -38,6 +38,9 @@ import type {
   ProfileValidation,
   BatchReport,
   CrossRule,
+  FollowAlert,
+  FollowAlertKind,
+  FollowUpdate,
   RecoverableSession,
   CrossValReport,
   OutlierReport,
@@ -595,6 +598,19 @@ interface Store {
   batch: BatchState | null;
   /** PII scan state (F28). */
   pii: PiiState;
+  /** Per-followed-document tail state (F19). */
+  followState: Record<
+    number,
+    { baselineRows: number; newRows: number; paused: boolean; alert: FollowAlertKind | null }
+  >;
+  /** Start following a file into a new read-only tab. */
+  startFollowFile: (path: string) => Promise<void>;
+  toggleFollowPause: (docId: number) => Promise<void>;
+  stopFollowing: (docId: number) => Promise<void>;
+  /** Route a follow-update event (rows appended by the watcher). */
+  handleFollowUpdate: (update: FollowUpdate) => void;
+  handleFollowAlert: (alert: FollowAlert) => void;
+
   /** Recoverable sessions found at startup (F16). */
   recoverySessions: RecoverableSession[];
   setRecoverySessions: (sessions: RecoverableSession[]) => void;
@@ -1223,6 +1239,7 @@ export const useStore = create<Store>((set, get) => {
     deriveError: null,
     batch: null,
     pii: initialPii,
+    followState: {},
     recoverySessions: [],
     archivePick: null,
     archiveLargeConfirm: null,
@@ -1755,6 +1772,104 @@ export const useStore = create<Store>((set, get) => {
     },
 
     clearPiiReport: () => set({ pii: initialPii }),
+
+    // ----- follow mode (F19) -------------------------------------------------------
+
+    startFollowFile: async (path) => {
+      try {
+        const meta = await api.startFollow(path);
+        set((s) => ({
+          ...switchPatch(s, meta.id),
+          tabs: [...s.tabs, meta],
+          followState: {
+            ...s.followState,
+            [meta.id]: {
+              baselineRows: meta.totalRowCount,
+              newRows: 0,
+              paused: false,
+              alert: null,
+            },
+          },
+        }));
+        pushRecent(path);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    toggleFollowPause: async (docId) => {
+      const current = get().followState[docId];
+      if (!current) return;
+      const paused = !current.paused;
+      try {
+        await api.setFollowPaused(docId, paused);
+        set((s) => ({
+          followState: { ...s.followState, [docId]: { ...current, paused } },
+        }));
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    stopFollowing: async (docId) => {
+      try {
+        await api.stopFollow(docId);
+        set((s) => {
+          const next = { ...s.followState };
+          delete next[docId];
+          return { followState: next };
+        });
+        await get().refreshActiveDoc();
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    handleFollowUpdate: (update) => {
+      const current = get().followState[update.docId];
+      set((s) => ({
+        followState: {
+          ...s.followState,
+          [update.docId]: {
+            baselineRows: current?.baselineRows ?? 0,
+            newRows: (current?.newRows ?? 0) + update.newRows,
+            paused: current?.paused ?? false,
+            alert: current?.alert ?? null,
+          },
+        },
+      }));
+      if (get().activeId === update.docId) {
+        void get().refreshActiveDoc();
+      } else {
+        // Background tab: patch its metadata from the event so switching
+        // back shows the appended rows immediately (row counts + revision;
+        // the grid refetches on activation via the doc change). While a
+        // filter is active, the visible count is refreshed on activation.
+        set((s) => ({
+          tabs: s.tabs.map((t) =>
+            t.id === update.docId
+              ? {
+                  ...t,
+                  totalRowCount: update.totalRows,
+                  rowCount: t.filtered ? t.rowCount : update.totalRows,
+                  revision: update.revision,
+                }
+              : t,
+          ),
+        }));
+      }
+    },
+
+    handleFollowAlert: (alert) => {
+      const current = get().followState[alert.docId];
+      if (!current) return;
+      set((s) => ({
+        followState: {
+          ...s.followState,
+          [alert.docId]: { ...current, alert: alert.kind },
+        },
+      }));
+    },
 
     // ----- crash recovery (F16) --------------------------------------------------
 

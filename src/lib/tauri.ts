@@ -261,6 +261,20 @@ export const startAppend = (inputs: AppendInput[], options: AppendOptions) =>
 export const getAppendReport = (docId: number) =>
   invoke<AppendReport | null>("get_append_report", { docId });
 
+/** Open a plain file in READ-ONLY follow mode (F19). */
+export const startFollow = (path: string) => invoke<DocumentMeta>("start_follow", { path });
+
+/** Pause/resume a follow watcher (view updates only; no bytes lost) (F19). */
+export const setFollowPaused = (docId: number, paused: boolean) =>
+  invoke<void>("set_follow_paused", { docId, paused });
+
+/** Stop following; the tab stays open as a read-only snapshot (F19). */
+export const stopFollow = (docId: number) => invoke<void>("stop_follow", { docId });
+
+/** Filter to rows from `fromRow` onward (F19: newly added rows) (F19). */
+export const setRowRangeFilter = (docId: number, fromRow: number) =>
+  invoke<DocumentMeta>("set_row_range_filter", { docId, fromRow });
+
 /** Parse the document's file under a full dialect, without applying (F18). */
 export const previewDialect = (docId: number, dialect: CsvDialectOptions) =>
   invoke<DialectPreview>("preview_dialect", { docId, dialect });

@@ -48,6 +48,8 @@ and faithful on large, real-world delimited files.**
   an override, plus correct **BOM** handling.
 - "First row is header" toggle with a frozen header row.
 - Tabs for multiple open files, plus a recent-files list.
+- **Follow mode** — tail a growing CSV log live (read-only), with
+  pause/resume, new-row filtering, and rotation/truncation detection.
 - Status bar with row/column counts, encoding, delimiter, line endings, and live
   selection stats (count, sum, average, min, max).
 

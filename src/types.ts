@@ -21,6 +21,8 @@ export interface DocumentMeta {
   dirty: boolean;
   canUndo: boolean;
   canRedo: boolean;
+  /** Read-only follow/tail mode (F19). */
+  follow?: boolean;
   /**
    * Monotonically increasing revision, bumped on every mutation. Previews and
    * deferred operations echo this back as `expectedRevision` and are rejected
@@ -321,6 +323,22 @@ export interface AppendReport {
   totalRows: number;
   indexed: boolean;
   inputs: InputOutcome[];
+}
+
+/** Appended rows landed in a followed document (F19). */
+export interface FollowUpdate {
+  docId: number;
+  newRows: number;
+  totalRows: number;
+  revision: number;
+}
+
+/** Why a follow watcher paused itself (F19). */
+export type FollowAlertKind = "truncatedOrRotated" | "widthChanged" | "encodingChanged" | "missing";
+
+export interface FollowAlert {
+  docId: number;
+  kind: FollowAlertKind;
 }
 
 /** The full CSV dialect (F18) — a closed set of validated options. */
