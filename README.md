@@ -93,6 +93,10 @@ and faithful on large, real-world delimited files.**
   position / manual mapping, with union or intersection schemas,
   provenance columns, and per-input reports. Inputs stay untouched;
   huge outputs open indexed automatically.
+- **Joins & lookups** — inner / left / right / full / anti joins between
+  two open documents on composite keys with trim / case / blank /
+  numeric / date normalization, cardinality previews, expansion
+  confirmation, and a unique-key lookup mode. Sources are preserved.
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 

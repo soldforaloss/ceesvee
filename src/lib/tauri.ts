@@ -39,6 +39,8 @@ import type {
   FindMatch,
   FindOptions,
   IndexedOpenStart,
+  JoinPreview,
+  JoinSpec,
   OpenEstimate,
   OpenOptions,
   OutlierAction,
@@ -244,6 +246,31 @@ export const startAppend = (inputs: AppendInput[], options: AppendOptions) =>
 /** The per-input outcome report of a finished append (F20). */
 export const getAppendReport = (docId: number) =>
   invoke<AppendReport | null>("get_append_report", { docId });
+
+/** Cardinality preview of a join — creates nothing (F21). */
+export const previewJoin = (
+  leftDoc: number,
+  rightDoc: number,
+  spec: JoinSpec,
+  leftRevision: number,
+  rightRevision: number,
+) => invoke<JoinPreview>("preview_join", { leftDoc, rightDoc, spec, leftRevision, rightRevision });
+
+/** Run a join as a cancellable "derive" job into a NEW document (F21). */
+export const startJoin = (
+  leftDoc: number,
+  rightDoc: number,
+  spec: JoinSpec,
+  leftRevision: number,
+  rightRevision: number,
+) =>
+  invoke<IndexedOpenStart>("start_join", {
+    leftDoc,
+    rightDoc,
+    spec,
+    leftRevision,
+    rightRevision,
+  });
 
 /** The last completed outlier report + the spec that produced it (F30). */
 export const getOutlierReport = (docId: number) =>

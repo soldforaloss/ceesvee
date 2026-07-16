@@ -323,6 +323,49 @@ export interface AppendReport {
   inputs: InputOutcome[];
 }
 
+/** The classic six join types (F21). */
+export type JoinType = "inner" | "left" | "right" | "full" | "leftAnti" | "rightAnti";
+
+/** Join key normalizations (mirrors the F09 comparison options) (F21). */
+export interface JoinNormalization {
+  trim?: boolean;
+  caseInsensitive?: boolean;
+  /** Blank keys match blanks. Off = SQL NULL semantics. */
+  blankEqual?: boolean;
+  numericEqual?: boolean;
+  dateEqual?: boolean;
+}
+
+export interface JoinSpec {
+  join: JoinType;
+  /** Ordered composite key columns, one list per side (equal lengths). */
+  leftKeys: number[];
+  rightKeys: number[];
+  /** Right-side columns to include in the output. */
+  rightColumns: number[];
+  /** Lookup mode: right-side keys must be unique. */
+  lookup?: boolean;
+  collisionSuffix?: string;
+  normalization?: JoinNormalization;
+  /** Refuse to run when projected rows exceed this (confirm = raise it). */
+  maxOutputRows?: number | null;
+}
+
+/** Cardinality preview of a join (F21). */
+export interface JoinPreview {
+  outputColumns: string[];
+  matchedPairs: number;
+  leftRows: number;
+  rightRows: number;
+  leftUnmatched: number;
+  rightUnmatched: number;
+  leftDuplicateKeys: number;
+  rightDuplicateKeys: number;
+  projectedRows: number;
+  expands: boolean;
+  lookupConflict: boolean;
+}
+
 /** Outlier detection method (F30) — a closed, validated set. */
 export type OutlierMethod =
   | { type: "iqr"; k: number }

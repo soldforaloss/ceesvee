@@ -342,6 +342,18 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("compare"),
     },
     {
+      id: "data.join",
+      title: "Join…",
+      keywords: ["lookup", "merge", "vlookup", "relational", "inner", "outer"],
+      category: "Data",
+      unavailableReason: () => {
+        const reason = needsDoc();
+        if (reason) return reason;
+        return state().tabs.length >= 2 ? null : "Joining needs a second open document";
+      },
+      run: () => openModal("join"),
+    },
+    {
       id: "data.summaries",
       title: "Column summaries",
       keywords: ["statistics", "types", "overview"],

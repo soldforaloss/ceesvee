@@ -83,7 +83,8 @@ export type ModalName =
   | "crossval"
   | "repair"
   | "outlier"
-  | "append";
+  | "append"
+  | "join";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },

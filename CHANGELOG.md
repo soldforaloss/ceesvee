@@ -8,6 +8,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Relational joins** (palette → "Join…"): join the active document with
+  another open tab on ordered composite keys — inner, left/right/full
+  outer, and left/right anti — into a NEW document; both sources stay
+  untouched. Key matching reuses the comparison normalizations (trim,
+  case, blank equivalence, numeric and date equivalence; blanks follow
+  SQL NULL semantics unless told otherwise). Pick which right columns to
+  include (collision-safe renaming with a configurable suffix), or use
+  lookup mode, which requires unique right-side keys. The preview reports
+  matched pairs, unmatched and duplicate-key counts per side, and the
+  projected output size; one-to-many expansion past a threshold needs an
+  explicit confirmation. Duplicate keys are never silently collapsed.
 - **Multi-file append** (palette → "Append files…"): combine rows from open
   tabs, picked files, or a whole folder of delimited files into a NEW
   document — inputs are never modified. Columns align by exact name,

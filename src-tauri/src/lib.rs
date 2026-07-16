@@ -25,6 +25,7 @@ mod index;
 /// Public so downstream features (and the test harness) can treat the job
 /// registry, progress plumbing and cancellation as a stable internal API.
 pub mod job;
+mod joins;
 mod outlier;
 mod parse;
 mod paste;
@@ -199,6 +200,8 @@ pub fn run() {
             commands::preview_append,
             commands::start_append,
             commands::get_append_report,
+            commands::preview_join,
+            commands::start_join,
             commands::start_compare,
             commands::get_compare_info,
             commands::get_compare_results,
