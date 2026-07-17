@@ -98,7 +98,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stratifying) before anything is written, outputs preserve source order or an
   explicit shuffle, results become new derived documents or direct CSV exports,
   and each export gets a JSON manifest recording the method, seed, source
-  fingerprint, scope, and a SHA-256 per output.
+  fingerprint, scope, and a SHA-256 per output. Reachable from the command
+  palette as "Sample rows…" and "Partition dataset…", with a per-method
+  parameter editor, a seed field (with a Regenerate button showing the value
+  in use), a live projected-vs-exact count preview, cancellable progress, and
+  a destination picker (new documents or a chosen export folder).
 - **Explicit schemas and typed columns** (palette → "Edit schema…", or a
   column header's menu): declare an explicit logical type per column —
   text, integer, decimal, float, boolean, date, datetime, UUID, or JSON —

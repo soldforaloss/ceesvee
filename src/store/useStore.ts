@@ -152,8 +152,9 @@ export type ModalName =
   | "dialect"
   | "schema"
   | "dictionary"
-  | "views"
-  | "jsonExport";
+  | "jsonExport"
+  | "sampling"
+  | "views";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
@@ -539,6 +540,18 @@ export interface JsonImportState {
   scanError: string | null;
 }
 
+/** A running sampling/partitioning job (F48). Unlike a derive job it can emit
+ * MANY new documents (one per partition) or none at all (a direct export). */
+export interface SampleState {
+  jobId: number;
+  /** Ids the new derived documents will register under; empty for exports. */
+  docIds: number[];
+  destination: "derivedDocuments" | "export";
+  processed: number;
+  total: number | null;
+  message: string | null;
+}
+
 /** Outlier-finder state (F30), for the ACTIVE document. */
 export interface OutlierState {
   scanJobId: number | null;
@@ -756,6 +769,12 @@ interface Store {
   deriveError: string | null;
   /** JSON / JSON Lines import flow (F33); non-null while its dialog is open. */
   jsonImport: JsonImportState | null;
+  /** Running sampling/partitioning job (F48), if any. */
+  sample: SampleState | null;
+  /** Error from the last sampling job, for the dialog that started it. */
+  sampleError: string | null;
+  /** Which tab the sampling dialog opens on (set by the command, F48). */
+  samplingInitialMode: "sampling" | "partitioning";
   /** Running (or just finished) batch-recipe job (F25), if any. */
   batch: BatchState | null;
   /** PII scan state (F28). */
@@ -930,6 +949,14 @@ interface Store {
   /** Track a started derive job so completion adds the new tab. */
   trackDerive: (jobId: number, docId: number, kind: DeriveState["kind"]) => void;
   cancelDerive: () => Promise<void>;
+
+  // sampling & partitioning (F48)
+  /** Track a started sample job so completion opens the new documents. */
+  trackSample: (jobId: number, docIds: number[], destination: SampleState["destination"]) => void;
+  cancelSample: () => Promise<void>;
+  clearSampleError: () => void;
+  /** Open the sampling dialog on the sampling or partitioning tab (F48). */
+  openSamplingDialog: (mode: "sampling" | "partitioning") => void;
 
   // batch recipes (F25)
   /** Track a started batch job; the report lands on completion. */
@@ -1911,6 +1938,9 @@ export const useStore = create<Store>((set, get) => {
     derive: null,
     deriveError: null,
     jsonImport: null,
+    sample: null,
+    sampleError: null,
+    samplingInitialMode: "sampling",
     batch: null,
     pii: initialPii,
     followState: {},
@@ -2685,6 +2715,27 @@ export const useStore = create<Store>((set, get) => {
       const derive = get().derive;
       if (derive) await api.cancelJob(derive.jobId).catch(() => undefined);
     },
+
+    // ----- sampling & partitioning (F48) -----------------------------------------
+
+    trackSample: (jobId, docIds, destination) => {
+      set({
+        sample: { jobId, docIds, destination, processed: 0, total: null, message: null },
+        sampleError: null,
+      });
+      consumeEarlyFinish(jobId);
+    },
+
+    cancelSample: async () => {
+      const sample = get().sample;
+      // A cancel removes any incomplete outputs (the backend cleans partial
+      // exports and never registers derived docs until the whole job succeeds).
+      if (sample) await api.cancelJob(sample.jobId).catch(() => undefined);
+    },
+
+    clearSampleError: () => set({ sampleError: null }),
+
+    openSamplingDialog: (mode) => set({ samplingInitialMode: mode, activeModal: "sampling" }),
 
     // ----- batch recipes (F25) ---------------------------------------------------
 
@@ -3715,6 +3766,20 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
+      if (progress.kind === "sample") {
+        const sample = get().sample;
+        if (sample?.jobId !== progress.jobId) return;
+        set({
+          sample: {
+            ...sample,
+            processed: progress.processed,
+            total: progress.total,
+            message: progress.message ?? sample.message,
+          },
+        });
+        return;
+      }
+
       if (progress.kind === "pii") {
         if (get().pii.scanJobId !== progress.jobId) return;
         set((s) => ({
@@ -4010,6 +4075,31 @@ export const useStore = create<Store>((set, get) => {
           if (derive.kind === "jsonImport") set({ jsonImport: null });
         } catch (e) {
           set({ deriveError: String(e) });
+        }
+        return;
+      }
+
+      if (finished.kind === "sample") {
+        const sample = get().sample;
+        if (sample?.jobId !== finished.jobId) return;
+        set({ sample: null });
+        if (finished.status !== "done") {
+          // A cancel is silent (incomplete outputs were already removed); only
+          // a genuine failure surfaces to the dialog.
+          if (finished.status === "failed") {
+            set({ sampleError: finished.error ?? "the operation failed" });
+          }
+          return;
+        }
+        // Direct exports leave nothing to open; derived outputs each registered
+        // a NEW document — add every tab and focus the first.
+        if (sample.destination === "derivedDocuments" && sample.docIds.length > 0) {
+          try {
+            const metas = await Promise.all(sample.docIds.map((id) => api.getMeta(id)));
+            set((s) => ({ ...switchPatch(s, metas[0].id), tabs: [...s.tabs, ...metas] }));
+          } catch (e) {
+            set({ sampleError: String(e) });
+          }
         }
         return;
       }

@@ -1928,3 +1928,114 @@ export interface DictionaryImportOutcome {
   unmatched: string[];
   view: DictionaryView;
 }
+
+// ===========================================================================
+// Sampling & partitioning (F48) — mirrors `src-tauri/src/sampling.rs`.
+// ===========================================================================
+
+/** Which rows the operation draws from. */
+export type SampleScope = "all" | "visibleRows";
+
+/** Emit outputs in source order, or in a seeded shuffle. */
+export type SampleOrder = "sourceOrder" | "shuffle";
+
+/**
+ * One of the eight sampling methods (internally tagged by `type`). Columns are
+ * addressed by STABLE column id (`DocumentMeta.columnIds`), like the backend's
+ * `KeySpec`, so a saved method survives renames and reorders.
+ */
+export type SamplingMethod =
+  | { type: "head"; n: number }
+  | { type: "tail"; n: number }
+  | { type: "randomCount"; n: number }
+  | { type: "randomPercentage"; percent: number }
+  | { type: "systematic"; step: number; offset: number | null }
+  | { type: "stratified"; columns: string[]; fraction: number; tolerance: number }
+  | { type: "balanced"; columns: string[]; perStratum: number }
+  | { type: "hashDeterministic"; columns: string[] | null; percent: number };
+
+/** One partition of a split: a name and a relative weight. */
+export interface PartitionOutput {
+  name: string;
+  weight: number;
+}
+
+/** A split into N disjoint, weighted, named partitions. */
+export interface PartitionSpec {
+  parts: PartitionOutput[];
+  /** Stratify the split by these stable column ids (empty = none). */
+  stratifyBy: string[];
+  /** Keep rows sharing these key-column values together (empty = per-row).
+   * Mutually exclusive with `stratifyBy`. */
+  groupBy: string[];
+  /** Partitions are disjoint unless set. Overlap is not yet implemented; the
+   * backend rejects `true` (reserved for a future bootstrap mode). */
+  allowOverlap: boolean;
+}
+
+/** A sampling operation OR a partitioning operation (tagged by `kind`). */
+export type SamplePlan =
+  | ({ kind: "sampling" } & SamplingMethod)
+  | ({ kind: "partitioning" } & PartitionSpec);
+
+/** Where the outputs land: new in-app documents, or CSV files on disk. */
+export type SampleDestination =
+  | { type: "derivedDocuments" }
+  | {
+      type: "export";
+      dir: string;
+      baseName: string;
+      options: ExportOptions;
+      writeManifest: boolean;
+    };
+
+/** A full sampling/partitioning request. */
+export interface SampleRequest {
+  plan: SamplePlan;
+  scope: SampleScope;
+  order: SampleOrder;
+  /** The seed. The UI always supplies a crypto-random safe-integer seed (never
+   * null) so the value round-trips the IPC boundary exactly — a u64 above
+   * 2^53 would lose precision and break reproducibility. */
+  seed: number | null;
+  destination: SampleDestination;
+}
+
+/** Projected vs. exact row count for one output. */
+export interface OutputProjection {
+  name: string;
+  /** The count the method's formula predicts (before running). */
+  projected: number;
+  /** The count the deterministic selection actually produces. */
+  exact: number;
+}
+
+/** One stratum's population and selection, for the preview's strata table. */
+export interface StratumRow {
+  /** The stratum's key cell values (missing cells render as empty). */
+  key: string[];
+  population: number;
+  selected: number;
+  fraction: number;
+}
+
+/** Non-binding preview of a sampling/partitioning run. */
+export interface SamplePreview {
+  seed: number;
+  sourceFingerprint: string;
+  scope: SampleScope;
+  order: SampleOrder;
+  totalRows: number;
+  outputs: OutputProjection[];
+  strata?: StratumRow[];
+  warnings: string[];
+  /** Document revision this preview was computed against. */
+  expectedRevision: number;
+}
+
+/** Handles returned by `start_sample`: the job, plus the ids the run registers
+ * (empty for a direct export). */
+export interface SampleStart {
+  jobId: number;
+  docIds: number[];
+}
