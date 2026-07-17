@@ -1003,11 +1003,17 @@ interface Store {
   pickDictionaryImportFile: () => Promise<string | null>;
   /** Plan an import merge for a chosen file; null on error. Read-only. */
   previewDictionaryImport: (path: string, matchBy: MergeMatchBy) => Promise<MergePlan | null>;
-  /** Apply an import merge under an explicit resolution; null on error. */
+  /**
+   * Apply an import merge under an explicit resolution; null on error.
+   * `expectedDictionaryRevision` MUST be the revision the plan was computed
+   * against (`MergePlan.dictionaryRevision`), NOT the store's current view — the
+   * backend rejects the apply if the dictionary moved since the plan was taken.
+   */
   applyDictionaryImport: (
     path: string,
     matchBy: MergeMatchBy,
     resolution: MergeResolution,
+    expectedDictionaryRevision: number,
   ) => Promise<DictionaryImportOutcome | null>;
 
   // compressed files (F17)
@@ -3227,17 +3233,20 @@ export const useStore = create<Store>((set, get) => {
       }
     },
 
-    applyDictionaryImport: async (path, matchBy, resolution) => {
+    applyDictionaryImport: async (path, matchBy, resolution, expectedDictionaryRevision) => {
       const meta = activeMeta();
-      const view = get().dictionaryView;
-      if (!meta || !view) return null;
+      if (!meta) return null;
       try {
+        // Guard with the revision the PLAN was computed against — not the live
+        // view — so a documentation edit landed after the preview (which bumps
+        // the dictionary revision) makes the backend reject this stale apply
+        // instead of silently overwriting the fresher edit.
         const outcome = await api.applyDictionaryImport(
           meta.id,
           path,
           matchBy,
           resolution,
-          view.dictionaryRevision,
+          expectedDictionaryRevision,
         );
         if (get().activeId === meta.id) set({ dictionaryView: outcome.view });
         return outcome;

@@ -770,35 +770,71 @@ struct MergeStats {
     unmatched: Vec<String>,
 }
 
+/// Outcome of resolving one imported entry to a current column.
+enum Target {
+    /// Resolved to exactly one current column ID.
+    Matched(String),
+    /// No current column matched.
+    Unmatched,
+    /// The name matched more than one current column. Documents do not enforce
+    /// unique headers (a source CSV or an in-app rename can duplicate one), so
+    /// rather than silently collapse every same-named entry onto the FIRST
+    /// column — misattributing documentation with no signal — the entry is
+    /// reported and left unmatched for the user to disambiguate (e.g. by ID).
+    Ambiguous { name: String, count: usize },
+}
+
+/// The technical name an import entry matches on: its captured column name, or
+/// its display name as a fallback.
+fn match_name(entry: &DictionaryExportEntry) -> &str {
+    if entry.column_name.trim().is_empty() {
+        entry.field.display_name.as_deref().unwrap_or("").trim()
+    } else {
+        entry.column_name.trim()
+    }
+}
+
+/// Current column IDs whose header equals `name` (case-insensitive, trimmed).
+fn columns_named(doc: &Document, name: &str) -> Vec<String> {
+    let ids = doc.column_ids();
+    doc.headers()
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| h.trim().eq_ignore_ascii_case(name))
+        .map(|(i, _)| ids[i].clone())
+        .collect()
+}
+
 /// Resolve one imported entry to a current column ID under `match_by`.
-fn resolve_target(
-    doc: &Document,
-    entry: &DictionaryExportEntry,
-    match_by: MergeMatchBy,
-) -> Option<String> {
+fn resolve_target(doc: &Document, entry: &DictionaryExportEntry, match_by: MergeMatchBy) -> Target {
     let by_id = || {
         let id = entry.field.column_id.trim();
         (!id.is_empty() && doc.column_ids().iter().any(|c| c == id)).then(|| id.to_string())
     };
     let by_name = || {
-        let name = if entry.column_name.trim().is_empty() {
-            entry.field.display_name.as_deref().unwrap_or("").trim()
-        } else {
-            entry.column_name.trim()
-        };
+        let name = match_name(entry);
         if name.is_empty() {
-            return None;
+            return Target::Unmatched;
         }
-        let pos = doc
-            .headers()
-            .iter()
-            .position(|h| h.trim().eq_ignore_ascii_case(name))?;
-        Some(doc.column_ids()[pos].clone())
+        let mut ids = columns_named(doc, name);
+        match ids.len() {
+            0 => Target::Unmatched,
+            1 => Target::Matched(ids.pop().expect("len checked")),
+            n => Target::Ambiguous {
+                name: name.to_string(),
+                count: n,
+            },
+        }
     };
     match match_by {
-        MergeMatchBy::ColumnId => by_id(),
+        MergeMatchBy::ColumnId => by_id().map_or(Target::Unmatched, Target::Matched),
         MergeMatchBy::ColumnName => by_name(),
-        MergeMatchBy::Auto => by_id().or_else(by_name),
+        // Prefer an exact ID match (always unambiguous); fall back to the name
+        // only when the ID is absent here.
+        MergeMatchBy::Auto => match by_id() {
+            Some(id) => Target::Matched(id),
+            None => by_name(),
+        },
     }
 }
 
@@ -839,9 +875,18 @@ fn run_merge(
     };
 
     for entry in &imported.entries {
-        let Some(target_id) = resolve_target(doc, entry, match_by) else {
-            stats.unmatched.push(unmatched_label(entry));
-            continue;
+        let target_id = match resolve_target(doc, entry, match_by) {
+            Target::Matched(id) => id,
+            Target::Unmatched => {
+                stats.unmatched.push(unmatched_label(entry));
+                continue;
+            }
+            Target::Ambiguous { name, count } => {
+                stats.unmatched.push(format!(
+                    "{name} (ambiguous — {count} columns share this name; import by column ID)"
+                ));
+                continue;
+            }
         };
         stats.matched += 1;
         let column_name = column_context(doc, &target_id, working.field(&target_id)).name;
@@ -1012,18 +1057,28 @@ pub fn documentation_gaps(
         if rule.fields.is_empty() {
             continue;
         }
-        // Resolve target column positions.
+        // Resolve target column positions. A required-doc rule applies to EVERY
+        // column sharing a named header, not just the first — headers are not
+        // unique — and duplicate positions are collapsed so a column is reported
+        // at most once per rule.
         let targets: Vec<usize> = if rule.columns.is_empty() {
             (0..doc.column_ids().len()).collect()
         } else {
-            rule.columns
+            let mut positions: Vec<usize> = rule
+                .columns
                 .iter()
-                .filter_map(|name| {
+                .flat_map(|name| {
+                    let name = name.trim();
                     doc.headers()
                         .iter()
-                        .position(|h| h.trim().eq_ignore_ascii_case(name.trim()))
+                        .enumerate()
+                        .filter(move |(_, h)| h.trim().eq_ignore_ascii_case(name))
+                        .map(|(i, _)| i)
                 })
-                .collect()
+                .collect();
+            positions.sort_unstable();
+            positions.dedup();
+            positions
         };
         for pos in targets {
             let column_id = &doc.column_ids()[pos];
@@ -1334,6 +1389,79 @@ mod tests {
     }
 
     #[test]
+    fn merge_by_name_reports_ambiguous_duplicate_headers() {
+        // Headers are not unique — two columns share the name "email". An
+        // import entry that matches by name cannot be safely attributed to
+        // either, so it is reported as unmatched, NOT silently collapsed onto
+        // the first column.
+        let d = doc("email,email\n1,2\n");
+        let incoming = export_of(vec![export_entry("foreign-1", "email", |f| {
+            f.description = Some("the email".into());
+        })]);
+
+        let plan = plan_merge(&d, &incoming, MergeMatchBy::ColumnName);
+        assert_eq!(plan.matched_columns, 0, "ambiguous name matches nothing");
+        assert!(plan.new_entries.is_empty());
+        assert_eq!(plan.unmatched.len(), 1);
+        assert!(
+            plan.unmatched[0].contains("ambiguous"),
+            "unmatched entry carries a reason: {:?}",
+            plan.unmatched[0]
+        );
+
+        // Applying attributes documentation to NEITHER column.
+        let applied = apply_merge(
+            &d,
+            &incoming,
+            MergeMatchBy::ColumnName,
+            &MergeResolution::KeepAllExisting,
+        )
+        .unwrap();
+        assert_eq!(applied.matched_columns, 0);
+        assert_eq!(applied.new_entries, 0);
+        assert!(applied.dictionary.field(&d.column_ids()[0]).is_none());
+        assert!(applied.dictionary.field(&d.column_ids()[1]).is_none());
+        assert_eq!(applied.unmatched.len(), 1);
+    }
+
+    #[test]
+    fn case_variant_headers_are_also_ambiguous_by_name() {
+        // "Email" and "email" collide under case-insensitive name matching.
+        let d = doc("Email,email\n1,2\n");
+        let incoming = export_of(vec![export_entry("foreign-1", "EMAIL", |f| {
+            f.owner = Some("data".into());
+        })]);
+        let plan = plan_merge(&d, &incoming, MergeMatchBy::ColumnName);
+        assert_eq!(plan.matched_columns, 0);
+        assert_eq!(plan.unmatched.len(), 1);
+    }
+
+    #[test]
+    fn auto_uses_id_even_when_the_name_is_ambiguous() {
+        // Duplicate headers, but the import carries the real ID of the SECOND
+        // column — Auto prefers the (unambiguous) ID and lands there exactly.
+        let d = doc("email,email\n1,2\n");
+        let id1 = d.column_ids()[1].clone();
+        let incoming = export_of(vec![export_entry(&id1, "email", |f| {
+            f.owner = Some("finance".into());
+        })]);
+        let applied = apply_merge(
+            &d,
+            &incoming,
+            MergeMatchBy::Auto,
+            &MergeResolution::KeepAllExisting,
+        )
+        .unwrap();
+        assert_eq!(applied.matched_columns, 1);
+        assert_eq!(
+            applied.dictionary.field(&id1).unwrap().owner.as_deref(),
+            Some("finance")
+        );
+        // The first same-named column is untouched.
+        assert!(applied.dictionary.field(&d.column_ids()[0]).is_none());
+    }
+
+    #[test]
     fn identical_incoming_value_is_not_a_conflict() {
         let mut d = doc("a\n1\n");
         let id_a = d.column_ids()[0].clone();
@@ -1489,6 +1617,22 @@ mod tests {
             documentation_gaps(&d, &scoped).is_empty(),
             "a has a description"
         );
+    }
+
+    #[test]
+    fn documentation_gaps_cover_every_column_sharing_a_name() {
+        // Two columns share the header "email"; a rule naming "email" must flag
+        // BOTH (not just the first) and report each at most once.
+        let d = doc("email,email\n1,2\n");
+        let rules = vec![RequiredDocumentation {
+            columns: vec!["email".into()],
+            fields: vec![DictionaryFieldKey::Description],
+        }];
+        let gaps = documentation_gaps(&d, &rules);
+        assert_eq!(gaps.len(), 2, "both same-named columns are flagged");
+        let ids: HashSet<&str> = gaps.iter().map(|g| g.column_id.as_str()).collect();
+        assert!(ids.contains(d.column_ids()[0].as_str()));
+        assert!(ids.contains(d.column_ids()[1].as_str()));
     }
 
     // ----- PII hook --------------------------------------------------------

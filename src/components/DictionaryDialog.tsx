@@ -177,9 +177,12 @@ export function DictionaryDialog({ onClose }: { onClose: () => void }) {
   };
 
   const finishImport = async (resolution: MergeResolution) => {
-    if (!importPath) return;
+    if (!importPath || !plan) return;
     setImportBusy(true);
-    const outcome = await applyImport(importPath, matchBy, resolution);
+    // Guard with the revision captured when this plan was previewed, so an edit
+    // saved after the preview (which moves the dictionary revision) rejects this
+    // now-stale apply rather than silently discarding that edit.
+    const outcome = await applyImport(importPath, matchBy, resolution, plan.dictionaryRevision);
     setImportBusy(false);
     if (!outcome) return; // error surfaced globally; keep the panel open to retry
     setConflictOpen(false);
