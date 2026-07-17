@@ -30,6 +30,12 @@ mod index;
 pub mod job;
 mod joins;
 mod journal;
+/// Public like [`job`]: the F33 JSON / JSON Lines import engine (shape
+/// detection, streaming JSON Pointer resolution, the JSONL byte-offset
+/// record index, flatten/explode policies, preview scan and the
+/// document-producing import) consumed by the F33 command surface and the
+/// JSON export stage.
+pub mod json_import;
 mod outlier;
 mod parse;
 mod paste;
