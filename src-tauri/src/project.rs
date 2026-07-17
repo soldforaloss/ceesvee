@@ -5,10 +5,10 @@
 //! is a versioned envelope `{ formatVersion, appVersion, sections }` whose
 //! sections are typed and registered in [`SECTION_REGISTRY`]. Future features
 //! extend the registry by adding a typed field to [`ProjectSections`], a row
-//! to the registry, and a match arm in [`set_section_typed`] — the reserved
-//! `annotations` (F40), `dictionary` (F38) and `queries` (F36) sections are
-//! already named, default-empty, and rejected for writes until their owning
-//! feature lands.
+//! to the registry, and a match arm in [`set_section_typed`] — as the F38
+//! `dictionary` section does. The still-reserved `annotations` (F40) and
+//! `queries` (F36) sections are already named, default-empty, and rejected for
+//! writes until their owning feature lands.
 //!
 //! Hard rules enforced here:
 //!
@@ -29,8 +29,8 @@
 //!   section-map, source, tabs and per-source open-settings levels are
 //!   preserved on round-trip via serde flatten catch-alls, alongside the
 //!   version string. Typed sub-sections owned by other features (views,
-//!   schemas, comparisons, row keys) round-trip through those features' own
-//!   versioned payloads rather than through a catch-all here.
+//!   schemas, dictionaries, comparisons, row keys) round-trip through those
+//!   features' own versioned payloads rather than through a catch-all here.
 //! - **Nothing runs on open.** Opening a project yields a [`ProjectOpenPlan`]
 //!   describing what to open and which named views are safe to reapply
 //!   (fingerprint + column compatibility gated — warn, never break). Recipes,
@@ -46,6 +46,7 @@ use serde_json::Value;
 use tauri::State;
 
 use crate::compare::CompareSpec;
+use crate::dictionary::DictionaryExport;
 use crate::dto::{BackupPolicy, FileFingerprint};
 use crate::error::{AppError, AppResult};
 use crate::row_identity::KeySpec;
@@ -171,10 +172,11 @@ pub struct ProjectSections {
     /// `row_identity::RowIdentity` (keys/record numbers), never by content.
     #[serde(default)]
     pub annotations: Vec<Value>,
-    /// RESERVED for F38 data dictionaries: per-column descriptions and
-    /// constraints (configuration only).
+    /// F38 data dictionaries, per source: per-column documentation and
+    /// constraints in the versioned dictionary export envelope (configuration
+    /// only — column IDs and metadata, never cell values).
     #[serde(default)]
-    pub dictionary: Vec<Value>,
+    pub dictionary: Vec<SourceDictionary>,
     /// RESERVED for F36 saved queries: definitions only, never results.
     #[serde(default)]
     pub queries: Vec<Value>,
@@ -253,7 +255,7 @@ pub const SECTION_REGISTRY: &[SectionSpec] = &[
     },
     SectionSpec {
         name: "dictionary",
-        reserved: true,
+        reserved: false,
         owner: "F38",
     },
     SectionSpec {
@@ -339,6 +341,17 @@ pub struct SourceViews {
 pub struct SourceSchema {
     pub source_id: String,
     pub schema: SchemaExport,
+}
+
+/// F38 data dictionary for one source, in the versioned export envelope. The
+/// envelope keys columns by their stable IDs and carries only documentation
+/// (display name, description, role, unit, allowed values, …) — never a cell
+/// value — so it passes the no-cell-data scan like every other section.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceDictionary {
+    pub source_id: String,
+    pub dictionary: DictionaryExport,
 }
 
 /// Row-identity key definition for one source.
@@ -1236,6 +1249,7 @@ fn set_section_typed(sections: &mut ProjectSections, name: &str, value: Value) -
         "joinMappings" => sections.join_mappings = serde_json::from_value(value).map_err(shape)?,
         "comparisons" => sections.comparisons = serde_json::from_value(value).map_err(shape)?,
         "rowKeys" => sections.row_keys = serde_json::from_value(value).map_err(shape)?,
+        "dictionary" => sections.dictionary = serde_json::from_value(value).map_err(shape)?,
         _ => unreachable!("registry check above covers every arm"),
     }
     Ok(())
@@ -1479,6 +1493,9 @@ pub fn project_open_apply(
 mod tests {
     use super::*;
     use crate::compare::CompareMode;
+    use crate::dictionary::{
+        DictionaryExportEntry, DictionaryField, FieldRole, Sensitivity, DICTIONARY_VERSION,
+    };
     use crate::row_identity::KeyNormalization;
     use crate::schema::{ColumnSchema, LogicalType, SCHEMA_VERSION};
     use crate::settings::ProfileMatch;
@@ -1541,6 +1558,26 @@ mod tests {
         }
     }
 
+    /// A one-entry dictionary export documenting the `amount` column (keyed by
+    /// its stable ID `c1`), exercising text, enum and list fields.
+    fn a_dictionary() -> DictionaryExport {
+        DictionaryExport {
+            version: DICTIONARY_VERSION,
+            entries: vec![DictionaryExportEntry {
+                column_name: "amount".into(),
+                field: DictionaryField {
+                    display_name: Some("Order amount".into()),
+                    description: Some("Total charged for the order".into()),
+                    role: Some(FieldRole::Measure),
+                    unit: Some("USD".into()),
+                    sensitivity: Some(Sensitivity::Confidential),
+                    allowed_values: vec!["low".into(), "high".into()],
+                    ..DictionaryField::empty("c1")
+                },
+            }],
+        }
+    }
+
     fn a_profile() -> FileProfile {
         FileProfile {
             id: "p1".into(),
@@ -1564,6 +1601,7 @@ mod tests {
             cross_rules: Vec::new(),
             named_views: Vec::new(),
             last_view_id: None,
+            required_documentation: Vec::new(),
         }
     }
 
@@ -1633,6 +1671,10 @@ mod tests {
                 },
             },
         }];
+        s.dictionary = vec![SourceDictionary {
+            source_id: "srcA".into(),
+            dictionary: a_dictionary(),
+        }];
         (file, a, b)
     }
 
@@ -1695,6 +1737,41 @@ mod tests {
         let loaded = load_project_file(&path).unwrap();
         assert_eq!(loaded.sections, file.sections);
         assert!(Path::new(&loaded.sections.sources[0].path).is_absolute());
+    }
+
+    #[test]
+    fn dictionary_section_registers_and_round_trips_per_source() {
+        // The F38 dictionary is a real registered section now, not reserved:
+        // a well-formed per-source payload (the JSON the front end sends via
+        // `project_set_section`) is accepted rather than rejected.
+        let mut sections = ProjectSections::default();
+        let payload = serde_json::to_value(vec![SourceDictionary {
+            source_id: "srcA".into(),
+            dictionary: a_dictionary(),
+        }])
+        .unwrap();
+        set_section_typed(&mut sections, "dictionary", payload).unwrap();
+        assert_eq!(sections.dictionary.len(), 1);
+        assert_eq!(sections.dictionary[0].source_id, "srcA");
+
+        // It survives an atomic save + reload, keyed by the stable column ID
+        // and carrying every documentation field verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        let (file, _a, _b) = full_project(dir.path());
+        let path = dir.path().join(format!("dict.{PROJECT_EXTENSION}"));
+        write_project_file(&path, &file).unwrap();
+        let loaded = load_project_file(&path).unwrap();
+        assert_eq!(loaded.sections.dictionary, file.sections.dictionary);
+        let field = &loaded.sections.dictionary[0].dictionary.entries[0].field;
+        assert_eq!(field.column_id, "c1");
+        assert_eq!(field.role, Some(FieldRole::Measure));
+        assert_eq!(field.sensitivity, Some(Sensitivity::Confidential));
+        assert_eq!(field.allowed_values, vec!["low", "high"]);
+
+        // Documentation is configuration, not data: the whole serialized file
+        // still passes the no-cell-data scan with the dictionary populated.
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        scan_for_data_keys("whole file", &value).expect("dictionary carries no cell data");
     }
 
     #[test]
@@ -1866,7 +1943,7 @@ mod tests {
     #[test]
     fn reserved_and_unknown_section_writes_are_rejected() {
         let mut sections = ProjectSections::default();
-        for reserved in ["annotations", "dictionary", "queries"] {
+        for reserved in ["annotations", "queries"] {
             let err = set_section_typed(&mut sections, reserved, serde_json::json!([]))
                 .unwrap_err()
                 .to_string();
@@ -2287,7 +2364,7 @@ mod tests {
         }
         // layout serializes as null; everything else defaults to empty lists
         // or objects. Reserved sections are present-but-empty by design.
-        for reserved in ["annotations", "dictionary", "queries"] {
+        for reserved in ["annotations", "queries"] {
             assert_eq!(map[reserved], serde_json::json!([]), "{reserved}");
         }
         assert_eq!(
