@@ -39,6 +39,9 @@ and faithful on large, real-world delimited files.**
 **Viewing**
 
 - Open CSV / TSV / and other delimited files in a virtualized, spreadsheet-style grid.
+- **Multi-GB files** open read-only against a streaming record index instead of
+  being loaded whole — browse, find, filter, export, profile, and compare with
+  bounded memory, then **Convert to editable** when you need to change cells.
 - Open **compressed files** — `.csv.gz` and `.zip` archives (with an entry
   chooser) — and export back to gzip. Decompression-bomb guards included.
 - Auto-detect the **delimiter** (comma, tab, semicolon, pipe) with a manual /
@@ -47,7 +50,11 @@ and faithful on large, real-world delimited files.**
 - Auto-detect the **encoding** (UTF-8, UTF-16 LE/BE, Windows-1252 / Latin-1) with
   an override, plus correct **BOM** handling.
 - "First row is header" toggle with a frozen header row.
-- Tabs for multiple open files, plus a recent-files list.
+- Per-column **type detection** (number / date / bool / text) shown as header
+  badges, with numeric columns right-aligned and a column-summaries panel
+  (count, blanks, unique values, min / max / mean).
+- Hide, **pin**, and drag-reorder columns; auto-fit widths; wrap long text.
+- Tabs for multiple open files, a recent-files list, and **drag-and-drop** to open.
 - **Follow mode** — tail a growing CSV log live (read-only), with
   pause/resume, new-row filtering, and rotation/truncation detection.
 - Status bar with row/column counts, encoding, delimiter, line endings, and live
@@ -65,6 +72,39 @@ and faithful on large, real-world delimited files.**
 - **Undo / redo** backed by a Rust undo stack (Ctrl+Z / Ctrl+Y).
 - **Save / Save As** with explicit export options: delimiter, encoding, quoting
   style, line endings (LF/CRLF), and BOM.
+- **Scoped & split export** — export everything, the visible (filtered) rows,
+  selected rows / columns, or a cell range; optionally split the output by row
+  count, approximate file size, or a column's values (one file per group),
+  with an optional JSON manifest recording row counts and SHA-256 hashes.
+
+**Reliability**
+
+- **Atomic saves** — Save streams through a temporary file that is fsynced and
+  renamed into place, so a crash or a full disk can never leave a half-written
+  file behind; optional single or rolling `.bak` backups.
+- **Data-fidelity diagnostics** — a cancellable background scan reports import
+  damage (malformed bytes, ragged records with their source line numbers),
+  replacement characters, mixed-type columns, blank-heavy columns, edge
+  whitespace, duplicate or empty headers, and more — each with samples,
+  jump-to-cell, and one-click "filter to affected rows".
+- **Reopen with settings** — change delimiter, encoding, or the header toggle
+  against a live preview of how the file would re-read (including exactly
+  which cells change) and apply only with explicit confirmation. Dirty
+  documents are saved or explicitly discarded first, never silently reparsed.
+- **External-change detection** — CEESVEE fingerprints the file on disk and,
+  when another program changes it, offers reload / ignore / save-as / open the
+  disk copy side by side instead of clobbering anything.
+- **Quit protection** — closing the window with unsaved tabs prompts to save
+  all (aborting if any save fails), discard all, or cancel.
+- **Crash recovery** (opt-in) — an append-only local edit journal that
+  replays your unsaved work after a crash, without ever touching the
+  source file. Changed sources recover as copies; journals clean up on
+  save and close.
+- Exports to legacy encodings (e.g. Windows-1252) are checked up front and
+  blocked with the exact offending cells listed — nothing is ever substituted
+  silently.
+- Saves, exports, and every heavy scan run as cancellable background jobs with
+  progress in the status bar, so the grid never blocks.
 
 **Navigate & analyze**
 
@@ -74,6 +114,19 @@ and faithful on large, real-world delimited files.**
 - **Named views** — save non-destructive combinations of filter, view-only
   sort, hidden/pinned/reordered columns, widths, and wrap per file; views
   survive renames via stable column IDs and restore when you reopen the file.
+- **Filter rows** with an advanced query builder — nest AND/OR groups of
+  conditions (contains, equals, numeric comparisons, is-empty, regex, and
+  more). The status bar shows "N of M rows" with one-click clear; filtering is
+  a non-destructive view, and Save always writes every row.
+- **Column explorer** — a per-column profiling panel: type distribution,
+  blanks, distinct counts (exact, or estimated once cardinality explodes), top
+  values, numeric quartiles, date extremes, and text-length stats — over all
+  rows or just the visible ones, with click-to-filter straight from the panel.
+- **File profiles** — save delimiter / encoding / header choices, expected
+  columns, and validation rules (required, unique, type, regex, numeric range)
+  under a name matched to file patterns; matching files suggest — or with
+  opt-in, auto-apply — the profile, and a validation report checks any
+  document against it.
 - **Fuzzy value clustering** — group spelling/punctuation/case variants
   (fingerprint, n-gram, Levenshtein, Jaro-Winkler) and normalize them in one
   reviewed, undoable step.
@@ -86,6 +139,11 @@ and faithful on large, real-world delimited files.**
   comparisons, date order, conditional required, sum equality with
   tolerance, allowed combinations, …) with violation samples, jump-to-row,
   filter-to-violations, and JSON reports. Rules persist in file profiles.
+- **Data cleaning transforms** — previewable, one-undo-step cleanups: trim and
+  collapse whitespace, case changes, find/replace within a column, number and
+  date normalization, blank-fill, split a column by delimiter, and merge
+  columns. Every transform shows affected counts, before/after examples, and
+  parse failures before anything is applied.
 - **Missing-value repair** — normalize null tokens, constant /
   forward / backward / mean / median / mode fills, grouped fills that
   never cross boundaries, linear interpolation, and thresholded row or
@@ -94,6 +152,10 @@ and faithful on large, real-world delimited files.**
   rare-value or pattern checks, whole-column or group-wise, with
   reasons, group statistics, filtering, and previewed one-undo
   corrections (blank, median, cap, remove).
+- **Duplicate finder** — group rows by a multi-column key with trim /
+  case-insensitive / whitespace-collapse / blank-key options; review sample
+  groups, filter the grid to duplicates, export them, or remove them in one
+  undoable step keeping the first, last, or most complete row.
 - **Append files** — concatenate open tabs, files, or a folder into a
   new document, aligning columns by name / case-insensitive name /
   position / manual mapping, with union or intersection schemas,
@@ -108,6 +170,12 @@ and faithful on large, real-world delimited files.**
   with normalized grouping, blank-key policies, and ordering options.
 - **Pivot / unpivot / transpose** — reshape wide↔long with aggregation
   choices, duplicate-coordinate detection, provenance, and size guards.
+- **Compare two documents** — positional or keyed comparison with column
+  mapping for renamed/reordered columns and value equivalences (numeric, date,
+  blank, case, trim). Every record classifies as added, removed, changed,
+  unchanged, or conflict — duplicate keys are surfaced, never silently
+  paired — with side-by-side cell diffs, jump-to-source-row, and exports of
+  each class or a JSON change report.
 - **Batch recipes** — run a saved, declarative pipeline (validate /
   filter / clean / dedup / sort / export) over folders of files with
   dry runs, per-file reports, and no-overwrite defaults. No scripting.
@@ -118,10 +186,6 @@ and faithful on large, real-world delimited files.**
 - **Change inspector** — see every unsaved operation with before/after
   values, jump to changes, and selectively revert cells, columns,
   operations, or everything — each revert itself undoable.
-- **Crash recovery** (opt-in) — an append-only local edit journal that
-  replays your unsaved work after a crash, without ever touching the
-  source file. Changed sources recover as copies; journals clean up on
-  save and close.
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 
@@ -129,6 +193,8 @@ and faithful on large, real-world delimited files.**
 
 - Light and dark themes that follow your OS preference.
 - A restrained, dense-but-readable interface.
+- **Per-tab state** — find, filter, selection, column widths, pinned columns,
+  and scroll position follow each document instead of leaking between tabs.
 - **File associations** — set CEESVEE as the default app for `.csv` / `.tsv` /
   `.tab` / `.psv` files, or right-click → **Open with CEESVEE**. Opening another
   file while CEESVEE is running adds a tab instead of a second window.
@@ -225,12 +291,7 @@ cargo fmt   --manifest-path src-tauri/Cargo.toml --check
 
 ## Roadmap
 
-- [ ] Column type detection and per-column summaries
-- [ ] Filtering / query view
-- [ ] Frozen columns (pin leading columns)
-- [ ] Drag-and-drop to open files
 - [ ] Signed & notarized macOS / Windows builds
-- [ ] Large-file streaming export
 
 Non-goals for v1: formulas, charts, scripting/macros, and cloud sync.
 
