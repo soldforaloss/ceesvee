@@ -67,8 +67,10 @@ pub const DEFAULT_WINDOW: usize = 4096;
 /// observed within this many rows. Finer than the app's existing full-scan
 /// granularity (schema inference checks per 4096-row chunk), so streaming
 /// consumers (append, [`copy`]) stop promptly without paying a per-row check
-/// on the hot path.
-const CANCEL_CHECK_EVERY: usize = 1024;
+/// on the hot path. Shared with consumers that push a full window through
+/// their own row loop (the F20 append writer) so cancellation is honoured at
+/// the same granularity mid-batch, not only between window reads.
+pub(crate) const CANCEL_CHECK_EVERY: usize = 1024;
 
 /// One owned row: `None` = missing field, `Some("")` = present but empty.
 pub type TabularRow = Vec<Option<String>>;
@@ -122,6 +124,17 @@ pub trait TabularSource {
     /// The logical columns, in read order.
     fn columns(&self) -> Vec<TabularColumn>;
 
+    /// Whether [`TabularSource::columns`] carries real header text (`true`) or
+    /// synthetic positional placeholders (`false`, e.g. a document opened
+    /// without a header row exposes `Column 1`, `Column 2`, ...). A sink uses
+    /// this to decide whether emitting a header record is meaningful: a
+    /// header-less source must not have its placeholder names written out as a
+    /// header row, which would shift every data row. Sources whose column
+    /// names are always caller-supplied default to `true`.
+    fn has_header_row(&self) -> bool {
+        true
+    }
+
     /// How many data rows the source has, as well as it knows.
     fn row_count(&self) -> RowCountHint;
 
@@ -151,8 +164,11 @@ pub trait TabularSource {
 /// leave any existing destination untouched.
 pub trait TabularSink {
     /// Declare the output schema. Must be called exactly once, before any
-    /// batch.
-    fn begin(&mut self, columns: &[TabularColumn]) -> AppResult<()>;
+    /// batch. `has_header_row` reports whether `columns` carries real header
+    /// text (see [`TabularSource::has_header_row`]); a sink that would
+    /// otherwise emit a header record must skip it when this is `false` so a
+    /// header-less source never gains a synthetic header row.
+    fn begin(&mut self, columns: &[TabularColumn], has_header_row: bool) -> AppResult<()>;
 
     /// Append a batch of rows. Rows shorter than the schema are padded as
     /// missing; wider rows are rejected (never silently truncated).
@@ -169,7 +185,7 @@ pub fn copy(
     sink: &mut dyn TabularSink,
     ctx: Option<&JobCtx>,
 ) -> AppResult<u64> {
-    sink.begin(&source.columns())?;
+    sink.begin(&source.columns(), source.has_header_row())?;
     if let (Some(ctx), RowCountHint::Exact(n)) = (ctx, source.row_count()) {
         ctx.set_total(n);
     }
@@ -221,6 +237,12 @@ impl TabularSource for DocumentSource<'_> {
                 schema: self.doc.column_schema_at(i).cloned(),
             })
             .collect()
+    }
+
+    fn has_header_row(&self) -> bool {
+        // Header-less documents expose synthetic `Column N` names; surface that
+        // provenance so a sink suppresses them exactly like the export path.
+        self.doc.has_header_row()
     }
 
     fn row_count(&self) -> RowCountHint {
@@ -417,7 +439,7 @@ impl CsvSink {
 }
 
 impl TabularSink for CsvSink {
-    fn begin(&mut self, columns: &[TabularColumn]) -> AppResult<()> {
+    fn begin(&mut self, columns: &[TabularColumn], has_header_row: bool) -> AppResult<()> {
         if self.n_cols.is_some() {
             return Err(AppError::invalid("the sink schema was already declared"));
         }
@@ -433,7 +455,11 @@ impl TabularSink for CsvSink {
             out.file_mut().write_all(bom)?;
             self.bytes += bom.len() as u64;
         }
-        if self.include_headers {
+        // Mirror the export pipeline: emit a header record only when the caller
+        // asked for headers AND the source's column names are real header text.
+        // A header-less source carries synthetic `Column N` placeholders; those
+        // must never be written as a header row (it would shift every data row).
+        if self.include_headers && has_header_row {
             self.writer
                 .write_record(columns.iter().map(|c| c.name.as_bytes()))?;
         }
@@ -682,7 +708,7 @@ mod tests {
         let ctx = registry.begin("test", None, |_| {});
         {
             let mut sink = CsvSink::create(&dest, &options()).unwrap();
-            sink.begin(&[col("a")]).unwrap();
+            sink.begin(&[col("a")], true).unwrap();
             sink.write_rows(&[vec![Some("1".into())]], Some(&ctx))
                 .unwrap();
             registry.cancel(ctx.id);
@@ -751,7 +777,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("out.csv");
         let mut sink = CsvSink::create(&dest, &options()).unwrap();
-        sink.begin(&[col("a"), col("b")]).unwrap();
+        sink.begin(&[col("a"), col("b")], true).unwrap();
         assert!(!dest.exists(), "nothing visible before finish");
         sink.write_rows(
             &[
@@ -775,7 +801,7 @@ mod tests {
         let dest = dir.path().join("out.csv");
         {
             let mut sink = CsvSink::create(&dest, &options()).unwrap();
-            sink.begin(&[col("a")]).unwrap();
+            sink.begin(&[col("a")], true).unwrap();
             // Enough data to force several 64 KiB drains into the staging
             // file, then "crash" (drop) before the commit.
             let batch: Vec<TabularRow> = (0..40_000)
@@ -800,8 +826,11 @@ mod tests {
             sink.write_rows(&[vec![Some("1".into())]], None).is_err(),
             "rows before begin are rejected"
         );
-        sink.begin(&[col("a")]).unwrap();
-        assert!(sink.begin(&[col("a")]).is_err(), "double begin is rejected");
+        sink.begin(&[col("a")], true).unwrap();
+        assert!(
+            sink.begin(&[col("a")], true).is_err(),
+            "double begin is rejected"
+        );
         assert!(
             sink.write_rows(&[vec![Some("1".into()), Some("2".into())]], None)
                 .is_err(),
@@ -819,13 +848,35 @@ mod tests {
         opts.bom = true;
         opts.include_headers = false;
         let mut sink = CsvSink::create(&dest, &opts).unwrap();
-        sink.begin(&[col("a"), col("b")]).unwrap();
+        sink.begin(&[col("a"), col("b")], true).unwrap();
         sink.write_rows(&[vec![Some("1".into()), Some("2".into())]], None)
             .unwrap();
         sink.finish().unwrap();
         let bytes = std::fs::read(&dest).unwrap();
         assert_eq!(&bytes[0..3], &[0xEF, 0xBB, 0xBF], "UTF-8 BOM");
         assert_eq!(&bytes[3..], b"1;2\r\n");
+    }
+
+    #[test]
+    fn sink_suppresses_headers_without_provenance() {
+        // include_headers is on, but the schema carries no real header text
+        // (has_header_row = false): the synthetic names must NOT be written as
+        // a header record, matching the export pipeline that skips headers
+        // unless the document actually has one.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.csv");
+        let mut sink = CsvSink::create(&dest, &options()).unwrap();
+        assert!(options().include_headers, "guard: headers requested");
+        sink.begin(&[col("Column 1"), col("Column 2")], false)
+            .unwrap();
+        sink.write_rows(&[vec![Some("1".into()), Some("2".into())]], None)
+            .unwrap();
+        sink.finish().unwrap();
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"1,2\n",
+            "no synthetic header record"
+        );
     }
 
     #[test]
@@ -836,14 +887,14 @@ mod tests {
         opts.encoding = "windows-1252".into();
         opts.include_headers = false;
         let mut sink = CsvSink::create(&dest, &opts).unwrap();
-        sink.begin(&[col("a")]).unwrap();
+        sink.begin(&[col("a")], true).unwrap();
         sink.write_rows(&[vec![Some("café".into())]], None).unwrap();
         sink.finish().unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"caf\xE9\n");
 
         let dest2 = dir.path().join("out2.csv");
         let mut sink = CsvSink::create(&dest2, &opts).unwrap();
-        sink.begin(&[col("a")]).unwrap();
+        sink.begin(&[col("a")], true).unwrap();
         sink.write_rows(&[vec![Some("a → b".into())]], None)
             .unwrap();
         assert!(sink.finish().is_err(), "unmappable characters fail");
@@ -865,6 +916,26 @@ mod tests {
         assert_eq!(reparsed.records[0], vec!["name", "note"]);
         assert_eq!(reparsed.records[1], vec!["Ada", "hello, world"]);
         assert_eq!(reparsed.records[2], vec!["Bob", "two"]);
+    }
+
+    #[test]
+    fn copy_omits_synthetic_headers_for_a_header_less_document() {
+        // A document opened without a header row exposes synthetic `Column N`
+        // names. Copying it through the sink with include_headers on must not
+        // write those as a header record, which would prepend a bogus row and
+        // shift every data row down.
+        let d = doc("1,2\n3,4\n", false);
+        assert!(!d.has_header_row());
+        assert_eq!(d.headers(), &["Column 1", "Column 2"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("copy.csv");
+        let mut sink = CsvSink::create(&dest, &options()).unwrap();
+        assert!(options().include_headers, "guard: headers requested");
+        copy(&DocumentSource::new(&d), &mut sink, None).unwrap();
+
+        let text = String::from_utf8(std::fs::read(&dest).unwrap()).unwrap();
+        assert_eq!(text, "1,2\n3,4\n", "data rows only, no synthetic header");
     }
 
     #[test]
