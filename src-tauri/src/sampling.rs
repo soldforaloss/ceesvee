@@ -1401,7 +1401,7 @@ pub fn execute_to_export(
             let path = output_path(dir, base_name, &plan.name, single);
 
             let mut sink = CsvSink::create(&path, options)?;
-            sink.begin(&source.columns())?;
+            sink.begin(&source.columns(), source.has_header_row())?;
             read_indices(source, &plan.indices, Some(ctx), &mut |_abs, row| {
                 sink.write_rows(std::slice::from_ref(row), Some(ctx))?;
                 ctx.advance(1)?;
