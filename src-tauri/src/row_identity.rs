@@ -286,9 +286,13 @@ impl KeyIndex {
 }
 
 /// Stream `source` and build its key index for `spec`. Key columns are
-/// resolved by STABLE column id against the source's schema; unknown ids
-/// fail up front. Duplicate keys land in [`KeyIndex::duplicates`] with
-/// every involved row flagged.
+/// resolved by STABLE column id ([`crate::tabular::TabularColumn::id`])
+/// against the source's schema; unknown ids fail up front. Resolution is
+/// deliberately by id, never by header text, so a spec survives renames and
+/// reorders — a non-document source must therefore expose stable ids for its
+/// key columns (see [`crate::tabular::TabularColumn::id`] for the naming
+/// convention). Duplicate keys land in [`KeyIndex::duplicates`] with every
+/// involved row flagged.
 pub fn build_key_index(
     source: &dyn TabularSource,
     spec: &KeySpec,

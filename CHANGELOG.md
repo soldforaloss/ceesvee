@@ -51,7 +51,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   atomic streamed CSV output through the existing crash-safe save
   pipeline. Both document backings (editable and indexed) read through the
   contract, and the multi-file append reader now streams its inputs over
-  it. Groundwork for upcoming import/export formats and sampling.
+  it. The contract is explicitly scoped: text-representable values (binary
+  columns are a documented follow-up), a fixed per-source schema, and
+  forward/sequential window streaming so a future single-pass source need
+  not fake random access. Groundwork for upcoming import/export formats and
+  sampling.
 - **Shared row identity**: new backend model for upcoming annotations,
   patches, and three-way merge — session-stable editor row ids, source
   record numbers for read-only documents, normalized composite keys

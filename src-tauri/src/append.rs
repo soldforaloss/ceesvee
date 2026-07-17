@@ -777,4 +777,24 @@ mod tests {
             _ => unreachable!(),
         }
     }
+
+    #[test]
+    fn append_honours_cancellation_through_the_window_reader() {
+        // A cancelled job must stop the append cooperatively via the shared
+        // tabular window reads (DocumentSource::read_rows) rather than run to
+        // completion — regression cover for the reroute onto the window reader.
+        let a = doc_input("a", "id\n1\n2\n3\n");
+        let registry = JobRegistry::default();
+        let ctx = registry.begin("derive", None, |_| {});
+        registry.cancel(ctx.id);
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            std::slice::from_ref(&a),
+            &options(AlignMode::ExactName, SchemaMode::Union),
+            99,
+            dir.path().to_path_buf(),
+            &ctx,
+        );
+        assert!(matches!(result, Err(AppError::Cancelled)));
+    }
 }

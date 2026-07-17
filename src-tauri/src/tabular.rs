@@ -16,6 +16,35 @@
 //! padding is recorded in [`crate::parse::ImportInfo`], not in the cells) —
 //! but the distinction is part of the contract so future sources can carry
 //! it and sinks can decide how to narrow it (CSV writes missing as empty).
+//!
+//! ## Contract scope and access model
+//!
+//! **Text values.** Cells are text (`Option<String>`); this contract version
+//! deliberately carries no binary or typed-blob slot, and the reused
+//! [`ColumnSchema`] (F31) has no binary logical type. A source over a column
+//! that holds raw bytes — a SQLite `BLOB`, a Parquet/Arrow `Binary` / `List`
+//! / `Struct` — is therefore OUT OF SCOPE until the contract grows a canonical
+//! carrier: either a `LogicalType::Binary` plus one agreed text encoding
+//! (e.g. base64) or a typed cell slot, so independently written sources cannot
+//! diverge on an ad hoc convention. Text-representable sources (CSV, JSONL,
+//! most SQL columns, Excel ranges) fit as-is.
+//!
+//! **Sequential streaming.** The streaming helpers ([`copy`],
+//! [`crate::row_identity::build_key_index`], the F20 append reader) only ever
+//! request monotonically increasing, contiguous windows — offset `0`, then
+//! `0 + len`, and so on. A source that supports random access MAY answer any
+//! `offset` (the document and in-memory sources here do); a genuinely
+//! single-pass, unseekable source (JSONL off a pipe, an F48 reservoir sample)
+//! need only serve forward contiguous reads and still composes with every
+//! helper, rather than being forced to buffer or rescan to fake an
+//! arbitrary-offset read.
+//!
+//! **Fixed schema.** [`TabularSource::columns`] is the source's COMPLETE
+//! logical schema, stable for the source's lifetime: [`copy`] reads it exactly
+//! once, up front, before any row. A schema-on-read source whose records carry
+//! heterogeneous key sets (JSONL field drift) must commit to its full column
+//! set before serving reads — by sniffing a bounded prefix and unioning, or by
+//! a declared projection — never by growing the schema mid-stream.
 
 use std::io::Write;
 
@@ -34,7 +63,11 @@ use crate::{encoding, export, save, util};
 /// size, so one window is one contiguous index read.
 pub const DEFAULT_WINDOW: usize = 4096;
 
-/// Cooperative-cancellation check interval inside a window read.
+/// Cooperative-cancellation check interval inside a window read: a cancel is
+/// observed within this many rows. Finer than the app's existing full-scan
+/// granularity (schema inference checks per 4096-row chunk), so streaming
+/// consumers (append, [`copy`]) stop promptly without paying a per-row check
+/// on the hot path.
 const CANCEL_CHECK_EVERY: usize = 1024;
 
 /// One owned row: `None` = missing field, `Some("")` = present but empty.
@@ -46,7 +79,11 @@ pub struct TabularColumn {
     /// Physical column name (header text, possibly synthetic).
     pub name: String,
     /// Stable column ID (F12) when the source has one. Key specs
-    /// ([`crate::row_identity::KeySpec`]) address columns by this.
+    /// ([`crate::row_identity::KeySpec`]) address columns by this, so a
+    /// non-document source that wants to take part in key matching must
+    /// synthesise a stable id: the physical column name when names are unique,
+    /// otherwise a positional `col-{index}`. `None` means the column cannot be
+    /// named in a key spec.
     pub id: Option<String>,
     /// Declared logical schema (F31), when one exists.
     pub schema: Option<ColumnSchema>,
@@ -92,6 +129,11 @@ pub trait TabularSource {
     /// An offset at or past the end yields an empty batch; `limit == 0`
     /// yields an empty batch; a window crossing the end yields the partial
     /// tail. Cancellation is observed cooperatively through `ctx`.
+    ///
+    /// The streaming helpers only request monotonically increasing, contiguous
+    /// windows (see the module's access-model note): a random-access source may
+    /// serve any `offset`, but a sequential-only source need only support
+    /// forward contiguous reads.
     fn read_rows(
         &self,
         offset: u64,
@@ -238,8 +280,11 @@ impl TabularSource for DocumentSource<'_> {
 }
 
 /// An owned in-memory table. The reference implementation of the
-/// missing-vs-empty contract (its cells CAN be `None`), and the natural
-/// shim for future materialized results (SQL rows, sampled subsets).
+/// missing-vs-empty contract (its cells CAN be `None`), and a convenient shim
+/// for SMALL, already-materialized results (a bounded sample, a modest SQL
+/// result). It holds every row in memory with no size guard, so a large query
+/// result must instead stream through a purpose-built, cursor-backed
+/// [`TabularSource`] rather than being fully materialized here.
 #[derive(Debug, Clone, Default)]
 pub struct MemSource {
     columns: Vec<TabularColumn>,
