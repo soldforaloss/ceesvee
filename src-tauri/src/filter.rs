@@ -6,12 +6,15 @@
 //! a value matches a numeric filter exactly when it counts as numeric for sort
 //! and summaries.
 
+use std::cmp::Ordering;
+
 use regex::{Regex, RegexBuilder};
 
 use crate::analyze;
 use crate::document::Document;
 use crate::dto::{Conjunction, FilterCondition, FilterGroup, FilterNode, FilterOp};
 use crate::error::{AppError, AppResult};
+use crate::schema::{self, CellState, ColumnSchema, TypedValue};
 
 enum Compiled {
     Group {
@@ -41,6 +44,12 @@ enum Test {
     StartsWith(String, bool),
     EndsWith(String, bool),
     Num(NumOp, f64),
+    /// F31: range comparison against a column with a DECLARED orderable type
+    /// (integer/decimal/float/date/datetime) — the comparison value is parsed
+    /// under the schema (locale, input formats) and cells compare in typed
+    /// order. Cells that are null-ish or invalid under the schema never match,
+    /// mirroring how non-numeric cells never satisfy `Num`.
+    Typed(Box<(ColumnSchema, NumOp, TypedValue)>),
     IsEmpty,
     NotEmpty,
     Regex(Regex),
@@ -59,7 +68,7 @@ fn norm(s: &str, case_sensitive: bool) -> String {
 /// row indices in document order. Streams through [`Document::visit_rows`],
 /// so it works for both editable and indexed backings.
 pub fn matching_rows(doc: &Document, spec: &FilterGroup) -> AppResult<Vec<usize>> {
-    let compiled = compile_group(spec)?;
+    let compiled = compile_group(spec, &|col| doc.column_schema_at(col).cloned())?;
     let mut out = Vec::new();
     doc.visit_rows(0..doc.n_rows(), &mut |i, row| {
         if eval(&compiled, row) {
@@ -70,12 +79,15 @@ pub fn matching_rows(doc: &Document, spec: &FilterGroup) -> AppResult<Vec<usize>
     Ok(out)
 }
 
-fn compile_group(g: &FilterGroup) -> AppResult<Compiled> {
+fn compile_group(
+    g: &FilterGroup,
+    schema_of: &dyn Fn(usize) -> Option<ColumnSchema>,
+) -> AppResult<Compiled> {
     let mut nodes = Vec::with_capacity(g.nodes.len());
     for node in &g.nodes {
         nodes.push(match node {
-            FilterNode::Condition(c) => compile_condition(c)?,
-            FilterNode::Group(sub) => compile_group(sub)?,
+            FilterNode::Condition(c) => compile_condition(c, schema_of)?,
+            FilterNode::Group(sub) => compile_group(sub, schema_of)?,
         });
     }
     Ok(Compiled::Group {
@@ -84,7 +96,36 @@ fn compile_group(g: &FilterGroup) -> AppResult<Compiled> {
     })
 }
 
-fn compile_condition(c: &FilterCondition) -> AppResult<Compiled> {
+/// Compile a range condition (`> >= < <=`): typed against the column's
+/// declared schema when it has an orderable type, the f64 heuristic
+/// otherwise.
+fn compile_range(
+    c: &FilterCondition,
+    op: NumOp,
+    schema_of: &dyn Fn(usize) -> Option<ColumnSchema>,
+) -> AppResult<Test> {
+    if let Some(schema) = schema_of(c.column) {
+        if schema.logical_type.is_numeric() || schema.logical_type.is_temporal() {
+            let trimmed = c.value.trim();
+            if trimmed.is_empty() {
+                return Err(AppError::invalid("the comparison needs a value"));
+            }
+            let target = schema::parse_typed(trimmed, &schema).map_err(|reason| {
+                AppError::invalid(format!(
+                    "'{}' is not valid for this column's declared type: {reason}",
+                    c.value
+                ))
+            })?;
+            return Ok(Test::Typed(Box::new((schema, op, target))));
+        }
+    }
+    Ok(Test::Num(op, parse_num(&c.value)?))
+}
+
+fn compile_condition(
+    c: &FilterCondition,
+    schema_of: &dyn Fn(usize) -> Option<ColumnSchema>,
+) -> AppResult<Compiled> {
     let cs = c.case_sensitive;
     let v = norm(&c.value, cs);
     let test = match c.op {
@@ -96,10 +137,10 @@ fn compile_condition(c: &FilterCondition) -> AppResult<Compiled> {
         FilterOp::EndsWith => Test::EndsWith(v, cs),
         FilterOp::IsEmpty => Test::IsEmpty,
         FilterOp::NotEmpty => Test::NotEmpty,
-        FilterOp::Gt => Test::Num(NumOp::Gt, parse_num(&c.value)?),
-        FilterOp::Gte => Test::Num(NumOp::Gte, parse_num(&c.value)?),
-        FilterOp::Lt => Test::Num(NumOp::Lt, parse_num(&c.value)?),
-        FilterOp::Lte => Test::Num(NumOp::Lte, parse_num(&c.value)?),
+        FilterOp::Gt => compile_range(c, NumOp::Gt, schema_of)?,
+        FilterOp::Gte => compile_range(c, NumOp::Gte, schema_of)?,
+        FilterOp::Lt => compile_range(c, NumOp::Lt, schema_of)?,
+        FilterOp::Lte => compile_range(c, NumOp::Lte, schema_of)?,
         FilterOp::Regex => {
             let re = RegexBuilder::new(&c.value)
                 .case_insensitive(!cs)
@@ -153,6 +194,22 @@ fn eval_test(test: &Test, cell: &str) -> bool {
             // A non-numeric cell never satisfies a numeric comparison.
             None => false,
         },
+        Test::Typed(boxed) => {
+            let (schema, op, target) = boxed.as_ref();
+            match schema::classify(Some(cell), schema) {
+                CellState::Valid(v) => {
+                    let ord = schema::compare_typed(&v, target);
+                    match op {
+                        NumOp::Gt => ord == Ordering::Greater,
+                        NumOp::Gte => ord != Ordering::Less,
+                        NumOp::Lt => ord == Ordering::Less,
+                        NumOp::Lte => ord != Ordering::Greater,
+                    }
+                }
+                // Null-ish and invalid cells never satisfy a range test.
+                _ => false,
+            }
+        }
         Test::Equals(v, cs) => &norm(cell, *cs) == v,
         Test::NotEquals(v, cs) => &norm(cell, *cs) != v,
         Test::Contains(v, cs) => norm(cell, *cs).contains(v.as_str()),
@@ -279,6 +336,80 @@ mod tests {
         let abs = d.display_to_abs(0).unwrap();
         let rows = d.fetch_rows(&[abs]).unwrap();
         assert_eq!(rows[0][1], "line1\nline2");
+    }
+
+    // ----- typed range filters under a declared schema (F31) ----------------
+
+    fn declare_with(
+        d: &mut Document,
+        col: usize,
+        lt: crate::schema::LogicalType,
+        f: impl FnOnce(&mut crate::schema::ColumnSchema),
+    ) {
+        let mut schema = crate::schema::ColumnSchema::new(
+            d.column_ids()[col].clone(),
+            d.headers()[col].clone(),
+            lt,
+        );
+        f(&mut schema);
+        d.set_column_schema(schema);
+    }
+
+    #[test]
+    fn declared_locale_decimal_gt_compares_numerically() {
+        // de-DE decimals: "1.234,5" is 1234.5. The f64 heuristic cannot read
+        // them at all; the declared type must. (Values quoted — comma is the
+        // CSV delimiter.)
+        let mut d = doc("amount,who\n\"1.234,5\",a\n\"999,5\",b\nabc,c\n");
+        declare_with(&mut d, 0, crate::schema::LogicalType::Decimal, |s| {
+            s.locale = Some("de-DE".to_string());
+        });
+        let g = group(Conjunction::And, vec![cond(0, FilterOp::Gt, "1000")]);
+        // Only 1234,5 exceeds 1000; "abc" (invalid) never matches.
+        assert_eq!(matching_rows(&d, &g).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn declared_date_range_compares_chronologically() {
+        let mut d = doc("when\n31.12.2023\n02.01.2024\n");
+        declare_with(&mut d, 0, crate::schema::LogicalType::Date, |s| {
+            s.input_formats = Some(vec!["%d.%m.%Y".to_string()]);
+        });
+        // Lexicographically "31.12.2023" > "02.01.2024"; chronologically not.
+        let g = group(Conjunction::And, vec![cond(0, FilterOp::Lt, "01.01.2024")]);
+        assert_eq!(matching_rows(&d, &g).unwrap(), vec![0]);
+        // A comparison value the declared type cannot parse errors up front.
+        let bad = group(Conjunction::And, vec![cond(0, FilterOp::Lt, "not-a-date")]);
+        assert!(matching_rows(&d, &bad).is_err());
+    }
+
+    #[test]
+    fn null_token_and_empty_stay_distinguishable_in_filters() {
+        // Second column keeps the empty-cell row from being an empty line
+        // (which the parser would skip entirely).
+        let mut d = doc("n,k\n1,a\nNULL,b\n,c\n2,d\n");
+        declare_with(&mut d, 0, crate::schema::LogicalType::Integer, |s| {
+            s.null_tokens = vec!["NULL".to_string()];
+        });
+        // IsEmpty matches ONLY the genuinely empty cell, never the token…
+        let empty = group(Conjunction::And, vec![cond(0, FilterOp::IsEmpty, "")]);
+        assert_eq!(matching_rows(&d, &empty).unwrap(), vec![2]);
+        // …the token is still addressable as text…
+        let token = group(Conjunction::And, vec![cond(0, FilterOp::Equals, "NULL")]);
+        assert_eq!(matching_rows(&d, &token).unwrap(), vec![1]);
+        // …and neither satisfies a typed range test.
+        let range = group(Conjunction::And, vec![cond(0, FilterOp::Gte, "0")]);
+        assert_eq!(matching_rows(&d, &range).unwrap(), vec![0, 3]);
+    }
+
+    #[test]
+    fn declared_text_column_keeps_heuristic_numeric_filter() {
+        // A ZIP-like column declared text: range filters fall back to the
+        // f64 heuristic instead of erroring, matching pre-schema behavior.
+        let mut d = doc("zip\n00501\n10001\n");
+        declare_with(&mut d, 0, crate::schema::LogicalType::Text, |_| {});
+        let g = group(Conjunction::And, vec![cond(0, FilterOp::Gt, "5000")]);
+        assert_eq!(matching_rows(&d, &g).unwrap(), vec![1]);
     }
 
     #[test]

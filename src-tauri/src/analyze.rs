@@ -26,12 +26,12 @@ pub fn is_bool(cell: &str) -> bool {
 /// Date formats recognised for type detection. Both US (M/D/Y) and
 /// international (D/M/Y) slash orders are accepted; for a type badge the exact
 /// order is immaterial, and chrono rejects impossible dates either way.
-const DATE_FORMATS: &[&str] = &[
+pub(crate) const DATE_FORMATS: &[&str] = &[
     "%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y.%m.%d",
 ];
 
 /// Date-time formats recognised in addition to plain dates.
-const DATETIME_FORMATS: &[&str] = &[
+pub(crate) const DATETIME_FORMATS: &[&str] = &[
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%d %H:%M",
     "%Y/%m/%d %H:%M:%S",

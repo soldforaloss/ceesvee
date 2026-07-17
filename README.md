@@ -63,6 +63,10 @@ and faithful on large, real-world delimited files.**
 **Editing**
 
 - Inline cell editing with Excel-like keyboard navigation.
+- **Typed edit validation** — when a column has a declared schema, cell
+  edits are checked against its logical type: strict mode blocks an
+  invalid edit with an inline reason, advisory mode accepts it and records
+  a retrievable issue.
 - **Multiline / raw cell editor** (`F2`) with an Escaped view that reveals
   newlines, tabs, and invisible characters — safe to inspect and copy.
 - Insert / delete / reorder rows; insert / delete / rename / reorder columns.
@@ -135,6 +139,20 @@ and faithful on large, real-world delimited files.**
   counts, filter to valid or invalid rows, and run previewed, undoable
   quick actions (normalize, percent→decimal, extract URL host / email
   domain). Overrides persist in file profiles.
+- **Explicit schemas & typed columns** — declare a logical type per column
+  (text, integer, decimal, float, boolean, date, datetime, UUID, JSON) as
+  a layer over the raw text that never rewrites a cell, so a ZIP column
+  declared text keeps its leading zeroes. Cells resolve to five
+  distinguishable states (missing field, null token, empty, valid,
+  invalid); parsing is locale- and timezone-aware with custom input
+  formats, and a display format changes only how a cell is shown. Infer a
+  schema from the data, edit it per column (nullability, null tokens,
+  locale, time zone, formats, advisory/strict validation), and import /
+  export it as versioned JSON. Sorting, filtering, profiling, joins,
+  group-by, and validation all prefer the declared type, and a canonical
+  conversion applies as one previewed, undoable step. Schemas key columns
+  by stable IDs so they survive renames and reorders; a violet header
+  badge marks a declared type.
 - **Cross-column validation** — relational rules between columns (typed
   comparisons, date order, conditional required, sum equality with
   tolerance, allowed combinations, …) with violation samples, jump-to-row,

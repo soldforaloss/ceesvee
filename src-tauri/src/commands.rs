@@ -23,10 +23,10 @@ use crate::diagnostics::{self, DiagnosticsCache, DiagnosticsReport};
 use crate::dialect::{self, CsvDialectOptions, DialectPreview};
 use crate::document::{ChangeSummary, Document};
 use crate::dto::{
-    CellRect, ColumnSummary, DocumentMeta, EncodingCompatibility, EncodingIncompatibility,
-    ExportOptions, ExportScope, ExternalChange, FileFingerprint, FilterGroup, FindMatch,
-    FindOptions, IndexedOpenStart, OpenOptions, ReparsePreview, ReplaceResult, RowsResponse,
-    ScopeCounts, SelectionStats, SortKey, SplitOptions,
+    BackupPolicy, CellRect, ColumnSummary, DocumentMeta, EncodingCompatibility,
+    EncodingIncompatibility, ExportOptions, ExportScope, ExternalChange, FileFingerprint,
+    FilterGroup, FindMatch, FindOptions, IndexedOpenStart, OpenOptions, ReparsePreview,
+    ReplaceResult, RowsResponse, ScopeCounts, SelectionStats, SortKey, SplitOptions,
 };
 use crate::error::{AppError, AppResult};
 use crate::follow::{self, FollowRegistry};
@@ -45,6 +45,11 @@ use crate::recipe::{self, BatchOptions, BatchReport, RecipeCache};
 use crate::reopen::{self, CurrentInterpretation};
 use crate::repair::{self, RepairPreview, RepairSpec};
 use crate::reshape::{self, ReshapePreview, ReshapeSpec};
+use crate::schema::{ColumnSchema, DocumentSchema, SchemaIssue};
+use crate::schema_ops::{
+    self, CellEditValidation, ConvertPreview, InvalidSampleReport, SchemaImportOutcome, SchemaInfo,
+    SchemaScanCache,
+};
 use crate::semantic::{
     self, SemanticAction, SemanticActionPreview, SemanticCache, SemanticReport, SemanticType,
 };
@@ -574,6 +579,9 @@ pub async fn start_reindex(
             // old incarnation can never accidentally match the new one.
             fresh.set_revision(doc.revision() + 1);
             fresh.set_fingerprint(fingerprint);
+            // Schema entries key on stable IDs, which restart positionally on
+            // a reload — they re-attach to the same columns (F31).
+            fresh.inherit_schema(&doc);
             *doc = fresh;
             Ok(())
         })
@@ -655,6 +663,9 @@ pub async fn apply_reparse(
         // incarnation can never accidentally match the new one.
         fresh.set_revision(doc.revision() + 1);
         fresh.set_fingerprint(fingerprint);
+        // Schema entries key on stable IDs, which restart positionally on a
+        // reparse — they re-attach to the same columns (F31).
+        fresh.inherit_schema(doc);
         // Journaling continues against the NEW interpretation.
         attach_journal_if_enabled(&app, &mut fresh);
         let meta = fresh.meta();
@@ -892,6 +903,7 @@ pub fn close_document(
     state: Db<'_>,
     diagnostics_cache: State<'_, DiagnosticsCache>,
     profile_cache: State<'_, ProfileCache>,
+    schema_scan_cache: State<'_, SchemaScanCache>,
     dedup_cache: State<'_, DedupCache>,
     compare_cache: State<'_, CompareCache>,
     cluster_cache: State<'_, ClusterCache>,
@@ -916,6 +928,7 @@ pub fn close_document(
     lock(&state)?.remove(doc_id);
     diagnostics_cache.remove(doc_id);
     profile_cache.remove_doc(doc_id);
+    schema_scan_cache.remove_doc(doc_id);
     dedup_cache.remove(doc_id);
     compare_cache.remove_doc(doc_id);
     cluster_cache.remove(doc_id);
@@ -2699,6 +2712,9 @@ pub fn column_summaries(doc_id: u64, state: Db<'_>) -> AppResult<Vec<ColumnSumma
 
 // ----- cell editing ------------------------------------------------------
 
+/// Cell edits go through F31 schema validation BEFORE the model: a strict
+/// column rejects an invalid value here, an advisory column applies it and
+/// records a retrievable issue.
 #[tauri::command]
 pub fn set_cell(
     doc_id: u64,
@@ -2709,11 +2725,13 @@ pub fn set_cell(
 ) -> AppResult<DocumentMeta> {
     write_doc(&state, doc_id, |doc| {
         let abs = abs_row(doc, row)?;
-        doc.set_cell(abs, col, value)?;
+        schema_ops::apply_validated_cells(doc, vec![(abs, col, value)])?;
         Ok(doc.meta())
     })
 }
 
+/// Batched cell edits; same F31 validation as [`set_cell`] (one strict
+/// violation rejects the whole batch before anything applies).
 #[tauri::command]
 pub fn set_cells(
     doc_id: u64,
@@ -2725,7 +2743,7 @@ pub fn set_cells(
         for (row, col, value) in changes {
             translated.push((abs_row(doc, row)?, col, value));
         }
-        doc.set_cells(translated)?;
+        schema_ops::apply_validated_cells(doc, translated)?;
         Ok(doc.meta())
     })
 }
@@ -3045,6 +3063,321 @@ pub fn redo(doc_id: u64, state: Db<'_>) -> AppResult<DocumentMeta> {
         doc.redo()?;
         Ok(doc.meta())
     })
+}
+
+// ----- explicit schemas and typed columns (F31) ---------------------------
+
+/// The document's explicit schema, entry names refreshed from the CURRENT
+/// headers by stable column ID. `schemaRevision` moves on schema edits; the
+/// document `revision` (and the dirty flag) deliberately does not.
+#[tauri::command]
+pub fn get_schema(doc_id: u64, state: Db<'_>) -> AppResult<SchemaInfo> {
+    read_doc(&state, doc_id, |doc| Ok(schema_ops::schema_info(doc)))
+}
+
+/// The completed inference result for a document, if a `start_infer_schema`
+/// job has finished since the last fetch. Read-once (taken from the cache).
+#[tauri::command]
+pub fn take_inferred_schema(
+    doc_id: u64,
+    schema_scan_cache: State<'_, SchemaScanCache>,
+) -> Option<DocumentSchema> {
+    schema_scan_cache.take_infer(doc_id)
+}
+
+/// Start a schema-inference scan over every column as a cancellable job.
+/// READ-ONLY: nothing is assigned until the user applies entries via
+/// `set_column_schema` or an import. An editable document is scanned in full
+/// (testing every candidate type per cell), so it runs through the job
+/// registry for progress + cancellation like the F26 semantic scan; the
+/// inferred schema is fetched with `take_inferred_schema` once the job ends.
+/// Indexed documents scan a bounded leading sample.
+#[tauri::command]
+pub async fn start_infer_schema(
+    doc_id: u64,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    schema_scan_cache: State<'_, SchemaScanCache>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+    }
+    let sink = schema_scan_cache.infer_sink();
+    let ctx = jobs.begin_for_app(&app, "schemaScan", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            let schema = crate::schema::infer_schema(&doc, Some(ctx))?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, schema);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// Assign or replace ONE column's schema. The entry is validated (time zone,
+/// input formats), the column ID must exist, and the display name is
+/// refreshed from the header (the header is the source of truth). Schema
+/// edits are metadata: not undoable, never dirty the document.
+#[tauri::command]
+pub fn set_column_schema(
+    doc_id: u64,
+    schema: ColumnSchema,
+    state: Db<'_>,
+) -> AppResult<SchemaInfo> {
+    write_doc(&state, doc_id, |doc| {
+        crate::schema::validate_column_schema(&schema)?;
+        let col = schema_ops::column_index(doc, &schema.column_id)?;
+        let mut schema = schema;
+        schema.name = doc.headers()[col].clone();
+        doc.set_column_schema(schema);
+        Ok(schema_ops::schema_info(doc))
+    })
+}
+
+/// Drop one column's schema entry (back to implicit text).
+#[tauri::command]
+pub fn remove_column_schema(
+    doc_id: u64,
+    column_id: String,
+    state: Db<'_>,
+) -> AppResult<SchemaInfo> {
+    write_doc(&state, doc_id, |doc| {
+        doc.remove_column_schema(&column_id);
+        Ok(schema_ops::schema_info(doc))
+    })
+}
+
+/// Export the schema as versioned JSON (atomic write; entries in the
+/// document's current column order, names refreshed from headers).
+#[tauri::command]
+pub async fn export_schema(doc_id: u64, path: String, state: Db<'_>) -> AppResult<()> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let json = {
+            let doc = handle.read().map_err(poisoned)?;
+            let info = schema_ops::schema_info(&doc);
+            crate::schema::export_to_json(&info.schema, doc.column_ids())?
+        };
+        save_mod::atomic_write(Path::new(&path), BackupPolicy::None, |file| {
+            use std::io::Write;
+            file.write_all(json.as_bytes())?;
+            Ok(json.len() as u64)
+        })?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Import a versioned schema JSON file, REPLACING the document's schema.
+/// Entries whose column ID does not exist here are skipped and reported.
+#[tauri::command]
+pub async fn import_schema(
+    doc_id: u64,
+    path: String,
+    state: Db<'_>,
+) -> AppResult<SchemaImportOutcome> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let json = std::fs::read_to_string(&path)?;
+        let imported = crate::schema::import_from_json(&json)?;
+        let mut doc = handle.write().map_err(poisoned)?;
+        schema_ops::import_into(&mut doc, imported)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Pure pre-check for the cell editor: how the declared schema judges a
+/// proposed value (strict paths block on it BEFORE calling `set_cell`).
+/// Records nothing — the apply path is the single recorder of issues.
+#[tauri::command]
+pub fn validate_cell_edit(
+    doc_id: u64,
+    col: usize,
+    value: String,
+    state: Db<'_>,
+) -> AppResult<CellEditValidation> {
+    read_doc(&state, doc_id, |doc| {
+        Ok(schema_ops::check_edit(doc, col, &value))
+    })
+}
+
+/// The advisory-validation issues recorded on the document (bounded,
+/// oldest first).
+#[tauri::command]
+pub fn get_schema_issues(doc_id: u64, state: Db<'_>) -> AppResult<Vec<SchemaIssue>> {
+    read_doc(&state, doc_id, |doc| Ok(doc.schema_issues().to_vec()))
+}
+
+#[tauri::command]
+pub fn clear_schema_issues(doc_id: u64, state: Db<'_>) -> AppResult<()> {
+    write_doc(&state, doc_id, |doc| {
+        doc.clear_schema_issues();
+        Ok(())
+    })
+}
+
+/// The completed invalid-value scan for a document, if a
+/// `start_schema_invalid_samples` job has finished since the last fetch.
+/// Read-once (taken from the cache).
+#[tauri::command]
+pub fn take_schema_invalid_samples(
+    doc_id: u64,
+    schema_scan_cache: State<'_, SchemaScanCache>,
+) -> Option<InvalidSampleReport> {
+    schema_scan_cache.take_invalid(doc_id)
+}
+
+/// Start a bounded invalid-value scan of one column under its declared type
+/// (exact five-state counts + samples) as a cancellable job. A full-column
+/// scan of an editable document is unbounded, so — like `start_column_profile`
+/// — it runs through the job registry for progress + cancellation; the report
+/// is fetched with `take_schema_invalid_samples` once the job ends.
+/// Data-revision-guarded up front so a stale panel request fails cleanly.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn start_schema_invalid_samples(
+    doc_id: u64,
+    column_id: String,
+    max_samples: usize,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    schema_scan_cache: State<'_, SchemaScanCache>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+        // Fail fast on a missing/undeclared column before spawning a job.
+        schema_ops::column_index(&doc, &column_id)?;
+    }
+    let sink = schema_scan_cache.invalid_sink();
+    let ctx = jobs.begin_for_app(&app, "schemaScan", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            let report = schema_ops::invalid_samples(&doc, &column_id, max_samples, Some(ctx))?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, report);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// The completed conversion preview for a document, if a
+/// `start_convert_column_preview` job has finished since the last fetch.
+/// Read-once (taken from the cache).
+#[tauri::command]
+pub fn take_convert_column_preview(
+    doc_id: u64,
+    schema_scan_cache: State<'_, SchemaScanCache>,
+) -> Option<ConvertPreview> {
+    schema_scan_cache.take_preview(doc_id)
+}
+
+/// Start a conversion preview of one column WITHOUT mutating (five-state
+/// counts, how many cells would change, before/after samples, the invalid
+/// cells that would keep their text) as a cancellable job — the same
+/// full-column scan `convert_column_apply` performs, so it gets the same
+/// progress + cancellation. Fetch the preview with `take_convert_column_preview`
+/// once the job ends and hand its `revision` + `schemaRevision` back to
+/// `convert_column_apply`.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn start_convert_column_preview(
+    doc_id: u64,
+    column_id: String,
+    max_samples: usize,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    schema_scan_cache: State<'_, SchemaScanCache>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.ensure_editable()?;
+        doc.check_revision(expected_revision)?;
+        schema_ops::column_index(&doc, &column_id)?;
+    }
+    let sink = schema_scan_cache.preview_sink();
+    let ctx = jobs.begin_for_app(&app, "schemaScan", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            let preview = schema_ops::convert_preview(&doc, &column_id, max_samples, Some(ctx))?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, preview);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// Apply a previewed canonical conversion as ONE undoable operation, as a
+/// job (progress + cancellation; the commit is guarded against BOTH the
+/// preview's data revision and its schema revision). Invalid cells keep their
+/// original text — the preview already reported their count.
+#[tauri::command]
+pub async fn convert_column_apply(
+    doc_id: u64,
+    column_id: String,
+    expected_revision: u64,
+    expected_schema_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.ensure_editable()?;
+        doc.check_revision(expected_revision)?;
+        doc.check_schema_revision(expected_schema_revision)?;
+    }
+    let ctx = jobs.begin_for_app(&app, "schemaConvert", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let mut doc = handle.write().map_err(poisoned)?;
+            // Editable documents are in-memory; the scan+commit runs under
+            // one write lock so the change list can never go stale between
+            // computing and committing.
+            schema_ops::apply_conversion(
+                &mut doc,
+                &column_id,
+                expected_revision,
+                expected_schema_revision,
+                Some(ctx),
+            )?;
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
 }
 
 // ----- save / export -------------------------------------------------------

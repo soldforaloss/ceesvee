@@ -40,6 +40,11 @@ mod reopen;
 mod repair;
 mod reshape;
 mod save;
+/// Public like [`job`]: the F31 schema core (logical types, classification,
+/// typed parsing, inference, import/export) is a stable internal API consumed
+/// by later feature stages and the test harness.
+pub mod schema;
+mod schema_ops;
 mod semantic;
 mod settings;
 mod sort;
@@ -104,6 +109,7 @@ pub fn run() {
         .manage(JobRegistry::default())
         .manage(DiagnosticsCache::default())
         .manage(ProfileCache::default())
+        .manage(crate::schema_ops::SchemaScanCache::default())
         .manage(DedupCache::default())
         .manage(CompareCache::default())
         .manage(crate::archive::ArchiveCache::default())
@@ -182,6 +188,21 @@ pub fn run() {
             commands::replace_all,
             commands::undo,
             commands::redo,
+            commands::get_schema,
+            commands::start_infer_schema,
+            commands::take_inferred_schema,
+            commands::set_column_schema,
+            commands::remove_column_schema,
+            commands::export_schema,
+            commands::import_schema,
+            commands::validate_cell_edit,
+            commands::get_schema_issues,
+            commands::clear_schema_issues,
+            commands::start_schema_invalid_samples,
+            commands::take_schema_invalid_samples,
+            commands::start_convert_column_preview,
+            commands::take_convert_column_preview,
+            commands::convert_column_apply,
             commands::check_encoding_compatibility,
             commands::export_scope_counts,
             commands::start_save,

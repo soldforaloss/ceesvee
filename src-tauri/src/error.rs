@@ -35,6 +35,13 @@ pub enum AppError {
     #[error("stale revision: the document changed since this operation was prepared (expected revision {expected}, document is at {actual})")]
     StaleRevision { expected: u64, actual: u64 },
 
+    /// A schema-dependent deferred operation (conversion preview/apply,
+    /// invalid-value scan) was prepared against an older schema revision. The
+    /// document data may be unchanged, but the declared type/locale/null-token
+    /// set moved, so the prepared result must be discarded (F31).
+    #[error("stale schema: the column schema changed since this operation was prepared (expected schema revision {expected}, document is at {actual})")]
+    StaleSchemaRevision { expected: u64, actual: u64 },
+
     /// A mutation was attempted on a document opened in indexed read-only
     /// mode (F10). Convert it to editable first.
     #[error(

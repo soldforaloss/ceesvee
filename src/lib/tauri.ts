@@ -80,6 +80,14 @@ import type {
   TransformPreview,
   TransformSpec,
   ZipEntryInfo,
+  CellEditValidation,
+  ColumnSchema,
+  ConvertPreview,
+  DocumentSchema,
+  InvalidSampleReport,
+  SchemaImportOutcome,
+  SchemaInfo,
+  SchemaIssue,
 } from "../types";
 
 export const openFile = (path: string, options?: OpenOptions) =>
@@ -475,6 +483,111 @@ export const applyCrossvalFilter = (
     rules,
     rule,
     expectedRevision,
+  });
+
+// ----- explicit schemas and typed columns (F31) ----------------------------
+
+/** The document's explicit schema, names refreshed from headers by ID (F31). */
+export const getSchema = (docId: number) => invoke<SchemaInfo>("get_schema", { docId });
+
+/**
+ * Start a schema-inference scan over every column as a cancellable job (F31).
+ * Read-only; nothing is assigned. Returns the job id; fetch the inferred
+ * schema with `takeInferredSchema` once the job finishes.
+ */
+export const startInferSchema = (docId: number, expectedRevision: number) =>
+  invoke<number>("start_infer_schema", { docId, expectedRevision });
+
+/** The completed inference result for a finished `startInferSchema` job (F31). */
+export const takeInferredSchema = (docId: number) =>
+  invoke<DocumentSchema | null>("take_inferred_schema", { docId });
+
+/** Assign or replace ONE column's schema (metadata: never dirties) (F31). */
+export const setColumnSchema = (docId: number, schema: ColumnSchema) =>
+  invoke<SchemaInfo>("set_column_schema", { docId, schema });
+
+/** Drop one column's schema entry, back to implicit text (F31). */
+export const removeColumnSchema = (docId: number, columnId: string) =>
+  invoke<SchemaInfo>("remove_column_schema", { docId, columnId });
+
+/** Export the schema as versioned JSON (atomic write) (F31). */
+export const exportSchema = (docId: number, path: string) =>
+  invoke<void>("export_schema", { docId, path });
+
+/** Import a versioned schema JSON file, REPLACING the schema (F31). */
+export const importSchema = (docId: number, path: string) =>
+  invoke<SchemaImportOutcome>("import_schema", { docId, path });
+
+/** Pure pre-check: how the declared schema judges a proposed value (F31). */
+export const validateCellEdit = (docId: number, col: number, value: string) =>
+  invoke<CellEditValidation>("validate_cell_edit", { docId, col, value });
+
+/** The advisory-validation issues recorded on the document (F31). */
+export const getSchemaIssues = (docId: number) =>
+  invoke<SchemaIssue[]>("get_schema_issues", { docId });
+
+/** Clear the recorded advisory-validation issues (F31). */
+export const clearSchemaIssues = (docId: number) => invoke<void>("clear_schema_issues", { docId });
+
+/**
+ * Start a bounded invalid-value scan of one column as a cancellable job (F31).
+ * Returns the job id; fetch the report with `takeSchemaInvalidSamples`.
+ */
+export const startSchemaInvalidSamples = (
+  docId: number,
+  columnId: string,
+  maxSamples: number,
+  expectedRevision: number,
+) =>
+  invoke<number>("start_schema_invalid_samples", {
+    docId,
+    columnId,
+    maxSamples,
+    expectedRevision,
+  });
+
+/** The report for a finished `startSchemaInvalidSamples` job (F31). */
+export const takeSchemaInvalidSamples = (docId: number) =>
+  invoke<InvalidSampleReport | null>("take_schema_invalid_samples", { docId });
+
+/**
+ * Start a conversion preview of one column (no mutation) as a cancellable
+ * job (F31). Returns the job id; fetch the preview with
+ * `takeConvertColumnPreview`.
+ */
+export const startConvertColumnPreview = (
+  docId: number,
+  columnId: string,
+  maxSamples: number,
+  expectedRevision: number,
+) =>
+  invoke<number>("start_convert_column_preview", {
+    docId,
+    columnId,
+    maxSamples,
+    expectedRevision,
+  });
+
+/** The preview for a finished `startConvertColumnPreview` job (F31). */
+export const takeConvertColumnPreview = (docId: number) =>
+  invoke<ConvertPreview | null>("take_convert_column_preview", { docId });
+
+/**
+ * Apply a previewed conversion as ONE undoable job (F31). Guarded against both
+ * the data revision AND the schema revision the preview was computed under, so
+ * a schema edit between preview and apply is rejected.
+ */
+export const convertColumnApply = (
+  docId: number,
+  columnId: string,
+  expectedRevision: number,
+  expectedSchemaRevision: number,
+) =>
+  invoke<number>("convert_column_apply", {
+    docId,
+    columnId,
+    expectedRevision,
+    expectedSchemaRevision,
   });
 
 /**

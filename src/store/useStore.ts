@@ -69,6 +69,10 @@ import type {
   TransformErrorPolicy,
   TransformSpec,
   ZipEntryInfo,
+  ColumnSchema,
+  ConvertPreview,
+  InvalidSampleReport,
+  SchemaInfo,
 } from "../types";
 
 export type ThemePref = "light" | "dark" | "system";
@@ -111,6 +115,7 @@ export type ModalName =
   | "pii"
   | "recovery"
   | "dialect"
+  | "schema"
   | "views";
 
 const FILE_FILTERS = [
@@ -487,6 +492,27 @@ const initialOutlier: OutlierState = {
   error: null,
 };
 
+/** A running canonical column-conversion job (F31), for the ACTIVE document. */
+export interface SchemaConvertState {
+  jobId: number;
+  /** The column being converted (stable ID). */
+  columnId: string;
+  processed: number;
+  total: number | null;
+}
+
+/** In-flight cancellable schema-scan job (F31): inference, invalid-value
+ * samples, or a conversion preview — all full-column/full-document scans that
+ * run through the job registry so they report progress and can be cancelled. */
+export interface SchemaScanState {
+  jobId: number;
+  kind: "infer" | "invalid" | "preview";
+  /** The column being scanned (stable ID); null for whole-document inference. */
+  columnId: string | null;
+  processed: number;
+  total: number | null;
+}
+
 /** ZIP entry chooser state (F17). */
 export interface ArchivePickState {
   path: string;
@@ -644,6 +670,14 @@ interface Store {
   crossval: CrossValState;
   /** Outlier-finder state (F30). */
   outlier: OutlierState;
+  /** The ACTIVE document's explicit schema (F31), refreshed on load/edit. */
+  schemaInfo: SchemaInfo | null;
+  /** A running canonical column-conversion job (F31), if any. */
+  schemaConvert: SchemaConvertState | null;
+  /** A running cancellable schema-scan job — infer / invalid / preview (F31). */
+  schemaScan: SchemaScanState | null;
+  /** Physical column the schema dialog should focus on open (F31). */
+  schemaDialogColumn: number | null;
   /** Running derived-document job (F20–F23), if any. */
   derive: DeriveState | null;
   /** Error from the last derive job, for the dialog that started it. */
@@ -842,6 +876,39 @@ interface Store {
   loadCachedOutlierReport: () => Promise<void>;
   /** Filter to the rows holding flagged values. */
   applyOutlierFilter: () => Promise<boolean>;
+
+  // explicit schemas & typed columns (F31)
+  /** Open the schema editor, optionally focused on one physical column. */
+  openSchemaDialog: (col?: number) => void;
+  /** Fetch the active document's schema into the store (badges, formatting). */
+  loadSchema: () => Promise<void>;
+  /** Assign or replace one column's schema (never dirties the document). */
+  setColumnSchema: (schema: ColumnSchema) => Promise<boolean>;
+  /** Drop one column's schema entry (back to implicit text). */
+  removeColumnSchema: (columnId: string) => Promise<void>;
+  /** Infer a schema from the data (cancellable job) and apply every entry. */
+  inferAndApplySchema: () => Promise<boolean>;
+  /** Import a versioned schema JSON file (REPLACES the schema); prompts. */
+  importSchemaFromFile: () => Promise<string | null>;
+  /** Export the schema to a versioned JSON file; prompts for a path. */
+  exportSchemaToFile: () => Promise<void>;
+  /** Scan a column's invalid values as a cancellable job; null on cancel/error. */
+  runSchemaInvalidSamples: (
+    columnId: string,
+    maxSamples: number,
+  ) => Promise<InvalidSampleReport | null>;
+  /** Compute a conversion preview as a cancellable job; null on cancel/error. */
+  runSchemaConvertPreview: (columnId: string, maxSamples: number) => Promise<ConvertPreview | null>;
+  /** Cancel the in-flight schema scan (infer / invalid / preview), if any. */
+  cancelSchemaScan: () => Promise<void>;
+  /** Apply a previewed canonical conversion as ONE undo step (job). Guarded
+   * against both the preview's data revision and its schema revision. */
+  applyColumnConversion: (
+    columnId: string,
+    expectedRevision: number,
+    expectedSchemaRevision: number,
+  ) => Promise<boolean>;
+  cancelColumnConversion: () => Promise<void>;
 
   // compressed files (F17)
   /** Start extracting an archive (gzip member or chosen ZIP entry). */
@@ -1098,6 +1165,11 @@ export const useStore = create<Store>((set, get) => {
       crossval: initialCrossVal,
       outlier: initialOutlier,
       pii: initialPii,
+      // F31: the schema is per-document; the Grid reloads it for the new tab.
+      schemaInfo: null,
+      schemaConvert: null,
+      schemaScan: null,
+      schemaDialogColumn: null,
     };
   };
 
@@ -1525,6 +1597,10 @@ export const useStore = create<Store>((set, get) => {
     semantic: initialSemantic,
     crossval: initialCrossVal,
     outlier: initialOutlier,
+    schemaInfo: null,
+    schemaConvert: null,
+    schemaScan: null,
+    schemaDialogColumn: null,
     derive: null,
     deriveError: null,
     batch: null,
@@ -2510,6 +2586,222 @@ export const useStore = create<Store>((set, get) => {
       }
     },
 
+    // ----- explicit schemas & typed columns (F31) --------------------------------
+
+    openSchemaDialog: (col) => set({ schemaDialogColumn: col ?? null, activeModal: "schema" }),
+
+    loadSchema: async () => {
+      const meta = activeMeta();
+      if (!meta) {
+        set({ schemaInfo: null });
+        return;
+      }
+      try {
+        const info = await api.getSchema(meta.id);
+        // A tab switch may have landed during the await; don't cross-install.
+        if (get().activeId === meta.id) set({ schemaInfo: info });
+      } catch {
+        // A schema fetch failure is non-fatal: badges/formatting stay off.
+      }
+    },
+
+    setColumnSchema: async (schema) => {
+      const meta = activeMeta();
+      if (!meta) return false;
+      try {
+        const info = await api.setColumnSchema(meta.id, schema);
+        // Schema edits never dirty the document (metadata only); just refresh
+        // the schema so the grid repaints declared badges + display formats.
+        if (get().activeId === meta.id) set({ schemaInfo: info });
+        // The declared type re-derives any open column profile (typed stats,
+        // inferredKind, null exclusion), which the backend keys on the schema
+        // revision — re-request so the explorer panel repaints, not stale.
+        void get().refreshExplorerProfile();
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    removeColumnSchema: async (columnId) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      try {
+        const info = await api.removeColumnSchema(meta.id, columnId);
+        if (get().activeId === meta.id) set({ schemaInfo: info });
+        void get().refreshExplorerProfile();
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    inferAndApplySchema: async () => {
+      const meta = activeMeta();
+      if (!meta) return false;
+      try {
+        // Inference is a full-document scan (every column, every candidate
+        // type) — run it as a cancellable job, then apply the entries.
+        const jobId = await api.startInferSchema(meta.id, meta.revision);
+        set({ schemaScan: { jobId, kind: "infer", columnId: null, processed: 0, total: null } });
+        consumeEarlyFinish(jobId);
+        const finished = await awaitJob(jobId);
+        set({ schemaScan: null });
+        if (finished.status !== "done") {
+          if (finished.status === "failed") {
+            set({ error: finished.error ?? "schema inference failed" });
+          }
+          return false;
+        }
+        const inferred = await api.takeInferredSchema(meta.id);
+        if (!inferred) return false;
+        // Apply each inferred entry (cheap, non-dirty, non-undoable metadata).
+        for (const entry of Object.values(inferred.columns)) {
+          await api.setColumnSchema(meta.id, entry);
+        }
+        const info = await api.getSchema(meta.id);
+        if (get().activeId === meta.id) set({ schemaInfo: info });
+        void get().refreshExplorerProfile();
+        return true;
+      } catch (e) {
+        set({ schemaScan: null, error: String(e) });
+        return false;
+      }
+    },
+
+    importSchemaFromFile: async () => {
+      const meta = activeMeta();
+      if (!meta) return null;
+      const chosen = await openFileDialog({
+        filters: [{ name: "Schema JSON", extensions: ["json"] }],
+      });
+      if (typeof chosen !== "string") return null;
+      try {
+        const outcome = await api.importSchema(meta.id, chosen);
+        if (get().activeId === meta.id) set({ schemaInfo: outcome.info });
+        const applied = `Applied ${outcome.applied} column schema${outcome.applied === 1 ? "" : "s"}`;
+        return outcome.skippedUnknown.length > 0
+          ? `${applied}; skipped ${outcome.skippedUnknown.length} entr${
+              outcome.skippedUnknown.length === 1 ? "y" : "ies"
+            } for columns not in this document.`
+          : `${applied}.`;
+      } catch (e) {
+        set({ error: String(e) });
+        return null;
+      }
+    },
+
+    exportSchemaToFile: async () => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const base = (meta.fileName || "schema").replace(/\.[^.]+$/, "");
+      const chosen = await saveFileDialog({
+        defaultPath: `${base}.schema.json`,
+        filters: [{ name: "Schema JSON", extensions: ["json"] }],
+      });
+      if (!chosen) return;
+      try {
+        await api.exportSchema(meta.id, chosen);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    runSchemaInvalidSamples: async (columnId, maxSamples) => {
+      const meta = activeMeta();
+      if (!meta) return null;
+      try {
+        const jobId = await api.startSchemaInvalidSamples(
+          meta.id,
+          columnId,
+          maxSamples,
+          meta.revision,
+        );
+        set({ schemaScan: { jobId, kind: "invalid", columnId, processed: 0, total: null } });
+        consumeEarlyFinish(jobId);
+        const finished = await awaitJob(jobId);
+        set({ schemaScan: null });
+        if (finished.status !== "done") {
+          if (finished.status === "failed") set({ error: finished.error ?? "scan failed" });
+          return null;
+        }
+        const report = await api.takeSchemaInvalidSamples(meta.id);
+        // Defensive: the cache is keyed by document, so verify the report is
+        // for the column we asked about before surfacing it.
+        return report && report.columnId === columnId ? report : null;
+      } catch (e) {
+        set({ schemaScan: null, error: String(e) });
+        return null;
+      }
+    },
+
+    runSchemaConvertPreview: async (columnId, maxSamples) => {
+      const meta = activeMeta();
+      if (!meta) return null;
+      try {
+        const jobId = await api.startConvertColumnPreview(
+          meta.id,
+          columnId,
+          maxSamples,
+          meta.revision,
+        );
+        set({ schemaScan: { jobId, kind: "preview", columnId, processed: 0, total: null } });
+        consumeEarlyFinish(jobId);
+        const finished = await awaitJob(jobId);
+        set({ schemaScan: null });
+        if (finished.status !== "done") {
+          if (finished.status === "failed") set({ error: finished.error ?? "preview failed" });
+          return null;
+        }
+        const preview = await api.takeConvertColumnPreview(meta.id);
+        return preview && preview.columnId === columnId ? preview : null;
+      } catch (e) {
+        set({ schemaScan: null, error: String(e) });
+        return null;
+      }
+    },
+
+    cancelSchemaScan: async () => {
+      const scan = get().schemaScan;
+      if (scan) await api.cancelJob(scan.jobId).catch(() => undefined);
+    },
+
+    applyColumnConversion: async (columnId, expectedRevision, expectedSchemaRevision) => {
+      const meta = activeMeta();
+      if (!meta) return false;
+      try {
+        const jobId = await api.convertColumnApply(
+          meta.id,
+          columnId,
+          expectedRevision,
+          expectedSchemaRevision,
+        );
+        set({ schemaConvert: { jobId, columnId, processed: 0, total: null } });
+        consumeEarlyFinish(jobId);
+        const finished = await awaitJob(jobId);
+        set({ schemaConvert: null });
+        if (finished.status !== "done") {
+          if (finished.status === "failed") {
+            set({ error: finished.error ?? "conversion failed" });
+          }
+          return false;
+        }
+        const updated = await api.getMeta(meta.id);
+        reloadDoc(updated);
+        // The document revision moved; keep the badge/formatting schema fresh.
+        void get().loadSchema();
+        return true;
+      } catch (e) {
+        set({ schemaConvert: null, error: String(e) });
+        return false;
+      }
+    },
+
+    cancelColumnConversion: async () => {
+      const convert = get().schemaConvert;
+      if (convert) await api.cancelJob(convert.jobId).catch(() => undefined);
+    },
+
     // ----- compressed files (F17) --------------------------------------------
 
     startArchiveExtract: async (path, entry, allowLarge) => {
@@ -2613,7 +2905,21 @@ export const useStore = create<Store>((set, get) => {
       return mutate((id) => api.setHeaderMode(id, hasHeader));
     },
 
-    setCell: (row, col, value) => mutate((id) => api.setCell(id, row, col, value), false),
+    setCell: async (row, col, value) => {
+      const id = get().activeId;
+      if (id == null) return;
+      try {
+        const meta = await api.setCell(id, row, col, value);
+        refreshMeta(meta);
+      } catch (e) {
+        // F31 strict mode rejects an invalid edit server-side. An inline grid
+        // edit already wrote the value into the windowed cache optimistically;
+        // invalidate it so the true (unchanged) value repaints instead of the
+        // rejected one lingering. The error toast explains why.
+        set({ error: String(e) });
+        get().invalidateGrid();
+      }
+    },
     pasteBlock: (row, col, block) => mutate((id) => api.paste(id, row, col, block)),
     insertRows: (at, count) => mutate((id) => api.insertRows(id, at, count)),
     deleteRows: (indices) => mutate((id) => api.deleteRows(id, indices)),
@@ -2982,6 +3288,22 @@ export const useStore = create<Store>((set, get) => {
         set((s) => ({
           cluster: { ...s.cluster, processed: progress.processed, total: progress.total },
         }));
+        return;
+      }
+
+      if (progress.kind === "schemaConvert") {
+        const convert = get().schemaConvert;
+        if (convert?.jobId !== progress.jobId) return;
+        set({
+          schemaConvert: { ...convert, processed: progress.processed, total: progress.total },
+        });
+        return;
+      }
+
+      if (progress.kind === "schemaScan") {
+        const scan = get().schemaScan;
+        if (scan?.jobId !== progress.jobId) return;
+        set({ schemaScan: { ...scan, processed: progress.processed, total: progress.total } });
         return;
       }
 

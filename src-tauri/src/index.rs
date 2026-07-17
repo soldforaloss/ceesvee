@@ -75,9 +75,9 @@ struct Scanner {
     /// field-count histogram over all records (small: one entry per distinct
     /// field count).
     histogram: HashMap<usize, usize>,
-    /// First [`RAGGED_SAMPLE_LIMIT`] `(line, fields)` per distinct field
-    /// count, so ragged samples can be reconstructed once the modal count is
-    /// known without retaining every record's shape.
+    /// First [`RAGGED_SAMPLE_LIMIT`] `(line, record index)` per distinct
+    /// field count, so ragged samples can be reconstructed once the modal
+    /// count is known without retaining every record's shape.
     shape_samples: HashMap<usize, Vec<(u64, usize)>>,
 }
 
@@ -105,10 +105,11 @@ impl Scanner {
     fn emit_record(&mut self) {
         let fields = self.record_delims + 1;
         self.offsets.push(self.record_start);
+        let record = self.offsets.len() - 1;
         *self.histogram.entry(fields).or_insert(0) += 1;
         let bucket = self.shape_samples.entry(fields).or_default();
         if bucket.len() < RAGGED_SAMPLE_LIMIT {
-            bucket.push((self.record_line, fields));
+            bucket.push((self.record_line, record));
         }
     }
 
@@ -206,12 +207,17 @@ impl Scanner {
         let total: usize = self.histogram.values().sum();
         let ragged_total = total - self.histogram.get(&modal_field_count).unwrap_or(&0);
 
-        let mut ragged: Vec<(u64, usize)> = self
+        let mut ragged: Vec<(u64, usize, usize)> = self
             .shape_samples
             .into_iter()
             .filter(|&(fields, _)| fields != modal_field_count)
-            .flat_map(|(_, bucket)| bucket)
+            .flat_map(|(fields, bucket)| {
+                bucket
+                    .into_iter()
+                    .map(move |(line, record)| (line, record, fields))
+            })
             .collect();
+        // Record start lines strictly increase, so line order IS record order.
         ragged.sort_unstable();
         ragged.truncate(RAGGED_SAMPLE_LIMIT);
 
@@ -220,7 +226,11 @@ impl Scanner {
             ragged_total,
             ragged_samples: ragged
                 .into_iter()
-                .map(|(line, fields)| RaggedSample { line, fields })
+                .map(|(line, record, fields)| RaggedSample {
+                    record,
+                    line,
+                    fields,
+                })
                 .collect(),
             modal_field_count,
         };
@@ -889,8 +899,16 @@ mod tests {
         assert_eq!(
             indexed.import.ragged_samples,
             vec![
-                RaggedSample { line: 2, fields: 2 },
-                RaggedSample { line: 4, fields: 1 },
+                RaggedSample {
+                    record: 1,
+                    line: 2,
+                    fields: 2
+                },
+                RaggedSample {
+                    record: 3,
+                    line: 4,
+                    fields: 1
+                },
             ]
         );
         drop(indexed);
@@ -904,7 +922,11 @@ mod tests {
         let (indexed, root) = build(src, 4);
         assert_eq!(
             indexed.import.ragged_samples,
-            vec![RaggedSample { line: 4, fields: 1 }]
+            vec![RaggedSample {
+                record: 2,
+                line: 4,
+                fields: 1
+            }]
         );
         drop(indexed);
         let _ = fs::remove_dir_all(root);
