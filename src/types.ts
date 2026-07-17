@@ -1177,6 +1177,10 @@ export interface ColumnProfile {
   scope: ProfileScope;
   /** Document revision this profile was computed against. */
   revision: number;
+  /** Schema revision this profile was computed against (F31): a declared
+   * schema changes classification without moving `revision`, so the cache
+   * keys on both. */
+  schemaRevision: number;
   rowCount: number;
   blankCount: number;
   inferredKind: ColumnKind;
@@ -1433,6 +1437,8 @@ export interface InvalidSampleReport {
   scannedRows: number;
   totalRows: number;
   revision: number;
+  /** Schema revision this scan was computed against (F31). */
+  schemaRevision: number;
 }
 
 /** One before/after pair of a canonical conversion. */
@@ -1453,6 +1459,9 @@ export interface ConvertPreview {
   scannedRows: number;
   /** The revision to hand back to `convert_column_apply`. */
   revision: number;
+  /** The schema revision to hand back to `convert_column_apply` alongside
+   * `revision`, so a schema edit between preview and apply is rejected (F31). */
+  schemaRevision: number;
 }
 
 /** The backend's verdict on one proposed cell edit (F31 pre-check). */

@@ -107,6 +107,11 @@ pub struct ColumnProfile {
     pub scope: ProfileScope,
     /// Document revision this profile was computed against.
     pub revision: u64,
+    /// Schema revision this profile was computed against. A declared schema
+    /// (F31) changes how cells classify — numeric stats, `inferredKind`, null
+    /// exclusion — WITHOUT moving the document revision, so the cache must also
+    /// invalidate when this moves, or it would serve pre-schema statistics.
+    pub schema_revision: u64,
     /// Rows covered by the scope.
     pub row_count: usize,
     pub blank_count: usize,
@@ -375,6 +380,7 @@ pub fn profile_column(
         column,
         scope,
         revision: doc.revision(),
+        schema_revision: doc.schema_revision(),
         row_count: total_rows,
         blank_count: blank,
         inferred_kind,
@@ -503,6 +509,12 @@ pub fn profile_is_valid(doc: &Document, cached: &ColumnProfile) -> bool {
         return false;
     }
     if cached.revision < doc.column_revision(cached.column) {
+        return false;
+    }
+    // A schema declaration/edit changes how the column classifies without
+    // moving the document (or column) revision. Any schema change re-derives
+    // the profile, so drop a cache entry computed against an older schema.
+    if cached.schema_revision != doc.schema_revision() {
         return false;
     }
     if cached.scope == ProfileScope::VisibleRows && cached.revision < doc.filter_revision() {
@@ -667,6 +679,43 @@ mod tests {
         // Editing column B invalidates its profiles.
         d.set_cell(0, 1, "z".into()).unwrap();
         assert!(!profile_is_valid(&d, &profile_b));
+    }
+
+    #[test]
+    fn declaring_a_schema_invalidates_a_cached_profile() {
+        // A heuristic profile is computed and cached first; then the user
+        // declares a schema for that column. The document (and column)
+        // revision has NOT moved — only the schema revision — so the old
+        // per-column check would keep serving stale, pre-schema statistics.
+        let mut d = doc_from("amount\n\"1.234,5\"\n\"0,5\"");
+        let (_r, ctx) = ctx();
+        let cached =
+            profile_column(&d, 0, ProfileScope::All, &ProfileOptions::default(), &ctx).unwrap();
+        assert!(profile_is_valid(&d, &cached));
+
+        declare_with(&mut d, 0, crate::schema::LogicalType::Decimal, |s| {
+            s.locale = Some("de-DE".to_string());
+        });
+        assert_eq!(
+            d.revision(),
+            cached.revision,
+            "schema edits never move revision"
+        );
+        assert!(
+            !profile_is_valid(&d, &cached),
+            "a schema declaration must evict the pre-schema profile"
+        );
+
+        // Editing a DIFFERENT column's schema still evicts (schema_revision is
+        // document-wide); the recomputed profile is valid again.
+        let fresh =
+            profile_column(&d, 0, ProfileScope::All, &ProfileOptions::default(), &ctx).unwrap();
+        assert!(profile_is_valid(&d, &fresh));
+        d.remove_column_schema(&d.column_ids()[0].clone());
+        assert!(
+            !profile_is_valid(&d, &fresh),
+            "removing the schema evicts too"
+        );
     }
 
     #[test]

@@ -7,7 +7,6 @@ import {
   isNumericType,
   isTemporalType,
 } from "../lib/schema";
-import * as api from "../lib/tauri";
 import { useActiveMeta, useStore } from "../store/useStore";
 import type {
   ColumnSchema,
@@ -31,6 +30,7 @@ export function SchemaDialog({ onClose }: { onClose: () => void }) {
   const meta = useActiveMeta();
   const schemaInfo = useStore((s) => s.schemaInfo);
   const schemaConvert = useStore((s) => s.schemaConvert);
+  const schemaScan = useStore((s) => s.schemaScan);
   const focusColumn = useStore((s) => s.schemaDialogColumn);
   const loadSchema = useStore((s) => s.loadSchema);
   const setColumnSchema = useStore((s) => s.setColumnSchema);
@@ -38,6 +38,9 @@ export function SchemaDialog({ onClose }: { onClose: () => void }) {
   const inferAndApply = useStore((s) => s.inferAndApplySchema);
   const importSchema = useStore((s) => s.importSchemaFromFile);
   const exportSchema = useStore((s) => s.exportSchemaToFile);
+  const runInvalidSamples = useStore((s) => s.runSchemaInvalidSamples);
+  const runConvertPreview = useStore((s) => s.runSchemaConvertPreview);
+  const cancelScan = useStore((s) => s.cancelSchemaScan);
   const applyConversion = useStore((s) => s.applyColumnConversion);
   const cancelConversion = useStore((s) => s.cancelColumnConversion);
 
@@ -53,10 +56,12 @@ export function SchemaDialog({ onClose }: { onClose: () => void }) {
   const [working, setWorking] = useState(false);
   const [invalidReport, setInvalidReport] = useState<InvalidSampleReport | null>(null);
   const [preview, setPreview] = useState<ConvertPreview | null>(null);
-  const [scanError, setScanError] = useState<string | null>(null);
 
   const schemaColumns = schemaInfo?.schema.columns ?? null;
   const readOnly = meta?.backing === "indexedReadOnly";
+  // A cancellable scan (infer / invalid-values / preview) is in flight when it
+  // targets nothing (whole-document infer) or this selected column.
+  const scanning = schemaScan !== null;
 
   useEffect(() => {
     void loadSchema();
@@ -92,7 +97,6 @@ export function SchemaDialog({ onClose }: { onClose: () => void }) {
     setFormatInput("");
     setInvalidReport(null);
     setPreview(null);
-    setScanError(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, selectedId, storedKey, meta?.id]);
 
@@ -146,37 +150,25 @@ export function SchemaDialog({ onClose }: { onClose: () => void }) {
 
   const scanInvalid = async () => {
     if (!selectedId || !declared) return;
-    setScanError(null);
     setInvalidReport(null);
-    setWorking(true);
-    try {
-      const report = await api.schemaInvalidSamples(meta.id, selectedId, 500, meta.revision);
-      setInvalidReport(report);
-    } catch (e) {
-      setScanError(String(e));
-    } finally {
-      setWorking(false);
-    }
+    // Runs as a cancellable job in the store; failures surface as a global
+    // error, cancellation returns null silently.
+    const report = await runInvalidSamples(selectedId, 500);
+    if (report) setInvalidReport(report);
   };
 
   const runPreview = async () => {
     if (!selectedId || !declared) return;
-    setScanError(null);
     setPreview(null);
-    setWorking(true);
-    try {
-      const p = await api.convertColumnPreview(meta.id, selectedId, 20, meta.revision);
-      setPreview(p);
-    } catch (e) {
-      setScanError(String(e));
-    } finally {
-      setWorking(false);
-    }
+    const p = await runConvertPreview(selectedId, 20);
+    if (p) setPreview(p);
   };
 
   const runConvert = async () => {
     if (!selectedId || !preview) return;
-    const ok = await applyConversion(selectedId, preview.revision);
+    // Hand back BOTH revisions the preview was computed against so a schema
+    // edit (or a data edit) since then is rejected before any cell changes.
+    const ok = await applyConversion(selectedId, preview.revision, preview.schemaRevision);
     if (ok) {
       setPreview(null);
       setInvalidReport(null);
@@ -205,15 +197,34 @@ export function SchemaDialog({ onClose }: { onClose: () => void }) {
     >
       <div className="space-y-3 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <button onClick={() => void runInfer()} disabled={working} className={btnPrimary}>
+          <button
+            onClick={() => void runInfer()}
+            disabled={working || scanning}
+            className={btnPrimary}
+          >
             Infer schema
           </button>
-          <button onClick={() => void runImport()} disabled={working} className={btnOutline}>
+          {scanning && schemaScan.kind === "infer" && (
+            <span className="flex items-center gap-2 text-[11px] text-zinc-500">
+              Inferring… {schemaScan.processed.toLocaleString()}
+              {schemaScan.total != null && ` / ${schemaScan.total.toLocaleString()}`}
+              <button onClick={() => void cancelScan()} className={btnDanger}>
+                Cancel
+              </button>
+            </span>
+          )}
+          <button
+            onClick={() => void runImport()}
+            disabled={working || scanning}
+            className={btnOutline}
+          >
             Import…
           </button>
           <button
             onClick={() => void exportSchema()}
-            disabled={working || !schemaColumns || Object.keys(schemaColumns).length === 0}
+            disabled={
+              working || scanning || !schemaColumns || Object.keys(schemaColumns).length === 0
+            }
             className={btnOutline}
           >
             Export…
@@ -280,7 +291,11 @@ export function SchemaDialog({ onClose }: { onClose: () => void }) {
                   {draft.name || `Column ${selected + 1}`}
                 </h3>
                 {declared && (
-                  <button onClick={() => void remove()} disabled={working} className={btnDanger}>
+                  <button
+                    onClick={() => void remove()}
+                    disabled={working || scanning}
+                    className={btnDanger}
+                  >
                     Remove schema
                   </button>
                 )}
@@ -465,7 +480,7 @@ export function SchemaDialog({ onClose }: { onClose: () => void }) {
               <div className="flex items-center gap-2 pt-1">
                 <button
                   onClick={() => void apply()}
-                  disabled={working || !isDirty}
+                  disabled={working || scanning || !isDirty}
                   className={btnPrimary}
                 >
                   {declared ? "Apply changes" : "Declare column"}
@@ -478,7 +493,7 @@ export function SchemaDialog({ onClose }: { onClose: () => void }) {
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => void scanInvalid()}
-                    disabled={working || !declared || isDirty}
+                    disabled={working || scanning || !declared || isDirty}
                     title={
                       !declared
                         ? "Declare a type first"
@@ -493,7 +508,7 @@ export function SchemaDialog({ onClose }: { onClose: () => void }) {
                   {!readOnly && (
                     <button
                       onClick={() => void runPreview()}
-                      disabled={working || !declared || isDirty || converting}
+                      disabled={working || scanning || !declared || isDirty || converting}
                       title={
                         !declared
                           ? "Declare a type first"
@@ -506,11 +521,17 @@ export function SchemaDialog({ onClose }: { onClose: () => void }) {
                       Preview conversion…
                     </button>
                   )}
+                  {scanning && schemaScan.kind !== "infer" && (
+                    <span className="flex items-center gap-2 text-[11px] text-zinc-500">
+                      {schemaScan.kind === "preview" ? "Previewing…" : "Scanning…"}{" "}
+                      {schemaScan.processed.toLocaleString()}
+                      {schemaScan.total != null && ` / ${schemaScan.total.toLocaleString()}`}
+                      <button onClick={() => void cancelScan()} className={btnDanger}>
+                        Cancel
+                      </button>
+                    </span>
+                  )}
                 </div>
-
-                {scanError && (
-                  <p className="mt-2 text-xs text-red-600 dark:text-red-400">{scanError}</p>
-                )}
 
                 {invalidReport && (
                   <div className="mt-2 space-y-1.5 rounded bg-zinc-50 p-2 text-xs dark:bg-zinc-900">

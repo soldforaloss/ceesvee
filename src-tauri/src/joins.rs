@@ -84,22 +84,39 @@ fn default_suffix() -> String {
 /// forms from colliding with ordinary text that happens to look the same.
 /// When the key column has a DECLARED schema (F31), numeric and date
 /// equivalence parse under the declared type — so a locale decimal `1,5` on
-/// one side matches `1.5` on the other — and fall back to the heuristics for
-/// values the schema rejects.
+/// one side matches `1.5` on the other. A value the declared type REJECTS is
+/// keyed as plain text, never reinterpreted through the untyped heuristic: a
+/// schema-invalid cell must not silently join under a different convention
+/// (this matches how `filter.rs` and `schema::compare_cells` exclude Invalid
+/// rather than re-reading it). Blank/null-token values are handled by
+/// `row_key` before this is called, so a schema-typed value here is either
+/// Valid or Invalid — never null-ish.
 fn key_component(norm: &JoinNormalization, value: &str, schema: Option<&ColumnSchema>) -> String {
     let base = if norm.trim { value.trim() } else { value };
+    let text_key = || {
+        let text = if norm.case_insensitive {
+            base.to_lowercase()
+        } else {
+            base.to_string()
+        };
+        format!("t:{text}")
+    };
     if let Some(s) = schema {
         if norm.numeric_equal && s.logical_type.is_numeric() {
             // The f64 canonical form matches the heuristic side's, so typed
-            // and untyped documents still join.
-            if let crate::schema::NumericCell::Value(n) = crate::schema::numeric_cell(s, base) {
-                return format!("n:{n}");
-            }
+            // and untyped documents still join on VALID values; an invalid
+            // value keys as text (excluded from numeric equivalence) rather
+            // than being re-parsed under the generic heuristic.
+            return match crate::schema::numeric_cell(s, base) {
+                crate::schema::NumericCell::Value(n) => format!("n:{n}"),
+                _ => text_key(),
+            };
         }
         if norm.date_equal && s.logical_type.is_temporal() {
-            if let Some(d) = crate::schema::temporal_cell(s, base) {
-                return format!("d:{d}");
-            }
+            return match crate::schema::temporal_cell(s, base) {
+                Some(d) => format!("d:{d}"),
+                None => text_key(),
+            };
         }
     }
     if norm.numeric_equal {
@@ -112,12 +129,7 @@ fn key_component(norm: &JoinNormalization, value: &str, schema: Option<&ColumnSc
             return format!("d:{d}");
         }
     }
-    let text = if norm.case_insensitive {
-        base.to_lowercase()
-    } else {
-        base.to_string()
-    };
-    format!("t:{text}")
+    text_key()
 }
 
 /// The full key for one row; `None` = "never matches" (blank component
@@ -687,6 +699,28 @@ mod tests {
         let out = run_join(&left, &right, &s).unwrap();
         assert_eq!(out.n_rows(), 1);
         assert_eq!(out.rows()[0][0], "1,5", "source text is never rewritten");
+    }
+
+    #[test]
+    fn schema_invalid_key_is_not_reinterpreted_by_the_heuristic() {
+        // Left declares Decimal de-DE; "1.23" is INVALID there (a group must
+        // be exactly three digits). The right side is a plain "1.23". The
+        // invalid left value must NOT be re-parsed by the generic heuristic
+        // into n:1.23 and silently join the untyped 1.23 — it keys as text.
+        let mut left = doc("amount,who\n1.23,ann\n2,bob\n");
+        let right = doc("amount,tag\n1.23,x\n2,y\n");
+        declare_with(&mut left, 0, crate::schema::LogicalType::Decimal, |s| {
+            s.locale = Some("de-DE".to_string());
+        });
+        let mut s = spec(JoinType::Inner);
+        s.normalization.numeric_equal = true;
+        let p = preview(&left, &right, &s).unwrap();
+        // Only the valid "2" ↔ "2" pair matches; the schema-invalid "1.23"
+        // keys as text "t:1.23" and never meets the right's numeric key.
+        assert_eq!(
+            p.matched_pairs, 1,
+            "the de-DE-invalid 1.23 must not join through the untyped heuristic"
+        );
     }
 
     #[test]

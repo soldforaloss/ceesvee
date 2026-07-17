@@ -868,6 +868,22 @@ impl Document {
         }
     }
 
+    /// Guard a schema-dependent deferred operation (F31): fail with
+    /// [`AppError::StaleSchemaRevision`] when the schema has changed since
+    /// `expected` was captured. The document `revision` and this schema
+    /// revision move independently, so an operation whose result depends on
+    /// the declared schema (conversion, invalid scan) must guard against BOTH.
+    pub fn check_schema_revision(&self, expected: u64) -> AppResult<()> {
+        if self.schema_revision == expected {
+            Ok(())
+        } else {
+            Err(AppError::StaleSchemaRevision {
+                expected,
+                actual: self.schema_revision,
+            })
+        }
+    }
+
     // ----- row view (filter ∘ non-destructive sort) ------------------------
 
     /// Visible row count: the view's count when one is active, else the

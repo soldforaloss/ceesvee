@@ -48,6 +48,7 @@ use crate::reshape::{self, ReshapePreview, ReshapeSpec};
 use crate::schema::{ColumnSchema, DocumentSchema, SchemaIssue};
 use crate::schema_ops::{
     self, CellEditValidation, ConvertPreview, InvalidSampleReport, SchemaImportOutcome, SchemaInfo,
+    SchemaScanCache,
 };
 use crate::semantic::{
     self, SemanticAction, SemanticActionPreview, SemanticCache, SemanticReport, SemanticType,
@@ -902,6 +903,7 @@ pub fn close_document(
     state: Db<'_>,
     diagnostics_cache: State<'_, DiagnosticsCache>,
     profile_cache: State<'_, ProfileCache>,
+    schema_scan_cache: State<'_, SchemaScanCache>,
     dedup_cache: State<'_, DedupCache>,
     compare_cache: State<'_, CompareCache>,
     cluster_cache: State<'_, ClusterCache>,
@@ -926,6 +928,7 @@ pub fn close_document(
     lock(&state)?.remove(doc_id);
     diagnostics_cache.remove(doc_id);
     profile_cache.remove_doc(doc_id);
+    schema_scan_cache.remove_doc(doc_id);
     dedup_cache.remove(doc_id);
     compare_cache.remove_doc(doc_id);
     cluster_cache.remove(doc_id);
@@ -3072,18 +3075,53 @@ pub fn get_schema(doc_id: u64, state: Db<'_>) -> AppResult<SchemaInfo> {
     read_doc(&state, doc_id, |doc| Ok(schema_ops::schema_info(doc)))
 }
 
-/// Infer a schema from the data (type + null-token scan). READ-ONLY: nothing
-/// is assigned until the user applies entries via `set_column_schema` or an
-/// import. Indexed documents scan a bounded leading sample.
+/// The completed inference result for a document, if a `start_infer_schema`
+/// job has finished since the last fetch. Read-once (taken from the cache).
 #[tauri::command]
-pub async fn infer_schema(doc_id: u64, state: Db<'_>) -> AppResult<DocumentSchema> {
+pub fn take_inferred_schema(
+    doc_id: u64,
+    schema_scan_cache: State<'_, SchemaScanCache>,
+) -> Option<DocumentSchema> {
+    schema_scan_cache.take_infer(doc_id)
+}
+
+/// Start a schema-inference scan over every column as a cancellable job.
+/// READ-ONLY: nothing is assigned until the user applies entries via
+/// `set_column_schema` or an import. An editable document is scanned in full
+/// (testing every candidate type per cell), so it runs through the job
+/// registry for progress + cancellation like the F26 semantic scan; the
+/// inferred schema is fetched with `take_inferred_schema` once the job ends.
+/// Indexed documents scan a bounded leading sample.
+#[tauri::command]
+pub async fn start_infer_schema(
+    doc_id: u64,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    schema_scan_cache: State<'_, SchemaScanCache>,
+) -> AppResult<u64> {
     let handle = doc_handle(&state, doc_id)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    {
         let doc = handle.read().map_err(poisoned)?;
-        crate::schema::infer_schema(&doc)
-    })
-    .await
-    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+        doc.check_revision(expected_revision)?;
+    }
+    let sink = schema_scan_cache.infer_sink();
+    let ctx = jobs.begin_for_app(&app, "schemaScan", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            let schema = crate::schema::infer_schema(&doc, Some(ctx))?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, schema);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
 }
 
 /// Assign or replace ONE column's schema. The entry is validated (time zone,
@@ -3190,58 +3228,125 @@ pub fn clear_schema_issues(doc_id: u64, state: Db<'_>) -> AppResult<()> {
     })
 }
 
-/// Bounded sample of a column's invalid values under its declared type,
-/// with exact five-state counts. Revision-guarded so a stale panel request
-/// fails cleanly instead of mislabelling rows.
+/// The completed invalid-value scan for a document, if a
+/// `start_schema_invalid_samples` job has finished since the last fetch.
+/// Read-once (taken from the cache).
 #[tauri::command]
-pub async fn schema_invalid_samples(
+pub fn take_schema_invalid_samples(
     doc_id: u64,
-    column_id: String,
-    max_samples: usize,
-    expected_revision: u64,
-    state: Db<'_>,
-) -> AppResult<InvalidSampleReport> {
-    let handle = doc_handle(&state, doc_id)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let doc = handle.read().map_err(poisoned)?;
-        doc.check_revision(expected_revision)?;
-        schema_ops::invalid_samples(&doc, &column_id, max_samples)
-    })
-    .await
-    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+    schema_scan_cache: State<'_, SchemaScanCache>,
+) -> Option<InvalidSampleReport> {
+    schema_scan_cache.take_invalid(doc_id)
 }
 
-/// Preview the explicit canonical conversion of one column WITHOUT mutating:
-/// five-state counts, how many cells would change, before/after samples and
-/// the invalid cells that would keep their text. Apply with
-/// `convert_column_apply`, guarded by the echoed revision.
+/// Start a bounded invalid-value scan of one column under its declared type
+/// (exact five-state counts + samples) as a cancellable job. A full-column
+/// scan of an editable document is unbounded, so — like `start_column_profile`
+/// — it runs through the job registry for progress + cancellation; the report
+/// is fetched with `take_schema_invalid_samples` once the job ends.
+/// Data-revision-guarded up front so a stale panel request fails cleanly.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
-pub async fn convert_column_preview(
+pub async fn start_schema_invalid_samples(
     doc_id: u64,
     column_id: String,
     max_samples: usize,
     expected_revision: u64,
+    app: tauri::AppHandle,
     state: Db<'_>,
-) -> AppResult<ConvertPreview> {
+    jobs: State<'_, JobRegistry>,
+    schema_scan_cache: State<'_, SchemaScanCache>,
+) -> AppResult<u64> {
     let handle = doc_handle(&state, doc_id)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    {
         let doc = handle.read().map_err(poisoned)?;
         doc.check_revision(expected_revision)?;
-        schema_ops::convert_preview(&doc, &column_id, max_samples, None)
-    })
-    .await
-    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+        // Fail fast on a missing/undeclared column before spawning a job.
+        schema_ops::column_index(&doc, &column_id)?;
+    }
+    let sink = schema_scan_cache.invalid_sink();
+    let ctx = jobs.begin_for_app(&app, "schemaScan", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            let report = schema_ops::invalid_samples(&doc, &column_id, max_samples, Some(ctx))?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, report);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// The completed conversion preview for a document, if a
+/// `start_convert_column_preview` job has finished since the last fetch.
+/// Read-once (taken from the cache).
+#[tauri::command]
+pub fn take_convert_column_preview(
+    doc_id: u64,
+    schema_scan_cache: State<'_, SchemaScanCache>,
+) -> Option<ConvertPreview> {
+    schema_scan_cache.take_preview(doc_id)
+}
+
+/// Start a conversion preview of one column WITHOUT mutating (five-state
+/// counts, how many cells would change, before/after samples, the invalid
+/// cells that would keep their text) as a cancellable job — the same
+/// full-column scan `convert_column_apply` performs, so it gets the same
+/// progress + cancellation. Fetch the preview with `take_convert_column_preview`
+/// once the job ends and hand its `revision` + `schemaRevision` back to
+/// `convert_column_apply`.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn start_convert_column_preview(
+    doc_id: u64,
+    column_id: String,
+    max_samples: usize,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    schema_scan_cache: State<'_, SchemaScanCache>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.ensure_editable()?;
+        doc.check_revision(expected_revision)?;
+        schema_ops::column_index(&doc, &column_id)?;
+    }
+    let sink = schema_scan_cache.preview_sink();
+    let ctx = jobs.begin_for_app(&app, "schemaScan", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            let preview = schema_ops::convert_preview(&doc, &column_id, max_samples, Some(ctx))?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(doc_id, preview);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
 }
 
 /// Apply a previewed canonical conversion as ONE undoable operation, as a
-/// job (progress + cancellation; the commit is revision-guarded against the
-/// preview). Invalid cells keep their original text — the preview already
-/// reported their count.
+/// job (progress + cancellation; the commit is guarded against BOTH the
+/// preview's data revision and its schema revision). Invalid cells keep their
+/// original text — the preview already reported their count.
 #[tauri::command]
 pub async fn convert_column_apply(
     doc_id: u64,
     column_id: String,
     expected_revision: u64,
+    expected_schema_revision: u64,
     app: tauri::AppHandle,
     state: Db<'_>,
     jobs: State<'_, JobRegistry>,
@@ -3251,6 +3356,7 @@ pub async fn convert_column_apply(
         let doc = handle.read().map_err(poisoned)?;
         doc.ensure_editable()?;
         doc.check_revision(expected_revision)?;
+        doc.check_schema_revision(expected_schema_revision)?;
     }
     let ctx = jobs.begin_for_app(&app, "schemaConvert", Some(doc_id));
     let job_id = ctx.id;
@@ -3260,7 +3366,13 @@ pub async fn convert_column_apply(
             // Editable documents are in-memory; the scan+commit runs under
             // one write lock so the change list can never go stale between
             // computing and committing.
-            schema_ops::apply_conversion(&mut doc, &column_id, expected_revision, Some(ctx))?;
+            schema_ops::apply_conversion(
+                &mut doc,
+                &column_id,
+                expected_revision,
+                expected_schema_revision,
+                Some(ctx),
+            )?;
             Ok(())
         })
         .await;

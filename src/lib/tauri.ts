@@ -490,8 +490,17 @@ export const applyCrossvalFilter = (
 /** The document's explicit schema, names refreshed from headers by ID (F31). */
 export const getSchema = (docId: number) => invoke<SchemaInfo>("get_schema", { docId });
 
-/** Infer a schema from the data (read-only; nothing is assigned) (F31). */
-export const inferSchema = (docId: number) => invoke<DocumentSchema>("infer_schema", { docId });
+/**
+ * Start a schema-inference scan over every column as a cancellable job (F31).
+ * Read-only; nothing is assigned. Returns the job id; fetch the inferred
+ * schema with `takeInferredSchema` once the job finishes.
+ */
+export const startInferSchema = (docId: number, expectedRevision: number) =>
+  invoke<number>("start_infer_schema", { docId, expectedRevision });
+
+/** The completed inference result for a finished `startInferSchema` job (F31). */
+export const takeInferredSchema = (docId: number) =>
+  invoke<DocumentSchema | null>("take_inferred_schema", { docId });
 
 /** Assign or replace ONE column's schema (metadata: never dirties) (F31). */
 export const setColumnSchema = (docId: number, schema: ColumnSchema) =>
@@ -520,37 +529,66 @@ export const getSchemaIssues = (docId: number) =>
 /** Clear the recorded advisory-validation issues (F31). */
 export const clearSchemaIssues = (docId: number) => invoke<void>("clear_schema_issues", { docId });
 
-/** Bounded sample of a column's invalid values + five-state counts (F31). */
-export const schemaInvalidSamples = (
+/**
+ * Start a bounded invalid-value scan of one column as a cancellable job (F31).
+ * Returns the job id; fetch the report with `takeSchemaInvalidSamples`.
+ */
+export const startSchemaInvalidSamples = (
   docId: number,
   columnId: string,
   maxSamples: number,
   expectedRevision: number,
 ) =>
-  invoke<InvalidSampleReport>("schema_invalid_samples", {
+  invoke<number>("start_schema_invalid_samples", {
     docId,
     columnId,
     maxSamples,
     expectedRevision,
   });
 
-/** Preview the canonical conversion of one column, without mutating (F31). */
-export const convertColumnPreview = (
+/** The report for a finished `startSchemaInvalidSamples` job (F31). */
+export const takeSchemaInvalidSamples = (docId: number) =>
+  invoke<InvalidSampleReport | null>("take_schema_invalid_samples", { docId });
+
+/**
+ * Start a conversion preview of one column (no mutation) as a cancellable
+ * job (F31). Returns the job id; fetch the preview with
+ * `takeConvertColumnPreview`.
+ */
+export const startConvertColumnPreview = (
   docId: number,
   columnId: string,
   maxSamples: number,
   expectedRevision: number,
 ) =>
-  invoke<ConvertPreview>("convert_column_preview", {
+  invoke<number>("start_convert_column_preview", {
     docId,
     columnId,
     maxSamples,
     expectedRevision,
   });
 
-/** Apply a previewed conversion as ONE undoable job (revision-guarded) (F31). */
-export const convertColumnApply = (docId: number, columnId: string, expectedRevision: number) =>
-  invoke<number>("convert_column_apply", { docId, columnId, expectedRevision });
+/** The preview for a finished `startConvertColumnPreview` job (F31). */
+export const takeConvertColumnPreview = (docId: number) =>
+  invoke<ConvertPreview | null>("take_convert_column_preview", { docId });
+
+/**
+ * Apply a previewed conversion as ONE undoable job (F31). Guarded against both
+ * the data revision AND the schema revision the preview was computed under, so
+ * a schema edit between preview and apply is rejected.
+ */
+export const convertColumnApply = (
+  docId: number,
+  columnId: string,
+  expectedRevision: number,
+  expectedSchemaRevision: number,
+) =>
+  invoke<number>("convert_column_apply", {
+    docId,
+    columnId,
+    expectedRevision,
+    expectedSchemaRevision,
+  });
 
 /**
  * Open a file in indexed read-only mode (F10). The document registers under

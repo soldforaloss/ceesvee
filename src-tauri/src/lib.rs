@@ -109,6 +109,7 @@ pub fn run() {
         .manage(JobRegistry::default())
         .manage(DiagnosticsCache::default())
         .manage(ProfileCache::default())
+        .manage(crate::schema_ops::SchemaScanCache::default())
         .manage(DedupCache::default())
         .manage(CompareCache::default())
         .manage(crate::archive::ArchiveCache::default())
@@ -188,7 +189,8 @@ pub fn run() {
             commands::undo,
             commands::redo,
             commands::get_schema,
-            commands::infer_schema,
+            commands::start_infer_schema,
+            commands::take_inferred_schema,
             commands::set_column_schema,
             commands::remove_column_schema,
             commands::export_schema,
@@ -196,8 +198,10 @@ pub fn run() {
             commands::validate_cell_edit,
             commands::get_schema_issues,
             commands::clear_schema_issues,
-            commands::schema_invalid_samples,
-            commands::convert_column_preview,
+            commands::start_schema_invalid_samples,
+            commands::take_schema_invalid_samples,
+            commands::start_convert_column_preview,
+            commands::take_convert_column_preview,
             commands::convert_column_apply,
             commands::check_encoding_compatibility,
             commands::export_scope_counts,

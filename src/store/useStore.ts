@@ -70,6 +70,8 @@ import type {
   TransformSpec,
   ZipEntryInfo,
   ColumnSchema,
+  ConvertPreview,
+  InvalidSampleReport,
   SchemaInfo,
 } from "../types";
 
@@ -499,6 +501,18 @@ export interface SchemaConvertState {
   total: number | null;
 }
 
+/** In-flight cancellable schema-scan job (F31): inference, invalid-value
+ * samples, or a conversion preview — all full-column/full-document scans that
+ * run through the job registry so they report progress and can be cancelled. */
+export interface SchemaScanState {
+  jobId: number;
+  kind: "infer" | "invalid" | "preview";
+  /** The column being scanned (stable ID); null for whole-document inference. */
+  columnId: string | null;
+  processed: number;
+  total: number | null;
+}
+
 /** ZIP entry chooser state (F17). */
 export interface ArchivePickState {
   path: string;
@@ -660,6 +674,8 @@ interface Store {
   schemaInfo: SchemaInfo | null;
   /** A running canonical column-conversion job (F31), if any. */
   schemaConvert: SchemaConvertState | null;
+  /** A running cancellable schema-scan job — infer / invalid / preview (F31). */
+  schemaScan: SchemaScanState | null;
   /** Physical column the schema dialog should focus on open (F31). */
   schemaDialogColumn: number | null;
   /** Running derived-document job (F20–F23), if any. */
@@ -870,14 +886,28 @@ interface Store {
   setColumnSchema: (schema: ColumnSchema) => Promise<boolean>;
   /** Drop one column's schema entry (back to implicit text). */
   removeColumnSchema: (columnId: string) => Promise<void>;
-  /** Infer a schema from the data and apply every entry (non-dirty). */
+  /** Infer a schema from the data (cancellable job) and apply every entry. */
   inferAndApplySchema: () => Promise<boolean>;
   /** Import a versioned schema JSON file (REPLACES the schema); prompts. */
   importSchemaFromFile: () => Promise<string | null>;
   /** Export the schema to a versioned JSON file; prompts for a path. */
   exportSchemaToFile: () => Promise<void>;
-  /** Apply a previewed canonical conversion as ONE undo step (job). */
-  applyColumnConversion: (columnId: string, expectedRevision: number) => Promise<boolean>;
+  /** Scan a column's invalid values as a cancellable job; null on cancel/error. */
+  runSchemaInvalidSamples: (
+    columnId: string,
+    maxSamples: number,
+  ) => Promise<InvalidSampleReport | null>;
+  /** Compute a conversion preview as a cancellable job; null on cancel/error. */
+  runSchemaConvertPreview: (columnId: string, maxSamples: number) => Promise<ConvertPreview | null>;
+  /** Cancel the in-flight schema scan (infer / invalid / preview), if any. */
+  cancelSchemaScan: () => Promise<void>;
+  /** Apply a previewed canonical conversion as ONE undo step (job). Guarded
+   * against both the preview's data revision and its schema revision. */
+  applyColumnConversion: (
+    columnId: string,
+    expectedRevision: number,
+    expectedSchemaRevision: number,
+  ) => Promise<boolean>;
   cancelColumnConversion: () => Promise<void>;
 
   // compressed files (F17)
@@ -1138,6 +1168,7 @@ export const useStore = create<Store>((set, get) => {
       // F31: the schema is per-document; the Grid reloads it for the new tab.
       schemaInfo: null,
       schemaConvert: null,
+      schemaScan: null,
       schemaDialogColumn: null,
     };
   };
@@ -1568,6 +1599,7 @@ export const useStore = create<Store>((set, get) => {
     outlier: initialOutlier,
     schemaInfo: null,
     schemaConvert: null,
+    schemaScan: null,
     schemaDialogColumn: null,
     derive: null,
     deriveError: null,
@@ -2581,6 +2613,10 @@ export const useStore = create<Store>((set, get) => {
         // Schema edits never dirty the document (metadata only); just refresh
         // the schema so the grid repaints declared badges + display formats.
         if (get().activeId === meta.id) set({ schemaInfo: info });
+        // The declared type re-derives any open column profile (typed stats,
+        // inferredKind, null exclusion), which the backend keys on the schema
+        // revision — re-request so the explorer panel repaints, not stale.
+        void get().refreshExplorerProfile();
         return true;
       } catch (e) {
         set({ error: String(e) });
@@ -2594,6 +2630,7 @@ export const useStore = create<Store>((set, get) => {
       try {
         const info = await api.removeColumnSchema(meta.id, columnId);
         if (get().activeId === meta.id) set({ schemaInfo: info });
+        void get().refreshExplorerProfile();
       } catch (e) {
         set({ error: String(e) });
       }
@@ -2603,16 +2640,31 @@ export const useStore = create<Store>((set, get) => {
       const meta = activeMeta();
       if (!meta) return false;
       try {
-        const inferred = await api.inferSchema(meta.id);
+        // Inference is a full-document scan (every column, every candidate
+        // type) — run it as a cancellable job, then apply the entries.
+        const jobId = await api.startInferSchema(meta.id, meta.revision);
+        set({ schemaScan: { jobId, kind: "infer", columnId: null, processed: 0, total: null } });
+        consumeEarlyFinish(jobId);
+        const finished = await awaitJob(jobId);
+        set({ schemaScan: null });
+        if (finished.status !== "done") {
+          if (finished.status === "failed") {
+            set({ error: finished.error ?? "schema inference failed" });
+          }
+          return false;
+        }
+        const inferred = await api.takeInferredSchema(meta.id);
+        if (!inferred) return false;
         // Apply each inferred entry (cheap, non-dirty, non-undoable metadata).
         for (const entry of Object.values(inferred.columns)) {
           await api.setColumnSchema(meta.id, entry);
         }
         const info = await api.getSchema(meta.id);
         if (get().activeId === meta.id) set({ schemaInfo: info });
+        void get().refreshExplorerProfile();
         return true;
       } catch (e) {
-        set({ error: String(e) });
+        set({ schemaScan: null, error: String(e) });
         return false;
       }
     },
@@ -2655,11 +2707,75 @@ export const useStore = create<Store>((set, get) => {
       }
     },
 
-    applyColumnConversion: async (columnId, expectedRevision) => {
+    runSchemaInvalidSamples: async (columnId, maxSamples) => {
+      const meta = activeMeta();
+      if (!meta) return null;
+      try {
+        const jobId = await api.startSchemaInvalidSamples(
+          meta.id,
+          columnId,
+          maxSamples,
+          meta.revision,
+        );
+        set({ schemaScan: { jobId, kind: "invalid", columnId, processed: 0, total: null } });
+        consumeEarlyFinish(jobId);
+        const finished = await awaitJob(jobId);
+        set({ schemaScan: null });
+        if (finished.status !== "done") {
+          if (finished.status === "failed") set({ error: finished.error ?? "scan failed" });
+          return null;
+        }
+        const report = await api.takeSchemaInvalidSamples(meta.id);
+        // Defensive: the cache is keyed by document, so verify the report is
+        // for the column we asked about before surfacing it.
+        return report && report.columnId === columnId ? report : null;
+      } catch (e) {
+        set({ schemaScan: null, error: String(e) });
+        return null;
+      }
+    },
+
+    runSchemaConvertPreview: async (columnId, maxSamples) => {
+      const meta = activeMeta();
+      if (!meta) return null;
+      try {
+        const jobId = await api.startConvertColumnPreview(
+          meta.id,
+          columnId,
+          maxSamples,
+          meta.revision,
+        );
+        set({ schemaScan: { jobId, kind: "preview", columnId, processed: 0, total: null } });
+        consumeEarlyFinish(jobId);
+        const finished = await awaitJob(jobId);
+        set({ schemaScan: null });
+        if (finished.status !== "done") {
+          if (finished.status === "failed") set({ error: finished.error ?? "preview failed" });
+          return null;
+        }
+        const preview = await api.takeConvertColumnPreview(meta.id);
+        return preview && preview.columnId === columnId ? preview : null;
+      } catch (e) {
+        set({ schemaScan: null, error: String(e) });
+        return null;
+      }
+    },
+
+    cancelSchemaScan: async () => {
+      const scan = get().schemaScan;
+      if (scan) await api.cancelJob(scan.jobId).catch(() => undefined);
+    },
+
+    applyColumnConversion: async (columnId, expectedRevision, expectedSchemaRevision) => {
       const meta = activeMeta();
       if (!meta) return false;
       try {
-        const jobId = await api.convertColumnApply(meta.id, columnId, expectedRevision);
+        const jobId = await api.convertColumnApply(
+          meta.id,
+          columnId,
+          expectedRevision,
+          expectedSchemaRevision,
+        );
         set({ schemaConvert: { jobId, columnId, processed: 0, total: null } });
         consumeEarlyFinish(jobId);
         const finished = await awaitJob(jobId);
@@ -3181,6 +3297,13 @@ export const useStore = create<Store>((set, get) => {
         set({
           schemaConvert: { ...convert, processed: progress.processed, total: progress.total },
         });
+        return;
+      }
+
+      if (progress.kind === "schemaScan") {
+        const scan = get().schemaScan;
+        if (scan?.jobId !== progress.jobId) return;
+        set({ schemaScan: { ...scan, processed: progress.processed, total: progress.total } });
         return;
       }
 

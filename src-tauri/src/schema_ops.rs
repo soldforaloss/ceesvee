@@ -18,6 +18,7 @@
 //! missing.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
@@ -88,6 +89,63 @@ fn scan_len(doc: &Document) -> usize {
         doc.n_rows()
     } else {
         doc.n_rows().min(INDEXED_SCAN_ROWS)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Job-result delivery for the cancellable full-scan commands
+// ---------------------------------------------------------------------------
+
+/// Delivers the RESULT of a job-wrapped schema scan (inference, invalid-value
+/// samples, conversion preview) to the front end. These are full-column /
+/// full-document scans, so they run through the job registry (progress +
+/// cancellation) and the async command returns only a job id; the computed
+/// value is stashed here and fetched once the job completes — the same
+/// side-channel pattern as [`crate::profile::ProfileCache`] and
+/// `SemanticCache`. Keyed by document id (only the latest scan per document is
+/// retained) and read once ("take"), so nothing lingers.
+#[derive(Default)]
+pub struct SchemaScanCache {
+    infer: Arc<Mutex<HashMap<u64, DocumentSchema>>>,
+    invalid: Arc<Mutex<HashMap<u64, InvalidSampleReport>>>,
+    preview: Arc<Mutex<HashMap<u64, ConvertPreview>>>,
+}
+
+impl SchemaScanCache {
+    pub fn infer_sink(&self) -> Arc<Mutex<HashMap<u64, DocumentSchema>>> {
+        Arc::clone(&self.infer)
+    }
+    pub fn invalid_sink(&self) -> Arc<Mutex<HashMap<u64, InvalidSampleReport>>> {
+        Arc::clone(&self.invalid)
+    }
+    pub fn preview_sink(&self) -> Arc<Mutex<HashMap<u64, ConvertPreview>>> {
+        Arc::clone(&self.preview)
+    }
+
+    /// Take (and remove) a completed inference result.
+    pub fn take_infer(&self, doc_id: u64) -> Option<DocumentSchema> {
+        self.infer.lock().ok()?.remove(&doc_id)
+    }
+    /// Take (and remove) a completed invalid-samples report.
+    pub fn take_invalid(&self, doc_id: u64) -> Option<InvalidSampleReport> {
+        self.invalid.lock().ok()?.remove(&doc_id)
+    }
+    /// Take (and remove) a completed conversion preview.
+    pub fn take_preview(&self, doc_id: u64) -> Option<ConvertPreview> {
+        self.preview.lock().ok()?.remove(&doc_id)
+    }
+
+    /// Drop every cached result for a closed document.
+    pub fn remove_doc(&self, doc_id: u64) {
+        if let Ok(mut m) = self.infer.lock() {
+            m.remove(&doc_id);
+        }
+        if let Ok(mut m) = self.invalid.lock() {
+            m.remove(&doc_id);
+        }
+        if let Ok(mut m) = self.preview.lock() {
+            m.remove(&doc_id);
+        }
     }
 }
 
@@ -193,6 +251,10 @@ pub struct InvalidSampleReport {
     pub scanned_rows: usize,
     pub total_rows: usize,
     pub revision: u64,
+    /// Schema revision this scan was computed against; the output is entirely
+    /// schema-dependent, so a caller can guard a deferred use of it against a
+    /// schema change the same way `revision` guards against a data change.
+    pub schema_revision: u64,
 }
 
 struct ColumnScan {
@@ -285,12 +347,15 @@ fn scan_column(
 }
 
 /// Bounded sample of a column's invalid values under its declared type.
+/// `ctx` (when the command runs it as a job) carries progress + cancellation
+/// over the full-column scan.
 pub fn invalid_samples(
     doc: &Document,
     column_id: &str,
     max_samples: usize,
+    ctx: Option<&JobCtx>,
 ) -> AppResult<InvalidSampleReport> {
-    let scan = scan_column(doc, column_id, max_samples, false, None)?;
+    let scan = scan_column(doc, column_id, max_samples, false, ctx)?;
     Ok(InvalidSampleReport {
         column_id: column_id.to_string(),
         counts: scan.counts,
@@ -298,6 +363,7 @@ pub fn invalid_samples(
         scanned_rows: scan.scanned,
         total_rows: doc.n_rows(),
         revision: doc.revision(),
+        schema_revision: doc.schema_revision(),
     })
 }
 
@@ -324,6 +390,12 @@ pub struct ConvertPreview {
     pub scanned_rows: usize,
     /// The revision to hand back to `convert_column_apply`.
     pub revision: u64,
+    /// The schema revision this preview was computed against, handed back to
+    /// `convert_column_apply` so a schema edit between preview and apply fails
+    /// the guard exactly like a data edit does. The scan (which cells change,
+    /// to what canonical text) is entirely a function of the declared schema,
+    /// which moves this counter WITHOUT moving `revision`.
+    pub schema_revision: u64,
 }
 
 /// Compute a conversion preview: per-state counts, how many cells would
@@ -345,6 +417,7 @@ pub fn convert_preview(
         invalid_samples: scan.invalid,
         scanned_rows: scan.scanned,
         revision: doc.revision(),
+        schema_revision: doc.schema_revision(),
     })
 }
 
@@ -365,16 +438,21 @@ pub struct ConvertOutcome {
 
 /// Apply the canonical conversion of one column as ONE undoable operation.
 /// Invalid cells keep their original text (their count is reported);
-/// empty/null-token/missing cells are never touched. Guarded by
-/// `expected_revision` so it can only apply against the data the preview saw.
+/// empty/null-token/missing cells are never touched. Guarded by BOTH
+/// `expected_revision` (the data the preview saw) AND `expected_schema_revision`
+/// (the declared schema the preview computed the canonical text under) — a
+/// schema edit moves the latter without moving the former, and the entire
+/// change list depends on the schema, so both must match.
 pub fn apply_conversion(
     doc: &mut Document,
     column_id: &str,
     expected_revision: u64,
+    expected_schema_revision: u64,
     ctx: Option<&JobCtx>,
 ) -> AppResult<ConvertOutcome> {
     doc.ensure_editable()?;
     doc.check_revision(expected_revision)?;
+    doc.check_schema_revision(expected_schema_revision)?;
     let scan = scan_column(doc, column_id, 0, true, ctx)?;
     if let Some(ctx) = ctx {
         ctx.check()?; // last cancellation point before the commit
@@ -488,6 +566,7 @@ pub fn apply_validated_cells(
 mod tests {
     use super::*;
     use crate::dto::SortKey;
+    use crate::job::JobRegistry;
     use crate::parse::{parse, ParseSettings};
     use crate::schema::{ColumnSchema, LogicalType};
 
@@ -524,7 +603,7 @@ mod tests {
         let mut doc = doc_from_csv("zip,city\n00501,Holtsville\n10001,NYC\n");
         let id = declare(&mut doc, 0, LogicalType::Text);
         // Inference itself refuses numeric for the leading-zero column.
-        let inferred = schema::infer_schema(&doc).unwrap();
+        let inferred = schema::infer_schema(&doc, None).unwrap();
         assert_eq!(
             inferred.column(&id).unwrap().logical_type,
             LogicalType::Text
@@ -534,7 +613,8 @@ mod tests {
         assert_eq!(preview.changed, 0);
         assert_eq!(preview.counts.valid, 2);
         let revision = doc.revision();
-        let outcome = apply_conversion(&mut doc, &id, revision, None).unwrap();
+        let schema_rev = doc.schema_revision();
+        let outcome = apply_conversion(&mut doc, &id, revision, schema_rev, None).unwrap();
         assert_eq!(outcome.changed, 0);
         assert_eq!(doc.rows()[0][0], "00501");
         assert!(!doc.is_dirty(), "a no-op conversion records no undo step");
@@ -553,7 +633,14 @@ mod tests {
         assert_eq!(preview.counts.empty, 1);
         assert_eq!(preview.samples.len(), 2);
 
-        let outcome = apply_conversion(&mut doc, &id, preview.revision, None).unwrap();
+        let outcome = apply_conversion(
+            &mut doc,
+            &id,
+            preview.revision,
+            preview.schema_revision,
+            None,
+        )
+        .unwrap();
         assert_eq!(outcome.changed, 2);
         assert_eq!(outcome.invalid, 1);
         assert_eq!(doc.rows()[0][0], "1234");
@@ -576,8 +663,69 @@ mod tests {
         // A concurrent edit lands after the preview…
         doc.set_cell(0, 0, "02".to_string()).unwrap();
         // …so the stale preview can no longer be applied.
-        let err = apply_conversion(&mut doc, &id, preview.revision, None).unwrap_err();
+        let err = apply_conversion(
+            &mut doc,
+            &id,
+            preview.revision,
+            preview.schema_revision,
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, AppError::StaleRevision { .. }));
+    }
+
+    #[test]
+    fn a_cancelled_job_aborts_the_scan() {
+        // The full-column scans (invalid samples, conversion preview) now
+        // thread a JobCtx so a long scan is cancellable. A pre-cancelled ctx
+        // makes the scan return Cancelled instead of a result.
+        let mut doc = doc_from_csv("n\n1\n2\n3\n");
+        let id = declare(&mut doc, 0, LogicalType::Integer);
+        let registry = JobRegistry::default();
+        let ctx = registry.begin("schemaScan", Some(1), |_| {});
+        assert!(registry.cancel(ctx.id));
+        assert!(matches!(
+            invalid_samples(&doc, &id, 10, Some(&ctx)),
+            Err(AppError::Cancelled)
+        ));
+        assert!(matches!(
+            convert_preview(&doc, &id, 10, Some(&ctx)),
+            Err(AppError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn conversion_apply_is_schema_revision_guarded() {
+        // The change list is a function of the declared schema. A schema edit
+        // between preview and apply moves schema_revision but NOT revision, so
+        // the data-revision guard alone would let a preview computed under the
+        // OLD schema commit under the NEW one.
+        let mut doc = doc_from_csv("n\n1000\n");
+        let id = declare(&mut doc, 0, LogicalType::Integer);
+        let preview = convert_preview(&doc, &id, 10, None).unwrap();
+
+        // Re-declare the column with a different locale — a pure schema edit.
+        declare_with(&mut doc, 0, LogicalType::Integer, |s| {
+            s.locale = Some("de-DE".to_string());
+        });
+        assert_eq!(
+            doc.revision(),
+            preview.revision,
+            "schema edits never move revision"
+        );
+
+        let err = apply_conversion(
+            &mut doc,
+            &id,
+            preview.revision,
+            preview.schema_revision,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::StaleSchemaRevision { .. }));
+        // Applying against the CURRENT schema revision is accepted.
+        let (rev, schema_rev) = (doc.revision(), doc.schema_revision());
+        assert!(apply_conversion(&mut doc, &id, rev, schema_rev, None).is_ok());
     }
 
     // ----- acceptance: strict rejects BEFORE the model ----------------------
@@ -663,7 +811,7 @@ mod tests {
         let id = declare_with(&mut doc, 0, LogicalType::Integer, |s| {
             s.null_tokens = vec!["NULL".to_string()];
         });
-        let report = invalid_samples(&doc, &id, 10).unwrap();
+        let report = invalid_samples(&doc, &id, 10, None).unwrap();
         assert_eq!(report.counts.valid, 2);
         assert_eq!(report.counts.null_token, 1);
         assert_eq!(report.counts.empty, 1);
@@ -677,7 +825,7 @@ mod tests {
         // Row 1 ("only" record) has ONE field; the grid pads column b.
         let mut doc = doc_from_csv("a,b\n1,2\nonly\n3,\n");
         let id = declare(&mut doc, 1, LogicalType::Integer);
-        let report = invalid_samples(&doc, &id, 10).unwrap();
+        let report = invalid_samples(&doc, &id, 10, None).unwrap();
         assert_eq!(report.counts.missing, 1, "padded field was never present");
         assert_eq!(report.counts.empty, 1, "a real empty field stays Empty");
         assert_eq!(report.counts.valid, 1);
@@ -689,7 +837,7 @@ mod tests {
     fn invalid_samples_are_bounded_and_reasoned() {
         let mut doc = doc_from_csv("n\nx1\nx2\nx3\n5\n");
         let id = declare(&mut doc, 0, LogicalType::Integer);
-        let report = invalid_samples(&doc, &id, 2).unwrap();
+        let report = invalid_samples(&doc, &id, 2, None).unwrap();
         assert_eq!(report.counts.invalid, 3, "counts stay exact");
         assert_eq!(report.samples.len(), 2, "samples honour the cap");
         assert_eq!(report.samples[0].row, 0);
@@ -701,8 +849,14 @@ mod tests {
     fn scans_need_a_declared_schema_and_known_column() {
         let doc = doc_from_csv("a\n1\n");
         let id = doc.column_ids()[0].clone();
-        assert!(invalid_samples(&doc, &id, 5).is_err(), "no schema declared");
-        assert!(invalid_samples(&doc, "c99", 5).is_err(), "unknown column");
+        assert!(
+            invalid_samples(&doc, &id, 5, None).is_err(),
+            "no schema declared"
+        );
+        assert!(
+            invalid_samples(&doc, "c99", 5, None).is_err(),
+            "unknown column"
+        );
     }
 
     // ----- acceptance: schema survives rename + reorder via stable IDs ------

@@ -52,6 +52,10 @@ use serde::{Deserialize, Serialize};
 use crate::analyze;
 use crate::document::Document;
 use crate::error::{AppError, AppResult};
+use crate::job::JobCtx;
+
+/// Progress/cancellation granularity for the full-document inference scan.
+const INFER_ROW_CHUNK: usize = 4096;
 
 /// Version written to (and required from) schema import/export envelopes.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -1229,7 +1233,12 @@ fn has_leading_zero(s: &str) -> bool {
 /// `nullTokens` from observed blanks and null-ish tokens. Indexed documents
 /// scan a leading sample ([`INFER_SAMPLE_ROWS`]); a sample is evidence, not
 /// certainty. Read-only; nothing is assigned until the user applies it.
-pub fn infer_schema(doc: &Document) -> AppResult<DocumentSchema> {
+///
+/// An editable document is scanned in FULL (unbounded), testing every
+/// candidate type per non-null cell, so on a large document this is a long
+/// operation: pass a [`JobCtx`] to report progress and honour cancellation
+/// (the command layer runs it through the job registry).
+pub fn infer_schema(doc: &Document, ctx: Option<&JobCtx>) -> AppResult<DocumentSchema> {
     struct Acc {
         non_null: usize,
         blanks: usize,
@@ -1255,7 +1264,18 @@ pub fn infer_schema(doc: &Document) -> AppResult<DocumentSchema> {
     } else {
         total.min(INFER_SAMPLE_ROWS)
     };
+    if let Some(ctx) = ctx {
+        ctx.set_total(scan as u64);
+    }
+    let mut pending = 0u64;
     doc.visit_rows(0..scan, &mut |_, row| {
+        pending += 1;
+        if pending >= INFER_ROW_CHUNK as u64 {
+            if let Some(ctx) = ctx {
+                ctx.advance(pending)?;
+            }
+            pending = 0;
+        }
         for (c, acc) in accs.iter_mut().enumerate() {
             let trimmed = row.get(c).map(String::as_str).unwrap_or("").trim();
             if trimmed.is_empty() {
@@ -1286,6 +1306,10 @@ pub fn infer_schema(doc: &Document) -> AppResult<DocumentSchema> {
         }
         Ok(true)
     })?;
+    if let Some(ctx) = ctx {
+        ctx.advance(pending)?;
+        ctx.flush_progress();
+    }
 
     let mut columns = BTreeMap::new();
     for (c, acc) in accs.into_iter().enumerate() {
@@ -1906,7 +1930,7 @@ mod tests {
               02134,2,2.75,false,2024-02-01,16fd2706-8baf-433b-82eb-8c7fada847da,NULL\n\
               ,3,3.00,true,2024-03-01,6fa459ea-ee8a-3ca4-894e-db77e160355e,world\n",
         );
-        let schema = infer_schema(&doc).unwrap();
+        let schema = infer_schema(&doc, None).unwrap();
         let by_id = |id: &str| schema.column(id).unwrap();
 
         // ZIP: leading zeroes veto integer; blank in row 3 → nullable.
@@ -1935,7 +1959,7 @@ mod tests {
               0,2.5,2024-01-02\n\
               1,3,2024-01-03 11:30:00\n",
         );
-        let schema = infer_schema(&doc).unwrap();
+        let schema = infer_schema(&doc, None).unwrap();
         // 0/1 columns stay integer (analyze excludes 0/1 from booleans too).
         assert_eq!(
             schema.column("c0").unwrap().logical_type,
@@ -1958,7 +1982,7 @@ mod tests {
     #[test]
     fn schema_keyed_by_column_id_survives_rename_and_move() {
         let mut doc = doc_from_csv(b"a,b,c\n1,x,2.5\n2,y,3.5\n");
-        let schema = infer_schema(&doc).unwrap();
+        let schema = infer_schema(&doc, None).unwrap();
         assert_eq!(
             schema.column("c0").unwrap().logical_type,
             LogicalType::Integer
