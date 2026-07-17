@@ -522,6 +522,13 @@ impl Document {
         &self.headers
     }
 
+    /// Stable logical column IDs (F12), in lockstep with `headers`. The
+    /// identity layer explicit schemas (F31) key their per-column entries on:
+    /// IDs survive renames, reorders, inserts, deletes and undo/redo.
+    pub fn column_ids(&self) -> &[String] {
+        &self.column_ids
+    }
+
     /// The in-memory row slice. EDITABLE backing only: for indexed documents
     /// this is always empty — mutation paths must gate with
     /// [`Document::ensure_editable`] first, and read paths must go through

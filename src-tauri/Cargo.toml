@@ -36,6 +36,8 @@ csv = "1"
 encoding_rs = "0.8"
 chardetng = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Timezone-aware datetime parsing for explicit column schemas (F31).
+chrono-tz = "0.10"
 regex = "1"
 thiserror = "2"
 # Crash-safe saves: staging file in the destination directory + atomic rename.

@@ -4,6 +4,24 @@ All notable changes to CEESVEE are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Explicit schemas and typed columns (F31, backend core)**: a logical
+  schema layer — nine logical types (text, integer, decimal, float,
+  boolean, date, datetime, uuid, json) declared per column and keyed by
+  stable column IDs so assignments survive renames and reorders. Cells
+  classify into five distinguishable states (missing field, configured
+  null token, empty string, valid, invalid); assigning a type never
+  rewrites cell text. Includes locale-aware number parsing (`de-DE`,
+  `fr-FR`, Swiss grouping, …), timezone-aware datetime parsing
+  (IANA zones, DST folds resolve earliest, DST gaps invalid), custom
+  date input formats, schema inference from the data (with leading-zero
+  protection so ZIP-like columns stay text), edit validation for the
+  upcoming strict/advisory modes, display-only formatting patterns, and
+  versioned schema import/export JSON. UI integration lands next.
+
 ## [0.4.0]
 
 ### Added

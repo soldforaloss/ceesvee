@@ -40,6 +40,10 @@ mod reopen;
 mod repair;
 mod reshape;
 mod save;
+/// Public like [`job`]: the F31 schema core (logical types, classification,
+/// typed parsing, inference, import/export) is a stable internal API consumed
+/// by later feature stages and the test harness.
+pub mod schema;
 mod semantic;
 mod settings;
 mod sort;
