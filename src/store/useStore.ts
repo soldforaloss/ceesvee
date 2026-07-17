@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
+import { ask, open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import * as api from "../lib/tauri";
@@ -22,6 +22,22 @@ import { currentOpenOptions, fingerprintKey } from "../lib/reopen";
 import { defaultImportOptions } from "../lib/jsonImport";
 import { suggestJsonFileName } from "../lib/jsonExport";
 import { isLegacyEncoding } from "../lib/save";
+import {
+  availableOnlyChoices,
+  buildLayoutSection,
+  buildResolutions,
+  buildSources,
+  buildTabsSection,
+  deriveProjectDirty,
+  gatingWarnings,
+  orderTabsForPlan,
+  panelsFromLayout,
+  pathKey,
+  projectSnapshot,
+  type PanelLayout,
+  type ProjectSnapshot,
+  type SourceChoice,
+} from "../lib/project";
 import type {
   AppSettings,
   CellRect,
@@ -78,7 +94,12 @@ import type {
   ConvertPreview,
   InvalidSampleReport,
   SchemaInfo,
+  ProjectMeta,
+  ProjectOpenPreview,
+  ProjectOpenPlan,
+  FileFingerprint,
 } from "../types";
+import type { GatingWarning } from "../lib/project";
 
 export type ThemePref = "light" | "dark" | "system";
 
@@ -137,6 +158,9 @@ const JSON_FILE_FILTERS = [
   { name: "JSON Lines", extensions: ["jsonl", "ndjson"] },
   { name: "All files", extensions: ["*"] },
 ];
+
+/** File filter for the project open/save dialogs (F37). */
+const PROJECT_FILTERS = [{ name: "CEESVEE project", extensions: ["ceesveeproj"] }];
 
 export interface SelectionInfo {
   count: number;
@@ -971,6 +995,48 @@ interface Store {
   setQuitPromptOpen: (open: boolean) => void;
   confirmQuit: (mode: "save" | "discard") => Promise<void>;
 
+  // project workspaces (F37)
+  /** The open project's header (name/path/version), or null. */
+  project: ProjectMeta | null;
+  /** UI snapshot captured at the last save/open, for dirty derivation. */
+  projectBaseline: ProjectSnapshot | null;
+  /** The open-dialog preview awaiting per-source resolutions, if any. */
+  projectOpen: ProjectOpenPreview | null;
+  /** Per-source choices in the open dialog, by source id. */
+  projectOpenChoices: Record<string, SourceChoice>;
+  /** Sources whose saved views were gated on the last open (warn, never break). */
+  projectWarnings: GatingWarning[];
+  /** Whether the unsaved-project close confirmation is showing. */
+  projectClosePromptOpen: boolean;
+  /** Whether the open project has drifted from its last-saved snapshot. */
+  isProjectDirty: () => boolean;
+  /** Create a new project (optionally from a template file), replacing any open one. */
+  projectNew: (templatePath?: string) => Promise<void>;
+  /** Pick a template file, then create a new project from it. */
+  projectNewFromTemplate: () => Promise<void>;
+  /** Pick a `.ceesveeproj` and load its per-source open preview into the dialog. */
+  projectPickAndOpen: () => Promise<void>;
+  /** Set one source's choice in the open dialog. */
+  setProjectChoice: (sourceId: string, choice: SourceChoice) => void;
+  /** Open a file picker to relink one missing/changed source. */
+  projectLocateSource: (sourceId: string) => Promise<void>;
+  /** Cancel the whole open (leaves any current project untouched). */
+  cancelProjectOpen: () => void;
+  /** Apply the open with the current per-source choices. */
+  applyProjectOpen: () => Promise<void>;
+  /** Open every present source and leave missing/moved ones out. */
+  projectOpenAvailableOnly: () => Promise<void>;
+  /** Capture live sections and save the project (prompting for a path if new). */
+  projectSave: (saveAs?: boolean) => Promise<boolean>;
+  /** Export the open project as a reusable template (config only, no sources). */
+  projectSaveTemplate: () => Promise<void>;
+  /** Close the project, guarding unsaved changes. */
+  requestCloseProject: () => void;
+  /** Close the project immediately (documents stay open). */
+  closeProjectNow: () => Promise<void>;
+  /** Dismiss the project-warnings banner. */
+  dismissProjectWarnings: () => void;
+
   // save / export pipeline (F03/F04)
   /** Resolve a blocked lossy save: retry with another encoding, or cancel. */
   resolveEncodingIssues: (retryEncoding: string | null) => Promise<void>;
@@ -1605,6 +1671,110 @@ export const useStore = create<Store>((set, get) => {
     }
   };
 
+  // ----- project workspaces (F37) ------------------------------------------
+
+  /** Current panel-open flags, as the project's layout section tracks them. */
+  const currentPanels = (s: Store): PanelLayout => ({
+    diagnostics: s.diagnosticsOpen,
+    explorer: s.explorer.open,
+    changes: s.changesOpen,
+  });
+
+  /** The live project-relevant UI snapshot (open docs, active, panels). */
+  const currentProjectSnapshot = (): ProjectSnapshot => {
+    const s = get();
+    return projectSnapshot(s.tabs, s.activeId, currentPanels(s));
+  };
+
+  /**
+   * Confirm discarding the current project's unsaved changes before an action
+   * that would replace it (new / open). Returns whether to proceed.
+   */
+  const guardDiscardProject = async (): Promise<boolean> => {
+    const s = get();
+    if (!s.project || !deriveProjectDirty(s.projectBaseline, currentProjectSnapshot())) return true;
+    return ask("Discard unsaved changes to the current project?", {
+      title: "Discard project changes",
+      kind: "warning",
+    });
+  };
+
+  /**
+   * Push the live sources/tabs/layout into the backend ProjectStore (THE
+   * persistence boundary). Reuses existing source ids by path so ids stay
+   * stable across saves. Captures configuration only — never cell data.
+   */
+  const captureProjectSections = async () => {
+    const s = get();
+    const docs = s.tabs.filter((t) => t.path);
+    const fingerprints: Record<number, FileFingerprint | null> = {};
+    await Promise.all(
+      docs.map(async (t) => {
+        fingerprints[t.id] = await api.getFileFingerprint(t.id).catch(() => null);
+      }),
+    );
+    const existing = await api
+      .projectGet()
+      .then((state) => state?.sections.sources ?? [])
+      .catch(() => []);
+    const sources = buildSources(s.tabs, existing, fingerprints);
+    await api.projectSetSection("sources", sources);
+    await api.projectSetSection("tabs", buildTabsSection(sources, s.tabs, s.activeId));
+    await api.projectSetSection("layout", buildLayoutSection(currentPanels(s)));
+  };
+
+  /**
+   * Drive an open plan: open each referenced document through the ordinary
+   * open pipeline, restore tab order/active tab/panel layout, and reapply the
+   * active document's saved view only when the gating allows. NEVER runs
+   * recipes, queries, joins, comparisons or exports.
+   */
+  const applyProjectPlan = async (plan: ProjectOpenPlan) => {
+    for (const entry of plan.entries) {
+      await get().openPath(entry.path);
+    }
+    // Restore saved tab order (project docs first, extras appended).
+    set((s) => {
+      const order = orderTabsForPlan(s.tabs, plan.entries);
+      const byId = new Map(s.tabs.map((t) => [t.id, t]));
+      const tabs = order.map((id) => byId.get(id)).filter((t): t is DocumentMeta => !!t);
+      return { tabs };
+    });
+    // Restore the active tab.
+    const activeEntry = plan.entries.find((e) => e.sourceId === plan.activeTab);
+    if (activeEntry) {
+      const tab = get().tabs.find((t) => t.path && pathKey(t.path) === pathKey(activeEntry.path));
+      if (tab) set((s) => switchPatch(s, tab.id));
+    }
+    // Restore the saved panel layout (front-end config only; runs nothing).
+    const panels = panelsFromLayout(
+      await api
+        .projectGet()
+        .then((state) => state?.sections.layout ?? null)
+        .catch(() => null),
+    );
+    set((s) => ({
+      diagnosticsOpen: panels.diagnostics,
+      changesOpen: panels.changes,
+      explorer: { ...s.explorer, open: panels.explorer },
+    }));
+    // Reapply the active document's saved view when it stayed compatible.
+    if (activeEntry?.reapplyViews && activeEntry.activeViewId) {
+      const view = activeEntry.views.find((v) => v.id === activeEntry.activeViewId);
+      if (view)
+        await get()
+          .applyNamedView(view)
+          .catch(() => undefined);
+    }
+    set({
+      project: plan.meta,
+      projectBaseline: currentProjectSnapshot(),
+      projectWarnings: gatingWarnings(plan.entries),
+      projectOpen: null,
+      projectOpenChoices: {},
+    });
+  };
+
   return {
     tabs: [],
     activeId: null,
@@ -1664,6 +1834,12 @@ export const useStore = create<Store>((set, get) => {
     externalPrompt: null,
     ignoredFingerprints: {},
     quitPromptOpen: false,
+    project: null,
+    projectBaseline: null,
+    projectOpen: null,
+    projectOpenChoices: {},
+    projectWarnings: [],
+    projectClosePromptOpen: false,
     exportPreferredScope: null,
     fileJobs: {},
     encodingIssues: null,
@@ -3940,10 +4116,157 @@ export const useStore = create<Store>((set, get) => {
             return;
           }
         }
+        // Persist the project too, so a dirty workspace isn't lost on quit.
+        if (get().isProjectDirty()) {
+          const saved = await get().projectSave(false);
+          if (!saved) {
+            set({
+              quitPromptOpen: false,
+              error: "Quit cancelled — the project was not saved.",
+            });
+            return;
+          }
+        }
       }
       set({ quitPromptOpen: false });
       await getCurrentWindow().destroy();
     },
+
+    // ----- project workspaces (F37) -------------------------------------------
+
+    isProjectDirty: () => {
+      const s = get();
+      if (!s.project) return false;
+      return deriveProjectDirty(s.projectBaseline, currentProjectSnapshot());
+    },
+
+    projectNew: async (templatePath) => {
+      if (!(await guardDiscardProject())) return;
+      try {
+        const meta = await api.projectNew(templatePath);
+        set({
+          project: meta,
+          projectBaseline: currentProjectSnapshot(),
+          projectWarnings: [],
+          projectOpen: null,
+          projectOpenChoices: {},
+        });
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    projectNewFromTemplate: async () => {
+      const chosen = await openFileDialog({ multiple: false, filters: PROJECT_FILTERS });
+      if (typeof chosen === "string") await get().projectNew(chosen);
+    },
+
+    projectPickAndOpen: async () => {
+      if (!(await guardDiscardProject())) return;
+      const chosen = await openFileDialog({ multiple: false, filters: PROJECT_FILTERS });
+      if (typeof chosen !== "string") return;
+      try {
+        const preview = await api.projectOpenPreview(chosen);
+        set({ projectOpen: preview, projectOpenChoices: {} });
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    setProjectChoice: (sourceId, choice) =>
+      set((s) => ({ projectOpenChoices: { ...s.projectOpenChoices, [sourceId]: choice } })),
+
+    projectLocateSource: async (sourceId) => {
+      const chosen = await openFileDialog({ multiple: false, filters: FILE_FILTERS });
+      if (typeof chosen !== "string") return;
+      set((s) => ({
+        projectOpenChoices: {
+          ...s.projectOpenChoices,
+          [sourceId]: { action: "locate", locatePath: chosen },
+        },
+      }));
+    },
+
+    cancelProjectOpen: () => set({ projectOpen: null, projectOpenChoices: {} }),
+
+    applyProjectOpen: async () => {
+      const preview = get().projectOpen;
+      if (!preview) return;
+      const resolutions = buildResolutions(preview.sources, get().projectOpenChoices);
+      try {
+        const plan = await api.projectOpenApply(preview.path, resolutions);
+        await applyProjectPlan(plan);
+        if (preview.path) pushRecent(preview.path);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    projectOpenAvailableOnly: async () => {
+      const preview = get().projectOpen;
+      if (!preview) return;
+      set({ projectOpenChoices: availableOnlyChoices(preview.sources) });
+      await get().applyProjectOpen();
+    },
+
+    projectSave: async (saveAs) => {
+      const project = get().project;
+      if (!project) return false;
+      try {
+        await captureProjectSections();
+        let meta: ProjectMeta;
+        if (saveAs || !project.path) {
+          const chosen = await saveFileDialog({
+            defaultPath: `${project.name || "project"}.ceesveeproj`,
+            filters: PROJECT_FILTERS,
+          });
+          if (!chosen) return false;
+          meta = await api.projectSaveAs(chosen);
+        } else {
+          meta = await api.projectSave();
+        }
+        set({ project: meta, projectBaseline: currentProjectSnapshot() });
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    projectSaveTemplate: async () => {
+      if (!get().project) return;
+      const chosen = await saveFileDialog({
+        defaultPath: "template.ceesveeproj",
+        filters: PROJECT_FILTERS,
+      });
+      if (!chosen) return;
+      try {
+        // Persist live sections first so the template reflects current config.
+        await captureProjectSections();
+        await api.projectSaveTemplate(chosen);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    requestCloseProject: () => {
+      if (get().isProjectDirty()) set({ projectClosePromptOpen: true });
+      else void get().closeProjectNow();
+    },
+
+    closeProjectNow: async () => {
+      await api.projectClose().catch(() => undefined);
+      set({
+        project: null,
+        projectBaseline: null,
+        projectWarnings: [],
+        projectClosePromptOpen: false,
+        projectOpen: null,
+        projectOpenChoices: {},
+      });
+    },
+
+    dismissProjectWarnings: () => set({ projectWarnings: [] }),
 
     // ----- save / export pipeline (F03) ---------------------------------------
 
@@ -4435,4 +4758,24 @@ export const useStore = create<Store>((set, get) => {
 /** Convenience selector for the active document's metadata. */
 export function useActiveMeta(): DocumentMeta | null {
   return useStore((s) => s.tabs.find((t) => t.id === s.activeId) ?? null);
+}
+
+/**
+ * Whether the open project has unsaved changes (F37). Derived reactively from
+ * the open documents, active tab and panel layout versus the snapshot captured
+ * at the last save/open, so the dirty dot updates without event bookkeeping.
+ */
+export function useProjectDirty(): boolean {
+  return useStore((s) =>
+    s.project == null
+      ? false
+      : deriveProjectDirty(
+          s.projectBaseline,
+          projectSnapshot(s.tabs, s.activeId, {
+            diagnostics: s.diagnosticsOpen,
+            explorer: s.explorer.open,
+            changes: s.changesOpen,
+          }),
+        ),
+  );
 }

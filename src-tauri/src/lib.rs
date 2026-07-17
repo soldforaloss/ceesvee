@@ -42,6 +42,7 @@ mod parse;
 mod paste;
 mod pii;
 mod profile;
+mod project;
 mod recipe;
 mod reopen;
 mod repair;
@@ -138,6 +139,7 @@ pub fn run() {
         .manage(crate::pii::PiiCache::default())
         .manage(crate::follow::FollowRegistry::default())
         .manage(crate::json_import::JsonImportPreviewCache::default())
+        .manage(crate::project::ProjectStore::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -286,6 +288,15 @@ pub fn run() {
             commands::get_compare_info,
             commands::get_compare_results,
             commands::start_compare_export,
+            project::project_new,
+            project::project_get,
+            project::project_set_section,
+            project::project_save,
+            project::project_save_as,
+            project::project_save_template,
+            project::project_close,
+            project::project_open_preview,
+            project::project_open_apply,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

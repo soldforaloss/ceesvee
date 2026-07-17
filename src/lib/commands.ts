@@ -9,6 +9,7 @@ import { fuzzyScore } from "./fuzzy";
 
 export type CommandCategory =
   | "File"
+  | "Project"
   | "Edit"
   | "View"
   | "Data"

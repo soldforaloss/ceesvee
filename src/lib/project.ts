@@ -1,0 +1,394 @@
+// F37 project workspaces: pure, side-effect-free helpers shared by the store,
+// the project bar, and the open dialog. Everything here is deterministic so it
+// can be unit-tested without a backend — status mapping, per-source resolution
+// building, source/tab section capture, and project dirty-state derivation.
+
+import type {
+  DocumentMeta,
+  FileFingerprint,
+  PlanEntry,
+  ProjectLayoutSection,
+  ProjectSource,
+  ProjectTabsSection,
+  ResolutionEntry,
+  SourcePreviewEntry,
+  SourceStatus,
+} from "../types";
+
+// ----- panel layout + snapshot ------------------------------------------------
+
+/** The front-end-owned panel layout a project persists (config only). */
+export interface PanelLayout {
+  diagnostics: boolean;
+  explorer: boolean;
+  changes: boolean;
+}
+
+/**
+ * The slice of UI state a project tracks, used only to DERIVE dirty state
+ * (the authoritative persisted state is the backend's). Documents are keyed by
+ * path (a project references files, never unsaved buffers).
+ */
+export interface ProjectSnapshot {
+  /** Open document paths in tab order. */
+  order: string[];
+  /** Active document path, or null. */
+  active: string | null;
+  layout: PanelLayout;
+}
+
+/**
+ * Normalize a filesystem path for identity comparison. Windows paths compare
+ * case-insensitively and treat `\` and `/` alike; trailing separators are
+ * dropped. Used to match open documents against saved sources.
+ */
+export function pathKey(path: string): string {
+  return path
+    .replace(/[\\/]+/g, "/")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
+
+/** Capture the current project-relevant UI state (pure). */
+export function projectSnapshot(
+  tabs: Pick<DocumentMeta, "id" | "path">[],
+  activeId: number | null,
+  panels: PanelLayout,
+): ProjectSnapshot {
+  const order = tabs.map((t) => t.path).filter((p): p is string => p != null);
+  const active = tabs.find((t) => t.id === activeId)?.path ?? null;
+  return { order, active, layout: { ...panels } };
+}
+
+export function panelLayoutsEqual(a: PanelLayout, b: PanelLayout): boolean {
+  return a.diagnostics === b.diagnostics && a.explorer === b.explorer && a.changes === b.changes;
+}
+
+export function projectSnapshotsEqual(a: ProjectSnapshot, b: ProjectSnapshot): boolean {
+  const sameActive =
+    a.active === b.active ||
+    (a.active != null && b.active != null && pathKey(a.active) === pathKey(b.active));
+  return (
+    sameActive &&
+    a.order.length === b.order.length &&
+    a.order.every((p, i) => pathKey(p) === pathKey(b.order[i])) &&
+    panelLayoutsEqual(a.layout, b.layout)
+  );
+}
+
+/**
+ * Whether the open project has unsaved changes: true when the live snapshot has
+ * drifted from the one captured at the last save/open. With no baseline (no
+ * project open) nothing is dirty.
+ */
+export function deriveProjectDirty(
+  baseline: ProjectSnapshot | null,
+  current: ProjectSnapshot,
+): boolean {
+  if (!baseline) return false;
+  return !projectSnapshotsEqual(baseline, current);
+}
+
+// ----- open-dialog status mapping ---------------------------------------------
+
+export interface StatusDisplay {
+  label: string;
+  tone: "ok" | "warn" | "error";
+  /** One-line explanation for the dialog row. */
+  hint: string;
+}
+
+/** Human-readable label, tone and hint for a source's open status. */
+export function statusDisplay(status: SourceStatus): StatusDisplay {
+  switch (status) {
+    case "ok":
+      return {
+        label: "Ready",
+        tone: "ok",
+        hint: "File found and unchanged since the project was saved.",
+      };
+    case "missing":
+      return {
+        label: "Missing",
+        tone: "error",
+        hint: "The file is not at its saved location. Locate a replacement, or leave it out.",
+      };
+    case "movedCandidate":
+      return {
+        label: "Moved?",
+        tone: "warn",
+        hint: "The file moved, but a matching one was found nearby — relink it or locate another.",
+      };
+    case "changedFingerprint":
+      return {
+        label: "Changed",
+        tone: "warn",
+        hint: "The file changed since the project was saved; saved views won't be reapplied automatically.",
+      };
+    case "schemaIncompatible":
+      return {
+        label: "Columns changed",
+        tone: "warn",
+        hint: "The file's columns no longer match; saved views and schemas won't be reapplied.",
+      };
+  }
+}
+
+/** Whether the file exists at its stored path (so opening in place is valid). */
+export function canOpenInPlace(status: SourceStatus): boolean {
+  return status === "ok" || status === "changedFingerprint" || status === "schemaIncompatible";
+}
+
+// ----- per-source resolution --------------------------------------------------
+
+export type SourceAction = "open" | "locate" | "skip" | "remove";
+
+/** The user's per-source choice in the open dialog. */
+export interface SourceChoice {
+  action: SourceAction;
+  /** Absolute path chosen for a `locate` action. */
+  locatePath?: string;
+}
+
+/**
+ * The choice a source starts with: open when the file is present, relink to a
+ * found candidate when one moved, otherwise leave the source out (missing files
+ * never block opening the rest).
+ */
+export function defaultChoice(entry: SourcePreviewEntry): SourceChoice {
+  if (entry.status === "movedCandidate" && entry.movedCandidate) {
+    return { action: "locate", locatePath: entry.movedCandidate };
+  }
+  if (canOpenInPlace(entry.status)) return { action: "open" };
+  return { action: "skip" };
+}
+
+/** Whether a chosen action can actually be applied (no missing pieces). */
+export function choiceValid(entry: SourcePreviewEntry, choice: SourceChoice): boolean {
+  switch (choice.action) {
+    case "open":
+      return canOpenInPlace(entry.status);
+    case "locate":
+      return !!choice.locatePath;
+    case "skip":
+    case "remove":
+      return true;
+  }
+}
+
+/** Translate one choice into the backend resolution DTO. */
+export function resolutionFor(entry: SourcePreviewEntry, choice: SourceChoice): ResolutionEntry {
+  switch (choice.action) {
+    case "locate":
+      return { sourceId: entry.sourceId, action: "locate", path: choice.locatePath ?? "" };
+    case "skip":
+      return { sourceId: entry.sourceId, action: "skip" };
+    case "remove":
+      return { sourceId: entry.sourceId, action: "remove" };
+    case "open":
+      return { sourceId: entry.sourceId, action: "open" };
+  }
+}
+
+/** Build the full resolution list, filling unset entries with their defaults. */
+export function buildResolutions(
+  entries: SourcePreviewEntry[],
+  choices: Record<string, SourceChoice>,
+): ResolutionEntry[] {
+  return entries.map((e) => resolutionFor(e, choices[e.sourceId] ?? defaultChoice(e)));
+}
+
+/** Whether every source's current choice is actionable (enables "Open"). */
+export function canApply(
+  entries: SourcePreviewEntry[],
+  choices: Record<string, SourceChoice>,
+): boolean {
+  return entries.every((e) => choiceValid(e, choices[e.sourceId] ?? defaultChoice(e)));
+}
+
+/** "Open available only": open every present file, leave the rest out. */
+export function availableOnlyChoices(entries: SourcePreviewEntry[]): Record<string, SourceChoice> {
+  const out: Record<string, SourceChoice> = {};
+  for (const e of entries) {
+    out[e.sourceId] = canOpenInPlace(e.status) ? { action: "open" } : { action: "skip" };
+  }
+  return out;
+}
+
+/** Whether any source is missing/moved and needs a decision before opening. */
+export function hasBlockingSources(entries: SourcePreviewEntry[]): boolean {
+  return entries.some((e) => e.status === "missing" || e.status === "movedCandidate");
+}
+
+// ----- view-gating warnings ---------------------------------------------------
+
+export interface GatingWarning {
+  sourceId: string;
+  name: string;
+  warnings: string[];
+}
+
+/** Collect the sources whose saved views won't reapply, with their reasons. */
+export function gatingWarnings(entries: PlanEntry[]): GatingWarning[] {
+  return entries
+    .filter((e) => !e.reapplyViews && e.viewWarnings.length > 0)
+    .map((e) => ({
+      sourceId: e.sourceId,
+      name: e.displayName ?? e.path,
+      warnings: e.viewWarnings,
+    }));
+}
+
+// ----- capturing sections for save -------------------------------------------
+
+/** Mint a fresh, collision-free `src-N` id given the ids already in use. */
+export function mintSourceId(used: Set<string>): string {
+  let n = used.size + 1;
+  let id = `src-${n}`;
+  while (used.has(id)) {
+    n += 1;
+    id = `src-${n}`;
+  }
+  used.add(id);
+  return id;
+}
+
+/** Capture one open document as a source entry (config + fingerprint only). */
+function sourceFromTab(
+  id: string,
+  tab: DocumentMeta,
+  fingerprint: FileFingerprint | null,
+  prior?: ProjectSource,
+): ProjectSource {
+  return {
+    id,
+    path: tab.path as string,
+    displayName: tab.fileName,
+    fingerprint: fingerprint ?? prior?.fingerprint ?? null,
+    open: {
+      delimiter: tab.delimiter || null,
+      encoding: tab.encoding || null,
+      hasHeaderRow: tab.hasHeaderRow,
+    },
+    columns: tab.columnIds.map((cid, i) => ({ id: cid, name: tab.headers[i] ?? "" })),
+  };
+}
+
+/**
+ * Build the `sources` section by MERGING the open documents into the project's
+ * existing sources. An existing source whose file is currently open is
+ * refreshed (fingerprint, parse settings, column snapshot); one that is NOT
+ * open is preserved untouched, so a source that was "left out" on open stays
+ * referenced for next time. Open documents with no matching source are
+ * appended with a fresh id. Only file-backed documents are referenceable;
+ * unsaved buffers are skipped. Never captures cell data.
+ */
+export function buildSources(
+  tabs: DocumentMeta[],
+  existing: ProjectSource[],
+  fingerprints: Record<number, FileFingerprint | null>,
+): ProjectSource[] {
+  const openByPath = new Map<string, DocumentMeta>();
+  for (const tab of tabs) {
+    if (tab.path) openByPath.set(pathKey(tab.path), tab);
+  }
+  const used = new Set(existing.map((s) => s.id));
+  const seen = new Set<string>();
+  const out: ProjectSource[] = [];
+
+  // Preserve existing sources in place; refresh the ones that are open now.
+  for (const prior of existing) {
+    const key = pathKey(prior.path);
+    const tab = openByPath.get(key);
+    if (tab) {
+      out.push(sourceFromTab(prior.id, tab, fingerprints[tab.id] ?? null, prior));
+      seen.add(key);
+    } else {
+      out.push(prior);
+    }
+  }
+  // Append open documents that the project didn't reference yet.
+  for (const tab of tabs) {
+    if (!tab.path) continue;
+    const key = pathKey(tab.path);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(sourceFromTab(mintSourceId(used), tab, fingerprints[tab.id] ?? null));
+  }
+  return out;
+}
+
+/**
+ * Build the `tabs` section (open order + active) from the open documents,
+ * expressed in the stable source ids of the given `sources`.
+ */
+export function buildTabsSection(
+  sources: ProjectSource[],
+  tabs: DocumentMeta[],
+  activeId: number | null,
+): ProjectTabsSection {
+  const idByPath = new Map(sources.map((s) => [pathKey(s.path), s.id]));
+  const open: string[] = [];
+  for (const tab of tabs) {
+    if (!tab.path) continue;
+    const id = idByPath.get(pathKey(tab.path));
+    if (id) open.push(id);
+  }
+  const activeTab = tabs.find((t) => t.id === activeId);
+  const active = activeTab?.path ? (idByPath.get(pathKey(activeTab.path)) ?? null) : null;
+  return { open, active };
+}
+
+/** Build the `layout` section from the panel flags (config only). */
+export function buildLayoutSection(panels: PanelLayout): ProjectLayoutSection {
+  return {
+    panels: {
+      diagnostics: panels.diagnostics,
+      explorer: panels.explorer,
+      changes: panels.changes,
+    },
+  };
+}
+
+/** Read panel flags back from a stored layout section (missing → false). */
+export function panelsFromLayout(layout: ProjectLayoutSection | null | undefined): PanelLayout {
+  const p = layout?.panels;
+  return {
+    diagnostics: !!p?.diagnostics,
+    explorer: !!p?.explorer,
+    changes: !!p?.changes,
+  };
+}
+
+/**
+ * Order the given tab ids to match a plan's tab order: tabs whose path matches
+ * a plan entry come first (in plan order), any others keep their relative order
+ * at the end. Used to restore saved tab order after opening a project.
+ */
+export function orderTabsForPlan(
+  tabs: Pick<DocumentMeta, "id" | "path">[],
+  entries: PlanEntry[],
+): number[] {
+  const idsByPath = new Map<string, number[]>();
+  for (const t of tabs) {
+    if (!t.path) continue;
+    const key = pathKey(t.path);
+    const arr = idsByPath.get(key) ?? [];
+    arr.push(t.id);
+    idsByPath.set(key, arr);
+  }
+  const ordered: number[] = [];
+  const taken = new Set<number>();
+  for (const entry of entries) {
+    const arr = idsByPath.get(pathKey(entry.path));
+    const id = arr?.shift();
+    if (id !== undefined) {
+      ordered.push(id);
+      taken.add(id);
+    }
+  }
+  for (const t of tabs) {
+    if (!taken.has(t.id)) ordered.push(t.id);
+  }
+  return ordered;
+}

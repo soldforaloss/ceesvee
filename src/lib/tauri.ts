@@ -91,6 +91,11 @@ import type {
   SchemaImportOutcome,
   SchemaInfo,
   SchemaIssue,
+  ProjectMeta,
+  ProjectStateDto,
+  ProjectOpenPreview,
+  ProjectOpenPlan,
+  ResolutionEntry,
 } from "../types";
 
 export const openFile = (path: string, options?: OpenOptions) =>
@@ -931,3 +936,40 @@ export const jsonExport = (
   scope: ExportScope,
   expectedRevision: number,
 ) => invoke<number>("json_export", { docId, path, options, scope, expectedRevision });
+
+// ----- project workspaces (F37) ---------------------------------------------
+// The ProjectStore is THE persistence boundary: typed, versioned sections are
+// written through `project_set_section` and flushed atomically by `project_save`.
+
+/** Create a new (unsaved) project, optionally from a template, replacing any
+ * open one. The caller confirms discarding unsaved changes first. */
+export const projectNew = (templatePath?: string) =>
+  invoke<ProjectMeta>("project_new", { templatePath: templatePath ?? null });
+
+/** The current project (meta + all sections), or null. */
+export const projectGet = () => invoke<ProjectStateDto | null>("project_get");
+
+/** Replace one registered section; dirties the project only when it changed. */
+export const projectSetSection = (name: string, value: unknown) =>
+  invoke<ProjectMeta>("project_set_section", { name, value });
+
+/** Save the project to its existing path (atomic). */
+export const projectSave = () => invoke<ProjectMeta>("project_save");
+
+/** Save the project to a new path (atomic) and adopt it. */
+export const projectSaveAs = (path: string) => invoke<ProjectMeta>("project_save_as", { path });
+
+/** Export the open project as a reusable template (config only, no sources). */
+export const projectSaveTemplate = (path: string) =>
+  invoke<void>("project_save_template", { path });
+
+/** Close the project (documents stay open). Caller confirms unsaved changes. */
+export const projectClose = () => invoke<void>("project_close");
+
+/** Preview opening a project file: per-source statuses and gating verdicts. */
+export const projectOpenPreview = (path: string) =>
+  invoke<ProjectOpenPreview>("project_open_preview", { path });
+
+/** Apply a project open with per-source resolutions, replacing any open one. */
+export const projectOpenApply = (path: string, resolutions: ResolutionEntry[]) =>
+  invoke<ProjectOpenPlan>("project_open_apply", { path, resolutions });

@@ -37,6 +37,9 @@ import { ProfilesDialog } from "./components/ProfilesDialog";
 import { ProfileSuggestionBar } from "./components/ProfileSuggestionBar";
 import { OpenModeDialog } from "./components/OpenModeDialog";
 import { OutlierDialog } from "./components/OutlierDialog";
+import { ProjectBar } from "./components/ProjectBar";
+import { ProjectCloseDialog } from "./components/ProjectCloseDialog";
+import { ProjectOpenDialog } from "./components/ProjectOpenDialog";
 import { QuitDialog } from "./components/QuitDialog";
 import { RecipeDialog } from "./components/RecipeDialog";
 import { RecoveryDialog } from "./components/RecoveryDialog";
@@ -137,7 +140,7 @@ export default function App() {
     void getCurrentWindow()
       .onCloseRequested((event) => {
         const s = useStore.getState();
-        if (s.tabs.some((t) => t.dirty)) {
+        if (s.tabs.some((t) => t.dirty) || s.isProjectDirty()) {
           event.preventDefault();
           s.setQuitPromptOpen(true);
         }
@@ -260,6 +263,7 @@ export default function App() {
   return (
     <div className="flex h-full flex-col bg-white text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
       <Toolbar />
+      <ProjectBar />
       <Tabs />
       <SourceBar />
       <FollowBar />
@@ -328,6 +332,8 @@ export default function App() {
       <OpenModeDialog />
       <ArchiveEntryDialog />
       <QuitDialog />
+      <ProjectOpenDialog />
+      <ProjectCloseDialog />
       <EncodingIssuesDialog />
 
       {error && (
