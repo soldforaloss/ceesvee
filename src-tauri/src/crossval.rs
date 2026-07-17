@@ -422,12 +422,15 @@ fn violation_reason<'d>(
         } => {
             let raw = cell(when_column);
             let value = raw.trim();
+            // Blankness follows the same schema-aware predicate as the required
+            // side: a configured null token on the trigger column counts as
+            // blank, so it never satisfies Equals/NonBlank and always satisfies
+            // Blank (consistent with `blank(then_required)` below).
+            let when_blank = blank(when_column);
             let fires = match when {
-                WhenCondition::Equals { value: expect } => {
-                    !value.is_empty() && value == expect.trim()
-                }
-                WhenCondition::NonBlank => !value.is_empty(),
-                WhenCondition::Blank => value.is_empty(),
+                WhenCondition::Equals { value: expect } => !when_blank && value == expect.trim(),
+                WhenCondition::NonBlank => !when_blank,
+                WhenCondition::Blank => when_blank,
             };
             if fires && blank(then_required) {
                 Some(format!("\"{then_required}\" is required here but blank"))
@@ -993,5 +996,43 @@ mod tests {
         // blank and skips the rule instead of reading as "not a date".
         assert_eq!(report.rules[0].violations, 1);
         assert_eq!(report.rules[0].sample[0].row, 1);
+    }
+
+    #[test]
+    fn conditional_required_when_side_respects_null_tokens() {
+        // A declared null token on the trigger column counts as blank, so the
+        // `when` side uses the same schema-aware predicate as the required
+        // side: a null token must not satisfy NonBlank and must satisfy Blank.
+        let mut d = doc("status,reason\nNULL,\nactive,\n");
+        declare_with(&mut d, 0, crate::schema::LogicalType::Text, |s| {
+            s.null_tokens = vec!["NULL".to_string()];
+        });
+
+        let when_nonblank = run(
+            &d,
+            vec![CrossRule::ConditionalRequired {
+                when_column: "status".into(),
+                when: WhenCondition::NonBlank,
+                then_required: "reason".into(),
+            }],
+        );
+        // Row 0's "NULL" is a null token → blank → NonBlank does not fire; only
+        // the "active" row (1) fires with a blank reason. Without the fix,
+        // "NULL" would read as nonblank and row 0 would also violate.
+        assert_eq!(when_nonblank.rules[0].violations, 1);
+        assert_eq!(when_nonblank.rules[0].sample[0].row, 1);
+
+        let when_blank = run(
+            &d,
+            vec![CrossRule::ConditionalRequired {
+                when_column: "status".into(),
+                when: WhenCondition::Blank,
+                then_required: "reason".into(),
+            }],
+        );
+        // Symmetrically, the "NULL" row counts as blank and fires Blank; the
+        // "active" row does not.
+        assert_eq!(when_blank.rules[0].violations, 1);
+        assert_eq!(when_blank.rules[0].sample[0].row, 0);
     }
 }

@@ -181,3 +181,23 @@ describe("formatCellValue — dates", () => {
     ).toBe("31/01/2024");
   });
 });
+
+describe("formatCellValue — null tokens render raw", () => {
+  it("leaves a parseable numeric null token unformatted", () => {
+    // "0" parses as an integer, but it is a configured null token, so it is
+    // classified as blank and renders raw — never "0.00" — matching the Rust
+    // `classify`/`format_value` path.
+    const s = schema({ logicalType: "integer", displayFormat: "fixed:2", nullTokens: ["0"] });
+    expect(formatCellValue(s, "0")).toBe("0");
+    expect(formatCellValue(s, " 0 ")).toBe(" 0 ");
+    // A non-token value still formats normally.
+    expect(formatCellValue(s, "5")).toBe("5.00");
+  });
+
+  it("leaves a parseable date sentinel token unformatted", () => {
+    const s = schema({ logicalType: "date", displayFormat: "eu", nullTokens: ["1970-01-01"] });
+    expect(formatCellValue(s, "1970-01-01")).toBe("1970-01-01");
+    // A real date under the same schema still reformats.
+    expect(formatCellValue(s, "2024-01-31")).toBe("31.01.2024");
+  });
+});

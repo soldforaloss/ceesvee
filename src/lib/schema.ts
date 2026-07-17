@@ -480,14 +480,28 @@ function formatTemporal(t: Temporal, fmt: string, hasTime: boolean): string | nu
 // ---------------------------------------------------------------------------
 
 /**
+ * Whether the (trimmed) cell matches one of the column's configured null
+ * tokens. Mirrors the Rust `schema::is_null_token`: the cell is trimmed and
+ * each token compared verbatim.
+ */
+function isNullToken(schema: ColumnSchema, raw: string): boolean {
+  const trimmed = raw.trim();
+  return schema.nullTokens.some((t) => t === trimmed);
+}
+
+/**
  * Render a cell for DISPLAY under the column schema's `displayFormat`. Never
  * changes stored text: no schema, no display format, an unknown pattern, or a
  * value that does not parse as the declared type all yield the raw text.
- * Text/boolean/uuid/json have no display patterns and always render raw.
+ * Text/boolean/uuid/json have no display patterns and always render raw. A cell
+ * matching a configured null token is classified as blank — never a value — so
+ * it renders raw even when it would otherwise parse (e.g. a "0" token under a
+ * numeric fixed:2 format), mirroring the Rust `classify`/`format_value` path.
  */
 export function formatCellValue(schema: ColumnSchema | undefined, raw: string): string {
   const fmt = schema?.displayFormat;
   if (!schema || !fmt) return raw;
+  if (isNullToken(schema, raw)) return raw;
   const lt = schema.logicalType;
   if (isNumericType(lt)) {
     const sep = separatorsFor(schema.locale);
