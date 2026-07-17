@@ -40,6 +40,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   null (still distinguishable from empty strings) everywhere. Ragged
   short rows classify as MISSING fields in schema scans, mapped exactly
   through new record indices on the import diagnostics.
+- **Explicit schemas and typed columns (F31, editor UI)**: a searchable
+  per-column schema editor (palette → "Edit schema…", or a column
+  header's menu) for the logical type, nullability, null tokens
+  (including the empty string), locale, time zone, custom input formats,
+  display format, and advisory/strict validation mode. One click infers a
+  schema from the data; schemas import and export as versioned JSON.
+  Column headers show a violet badge for the declared logical type
+  (winning over the detected-type badge), and a declared display format
+  reformats how a cell is shown while the editor and copy/fill always see
+  the raw stored text — so declaring a ZIP column as text keeps its
+  leading zeroes and changing a display format never dirties the document.
+  The editor surfaces a column's five cell states with invalid-value
+  samples and runs the canonical conversion as a previewed, cancellable,
+  single-undo operation. Cell edits are gated by the column's validation
+  mode: strict blocks an invalid edit in the editor (and the backend) with
+  an inline reason; advisory accepts it and records an issue.
 
 ## [0.4.0]
 

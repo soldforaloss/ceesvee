@@ -80,6 +80,14 @@ import type {
   TransformPreview,
   TransformSpec,
   ZipEntryInfo,
+  CellEditValidation,
+  ColumnSchema,
+  ConvertPreview,
+  DocumentSchema,
+  InvalidSampleReport,
+  SchemaImportOutcome,
+  SchemaInfo,
+  SchemaIssue,
 } from "../types";
 
 export const openFile = (path: string, options?: OpenOptions) =>
@@ -476,6 +484,73 @@ export const applyCrossvalFilter = (
     rule,
     expectedRevision,
   });
+
+// ----- explicit schemas and typed columns (F31) ----------------------------
+
+/** The document's explicit schema, names refreshed from headers by ID (F31). */
+export const getSchema = (docId: number) => invoke<SchemaInfo>("get_schema", { docId });
+
+/** Infer a schema from the data (read-only; nothing is assigned) (F31). */
+export const inferSchema = (docId: number) => invoke<DocumentSchema>("infer_schema", { docId });
+
+/** Assign or replace ONE column's schema (metadata: never dirties) (F31). */
+export const setColumnSchema = (docId: number, schema: ColumnSchema) =>
+  invoke<SchemaInfo>("set_column_schema", { docId, schema });
+
+/** Drop one column's schema entry, back to implicit text (F31). */
+export const removeColumnSchema = (docId: number, columnId: string) =>
+  invoke<SchemaInfo>("remove_column_schema", { docId, columnId });
+
+/** Export the schema as versioned JSON (atomic write) (F31). */
+export const exportSchema = (docId: number, path: string) =>
+  invoke<void>("export_schema", { docId, path });
+
+/** Import a versioned schema JSON file, REPLACING the schema (F31). */
+export const importSchema = (docId: number, path: string) =>
+  invoke<SchemaImportOutcome>("import_schema", { docId, path });
+
+/** Pure pre-check: how the declared schema judges a proposed value (F31). */
+export const validateCellEdit = (docId: number, col: number, value: string) =>
+  invoke<CellEditValidation>("validate_cell_edit", { docId, col, value });
+
+/** The advisory-validation issues recorded on the document (F31). */
+export const getSchemaIssues = (docId: number) =>
+  invoke<SchemaIssue[]>("get_schema_issues", { docId });
+
+/** Clear the recorded advisory-validation issues (F31). */
+export const clearSchemaIssues = (docId: number) => invoke<void>("clear_schema_issues", { docId });
+
+/** Bounded sample of a column's invalid values + five-state counts (F31). */
+export const schemaInvalidSamples = (
+  docId: number,
+  columnId: string,
+  maxSamples: number,
+  expectedRevision: number,
+) =>
+  invoke<InvalidSampleReport>("schema_invalid_samples", {
+    docId,
+    columnId,
+    maxSamples,
+    expectedRevision,
+  });
+
+/** Preview the canonical conversion of one column, without mutating (F31). */
+export const convertColumnPreview = (
+  docId: number,
+  columnId: string,
+  maxSamples: number,
+  expectedRevision: number,
+) =>
+  invoke<ConvertPreview>("convert_column_preview", {
+    docId,
+    columnId,
+    maxSamples,
+    expectedRevision,
+  });
+
+/** Apply a previewed conversion as ONE undoable job (revision-guarded) (F31). */
+export const convertColumnApply = (docId: number, columnId: string, expectedRevision: number) =>
+  invoke<number>("convert_column_apply", { docId, columnId, expectedRevision });
 
 /**
  * Open a file in indexed read-only mode (F10). The document registers under

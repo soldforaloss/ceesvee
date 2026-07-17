@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { containsNul, countLines, escapeCellText, utf8ByteLength } from "../lib/cellText";
+import { gateCellEdit } from "../lib/schema";
 import * as api from "../lib/tauri";
 import { useActiveMeta, useStore } from "../store/useStore";
+import type { CellEditValidation } from "../types";
 
 type Mode = "rendered" | "escaped";
 
@@ -31,6 +33,8 @@ export function CellEditorDialog() {
   const [counts, setCounts] = useState({ lines: 1, chars: 0, bytes: 0 });
   // Whether the current value parses as JSON (F26: pretty-print action).
   const [isJson, setIsJson] = useState(false);
+  // F31: the declared-schema verdict on the current value (debounced).
+  const [schemaCheck, setSchemaCheck] = useState<CellEditValidation | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const readOnly = meta?.backing === "indexedReadOnly";
@@ -77,6 +81,28 @@ export function CellEditorDialog() {
     return () => clearTimeout(handle);
   }, [value]);
 
+  // F31: check the value against the column's declared schema (debounced).
+  // The verdict drives an inline warning/error and, in strict mode, blocks
+  // Save; the backend enforces the same rule regardless.
+  useEffect(() => {
+    if (value === null || !meta || !target || readOnly) {
+      setSchemaCheck(null);
+      return;
+    }
+    let cancelled = false;
+    const handle = setTimeout(() => {
+      api
+        .validateCellEdit(meta.id, target.col, value)
+        .then((v) => !cancelled && setSchemaCheck(v))
+        .catch(() => !cancelled && setSchemaCheck(null));
+    }, 150);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value, meta?.id, target?.col, readOnly]);
+
   // Escaped text is computed only when that mode is shown (large cells).
   const escaped = useMemo(
     () => (mode === "escaped" && value !== null ? escapeCellText(value) : ""),
@@ -87,6 +113,8 @@ export function CellEditorDialog() {
 
   const hasNul = value !== null && containsNul(value);
   const dirty = value !== null && original !== null && value !== original;
+  // F31 strict/advisory gate: strict blocks the commit, advisory only warns.
+  const gate = gateCellEdit(schemaCheck);
 
   const save = async () => {
     if (value === null || readOnly) return;
@@ -96,6 +124,15 @@ export function CellEditorDialog() {
     }
     setSaving(true);
     try {
+      // Authoritative F31 pre-check (the debounced verdict may lag a keystroke):
+      // strict mode blocks an invalid edit here, with an inline reason, before
+      // it reaches the backend. Advisory mode records the issue on commit.
+      const verdict = await api.validateCellEdit(meta.id, target.col, value);
+      if (gateCellEdit(verdict).block) {
+        setError(gateCellEdit(verdict).message ?? "Value rejected by the column's strict schema.");
+        setSaving(false);
+        return;
+      }
       // One undo step: the ordinary set_cell path.
       await setCell(target.row, target.col, value);
       // The windowed grid cache still holds the old value (set_cell only
@@ -226,7 +263,7 @@ export function CellEditorDialog() {
           {!readOnly && (
             <button
               onClick={() => void save()}
-              disabled={saving || value === null || !dirty || hasNul}
+              disabled={saving || value === null || !dirty || hasNul || gate.block}
               className="rounded bg-violet-600 px-3 py-1 text-white hover:bg-violet-500 disabled:opacity-40"
             >
               {saving ? "Saving…" : "Save"}
@@ -234,6 +271,16 @@ export function CellEditorDialog() {
           )}
         </div>
 
+        {gate.message && !readOnly && (
+          <p
+            className={`mt-2 text-xs ${
+              gate.block ? "text-red-600 dark:text-red-400" : "text-amber-600 dark:text-amber-400"
+            }`}
+          >
+            {gate.block ? "Strict schema — commit blocked: " : "Advisory — will record an issue: "}
+            {gate.message}
+          </p>
+        )}
         {error && <p className="mt-2 text-xs text-red-600 dark:text-red-400">{error}</p>}
       </div>
     </div>
