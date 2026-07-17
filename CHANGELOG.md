@@ -8,54 +8,39 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Explicit schemas and typed columns (F31, backend core)**: a logical
-  schema layer — nine logical types (text, integer, decimal, float,
-  boolean, date, datetime, uuid, json) declared per column and keyed by
-  stable column IDs so assignments survive renames and reorders. Cells
-  classify into five distinguishable states (missing field, configured
-  null token, empty string, valid, invalid); assigning a type never
-  rewrites cell text. Includes locale-aware number parsing (`de-DE`,
-  `fr-FR`, Swiss grouping, …), timezone-aware datetime parsing
-  (IANA zones, DST folds resolve earliest, DST gaps invalid), custom
-  date input formats, schema inference from the data (with leading-zero
-  protection so ZIP-like columns stay text), edit validation for the
-  upcoming strict/advisory modes, display-only formatting patterns, and
-  versioned schema import/export JSON. UI integration lands next.
-- **Explicit schemas and typed columns (F31, backend integration)**: the
-  full command surface — get/infer/assign/remove column schemas,
-  versioned JSON import/export (atomic writes, unknown columns skipped
-  and reported), invalid-value samples with exact five-state counts,
-  and canonical conversion as a previewed, revision-guarded job that
-  applies as ONE undoable operation (invalid cells keep their text and
-  are counted). Strict validation now rejects an invalid cell edit
-  before it reaches the document; advisory mode applies the edit and
-  records a bounded, retrievable issue list. Schema edits (including
-  display-format changes) never mark the document dirty and track their
-  own `schemaRevision`. Sorting (destructive and view), range filters,
-  column profiles and summaries, group-by aggregates and key ordering,
-  join key equivalence, and cross-field validation rules now prefer the
-  declared logical type over heuristics — integers compare as full-width
-  integers, decimals exactly, dates chronologically, locale decimals
-  parse under the declared locale, and configured null tokens count as
-  null (still distinguishable from empty strings) everywhere. Ragged
-  short rows classify as MISSING fields in schema scans, mapped exactly
-  through new record indices on the import diagnostics.
-- **Explicit schemas and typed columns (F31, editor UI)**: a searchable
-  per-column schema editor (palette → "Edit schema…", or a column
-  header's menu) for the logical type, nullability, null tokens
-  (including the empty string), locale, time zone, custom input formats,
-  display format, and advisory/strict validation mode. One click infers a
-  schema from the data; schemas import and export as versioned JSON.
-  Column headers show a violet badge for the declared logical type
-  (winning over the detected-type badge), and a declared display format
-  reformats how a cell is shown while the editor and copy/fill always see
-  the raw stored text — so declaring a ZIP column as text keeps its
-  leading zeroes and changing a display format never dirties the document.
-  The editor surfaces a column's five cell states with invalid-value
-  samples and runs the canonical conversion as a previewed, cancellable,
-  single-undo operation. Cell edits are gated by the column's validation
-  mode: strict blocks an invalid edit in the editor (and the backend) with
-  an inline reason; advisory accepts it and records an issue.
+- **Explicit schemas and typed columns** (palette → "Edit schema…", or a
+  column header's menu): declare an explicit logical type per column —
+  text, integer, decimal, float, boolean, date, datetime, UUID, or JSON —
+  as a layer ON TOP of the raw text that never rewrites a cell, so a ZIP
+  column declared text keeps its leading zeroes. Every cell resolves to
+  one of five distinguishable states — a missing field in a ragged short
+  row, a configured null token, an empty string, a valid typed value, or a
+  value invalid for the declared type — and empty strings stay distinct
+  from null tokens everywhere. Schemas key columns by stable IDs so
+  assignments survive renames and reorders; one click infers a schema from
+  the data (with leading-zero protection so numeric-looking codes stay
+  text), and whole schemas import and export as versioned JSON (unknown
+  columns are skipped and reported). The searchable per-column editor sets
+  the logical type, nullability, null tokens (including the empty string),
+  locale, time zone, custom input formats, a display format, and an
+  advisory/strict validation mode. Parsing is locale-aware (`de-DE` /
+  `fr-FR` decimals, Swiss grouping, …) and timezone-aware (IANA zones, DST
+  folds resolve earliest, gaps are invalid); a display format only changes
+  how a cell is shown — the editor, copy, and fill always see the raw
+  stored text, and changing a display format never marks the document
+  dirty. Column headers show a violet badge for the declared type, and
+  sorting (destructive and view), range filters, column profiles and
+  summaries, group-by aggregates, join key equivalence, and cross-column
+  validation all prefer the declared logical type over heuristics —
+  full-width integer, exact decimal, and chronological date comparisons,
+  locale-parsed decimals, and null tokens counted as null (still distinct
+  from empty strings). The editor surfaces each column's five-state counts
+  with invalid-value samples and runs a canonical conversion as a
+  previewed, cancellable, single-undo operation that leaves invalid and
+  null cells untouched. Cell edits are gated by the column's mode — strict
+  rejects an invalid edit before it reaches the model (in the editor and
+  the backend), advisory accepts it and records a bounded, retrievable
+  issue — while schema edits themselves never touch the undo stack.
 
 ## [0.4.0]
 
