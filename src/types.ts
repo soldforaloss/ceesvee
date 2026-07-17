@@ -1484,3 +1484,116 @@ export interface SchemaIssue {
   /** Document revision AFTER the edit was applied. */
   revision: number;
 }
+
+// ----- JSON / JSON Lines interoperability (F33) -----------------------------
+
+/** How nested objects are handled on import (mirrors Rust `NestedPolicy`). */
+export type NestedPolicy = "flatten" | "preserveJson";
+
+/** How array-valued fields are handled on import (mirrors `ArrayPolicy`). */
+export type ArrayPolicy = "preserveJson" | "explode" | "join" | "reject";
+
+/** The explicit choice required when two or more array fields explode. */
+export type MultiArrayMode = "cartesian" | "zip";
+
+/** The recognised JSON input shapes (mirrors Rust `DetectedShape`). */
+export type DetectedShape =
+  | "objectArray"
+  | "arrayOfArrays"
+  | "primitiveArray"
+  | "jsonLines"
+  | "objectDocument"
+  | "scalarDocument";
+
+/** Everything a JSON import needs to know (wire DTO; camelCase). */
+export interface JsonImportOptions {
+  /** Record-array JSON Pointer; `undefined`/`""` is the document root. */
+  pointer?: string;
+  nestedPolicy: NestedPolicy;
+  /** Flattened paths dropped together with everything under them. */
+  ignorePaths: string[];
+  arrayPolicy: ArrayPolicy;
+  /** Required when `arrayPolicy` is `join` (empty string allowed). */
+  joinSeparator?: string;
+  /** Required when a record explodes two or more array fields. */
+  multiArray?: MultiArrayMode;
+  /** Cell text that means an explicit JSON null. */
+  nullToken: string;
+  /** Cell text that means a missing property. */
+  missingToken: string;
+  /** Spill straight to the indexed read-only backing. */
+  forceIndexed: boolean;
+}
+
+/** One auto-detected record-array candidate inside an object document. */
+export interface PointerCandidate {
+  /** RFC 6901 JSON Pointer (`""` is the root). */
+  pointer: string;
+  records: number;
+  /** `"object"`, `"array"`, `"primitive"`, `"mixed"` or `"empty"`. */
+  elementKind: string;
+}
+
+/** One column of the JSON import preview. */
+export interface PreviewColumn {
+  /** Flattened path name (dot-joined, `.`/`\` escaped). */
+  name: string;
+  inferredType: LogicalType;
+  /** Occurrences with a value (per record, or per element when exploded). */
+  present: number;
+  /** Occurrences that were an explicit JSON null. */
+  nulls: number;
+  /** Records in which the path did not occur at all. */
+  missing: number;
+}
+
+/** One array-valued field, for the preview's policy picker. */
+export interface ArrayFieldInfo {
+  path: string;
+  occurrences: number;
+  maxLen: number;
+  primitivesOnly: boolean;
+}
+
+/** Everything the JSON import dialog needs to render (bounded samples). */
+export interface JsonImportPreview {
+  shape: DetectedShape;
+  /** The pointer actually used (empty string = root), when resolved. */
+  pointer?: string;
+  /** True when an object document still needs a record-array pointer. */
+  needsPointer: boolean;
+  candidates: PointerCandidate[];
+  /** `"object"`, `"array"` or `"value"`, when known. */
+  recordKind?: string;
+  columns: PreviewColumn[];
+  nestedObjectPaths: string[];
+  arrayFields: ArrayFieldInfo[];
+  recordCount: number;
+  /** Rows the import will produce (explosion accounted for). */
+  projectedRows: number;
+  projectedColumns: number;
+  /** Up to N rows exactly as they would land in the grid. */
+  sampleRows: string[][];
+  exploded: boolean;
+  warnings: string[];
+}
+
+/** The three JSON output layouts (mirrors Rust `JsonExportFormat`). */
+export type JsonExportFormat = "objects" | "arrays" | "jsonLines";
+
+/** Options controlling a JSON export (F33). */
+export interface JsonExportOptions {
+  format: JsonExportFormat;
+  /** Cells with EXACTLY this text export as JSON `null` (null disables). */
+  nullToken?: string;
+  /** Cells with EXACTLY this text export as a MISSING property (null disables). */
+  missingToken?: string;
+  /** Rebuild nested objects from flattened path column names. */
+  rebuildNested: boolean;
+  /** Emit typed JSON values for columns with a declared schema. */
+  typed: boolean;
+  /** Arrays format only: write the header names as the first array. */
+  includeHeaders: boolean;
+  /** Backup policy for the previous destination file. */
+  backup: BackupPolicy;
+}
