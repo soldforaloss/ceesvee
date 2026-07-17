@@ -8,7 +8,7 @@
 //! undo step, and nothing leaves the device (the audit log stores counts,
 //! never values).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use hmac::{Hmac, Mac};
@@ -196,6 +196,23 @@ pub struct PiiFinding {
     pub samples: Vec<String>,
 }
 
+/// A column the data dictionary (F38) classifies as confidential or
+/// restricted. Surfaced by the scan preflight EVEN WITHOUT a pattern hit, so a
+/// declared-sensitive column that no detector matched is still flagged for the
+/// package/export preflight to act on.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SensitivityFlag {
+    pub column: usize,
+    pub column_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// "confidential" or "restricted".
+    pub sensitivity: String,
+    /// Whether a detector also matched this column in this scan.
+    pub has_pattern_hit: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PiiReport {
@@ -203,6 +220,9 @@ pub struct PiiReport {
     pub scanned_rows: usize,
     pub total_matches: usize,
     pub findings: Vec<PiiFinding>,
+    /// F38: columns the dictionary declares confidential/restricted, flagged
+    /// regardless of pattern hits so the preflight cannot miss them.
+    pub sensitivity_flags: Vec<SensitivityFlag>,
 }
 
 /// Run a PII scan. Read-only; never dirties the document.
@@ -256,11 +276,27 @@ pub fn scan(doc: &Document, spec: &PiiSpec, ctx: &JobCtx) -> AppResult<PiiReport
             .then_with(|| a.column.cmp(&b.column))
             .then_with(|| a.detector.cmp(&b.detector))
     });
+
+    // F38 preflight: fold in columns the dictionary declares confidential or
+    // restricted, whether or not a detector matched them.
+    let hit_columns: HashSet<usize> = findings.iter().map(|f| f.column).collect();
+    let sensitivity_flags = crate::dictionary::sensitive_columns(doc)
+        .into_iter()
+        .map(|s| SensitivityFlag {
+            column: s.column,
+            column_id: s.column_id,
+            display_name: s.display_name,
+            sensitivity: s.sensitivity.label().to_string(),
+            has_pattern_hit: hit_columns.contains(&s.column),
+        })
+        .collect();
+
     Ok(PiiReport {
         revision: doc.revision(),
         scanned_rows: rows.len(),
         total_matches: findings.iter().map(|f| f.count).sum(),
         findings,
+        sensitivity_flags,
     })
 }
 
@@ -634,6 +670,46 @@ mod tests {
         let _ = run(&d, &spec(vec![PiiDetector::Email]));
         assert_eq!(d.revision(), before);
         assert_eq!(d.rows()[0][0], "user@example.com");
+    }
+
+    #[test]
+    fn dictionary_sensitivity_is_folded_into_the_report() {
+        use crate::dictionary::{DictionaryField, Sensitivity};
+        // Column 0 has emails (a pattern hit); column 1 is declared restricted
+        // but holds nothing a detector matches; column 2 is plain.
+        let mut d = doc("email,secret,plain\nuser@example.com,alpha,x\n");
+        let ids: Vec<String> = d.column_ids().to_vec();
+        let mut a = DictionaryField::empty(ids[0].clone());
+        a.sensitivity = Some(Sensitivity::Confidential);
+        d.set_dictionary_field(a);
+        let mut b = DictionaryField::empty(ids[1].clone());
+        b.sensitivity = Some(Sensitivity::Restricted);
+        b.display_name = Some("Secret".into());
+        d.set_dictionary_field(b);
+
+        let report = run(&d, &spec(vec![PiiDetector::Email]));
+        // The restricted column is flagged even though no detector matched it.
+        assert_eq!(report.sensitivity_flags.len(), 2);
+        let secret = report
+            .sensitivity_flags
+            .iter()
+            .find(|f| f.column == 1)
+            .unwrap();
+        assert_eq!(secret.sensitivity, "restricted");
+        assert!(
+            !secret.has_pattern_hit,
+            "no detector matched the secret col"
+        );
+        assert_eq!(secret.display_name.as_deref(), Some("Secret"));
+        // The confidential email column both matched a detector AND is flagged.
+        let email = report
+            .sensitivity_flags
+            .iter()
+            .find(|f| f.column == 0)
+            .unwrap();
+        assert!(email.has_pattern_hit);
+        // Setting the dictionary never dirtied the document.
+        assert!(!d.is_dirty());
     }
 
     #[test]

@@ -14,6 +14,11 @@ mod delimiter;
 mod derived;
 mod diagnostics;
 mod dialect;
+/// Public like [`job`]: the F38 data-dictionary model (per-column
+/// documentation keyed by stable column ID, versioned import/export, the merge
+/// engine and the profile/PII integration hooks) is a stable internal API
+/// consumed by the profile and PII modules and the test harness.
+pub mod dictionary;
 mod document;
 mod dto;
 mod encoding;
@@ -275,6 +280,13 @@ pub fn run() {
             commands::start_pii_scan,
             commands::preview_redaction,
             commands::apply_redaction,
+            commands::get_dictionary,
+            commands::set_dictionary_field,
+            commands::remove_dictionary_field,
+            commands::discard_dictionary_orphans,
+            commands::export_dictionary,
+            commands::preview_dictionary_import,
+            commands::apply_dictionary_import,
             commands::get_changes,
             commands::revert_change,
             commands::revert_change_cells,
