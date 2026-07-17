@@ -43,6 +43,7 @@
 //!   - `"us"` — `01/31/2024` (+ ` 15:04:05`)
 //!   - `"long"` — `Jan 31, 2024` (+ ` 15:04`)
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use chrono::{DateTime, Datelike, LocalResult, NaiveDate, NaiveDateTime, TimeZone};
@@ -379,6 +380,46 @@ fn increment_digits(d: &str) -> String {
     out.push('1');
     out.push_str(std::str::from_utf8(&bytes).expect("ascii digits"));
     out
+}
+
+impl LogicalType {
+    /// The numeric types (locale-aware parsing, numeric ordering).
+    pub fn is_numeric(self) -> bool {
+        matches!(
+            self,
+            LogicalType::Integer | LogicalType::Decimal | LogicalType::Float
+        )
+    }
+
+    /// The temporal types (chronological ordering).
+    pub fn is_temporal(self) -> bool {
+        matches!(self, LogicalType::Date | LogicalType::Datetime)
+    }
+
+    /// Whether declared values have a meaningful non-lexicographic order
+    /// (numeric, chronological or boolean) that sorting and range filters
+    /// should prefer over the text heuristics.
+    pub fn has_typed_order(self) -> bool {
+        self.is_numeric() || self.is_temporal() || self == LogicalType::Boolean
+    }
+}
+
+/// The coarse [`crate::dto::ColumnKind`] a declared logical type maps to, for
+/// the surfaces (grid badges, profiles) that predate the nine-type schema.
+pub fn column_kind_of(lt: LogicalType) -> crate::dto::ColumnKind {
+    use crate::dto::ColumnKind;
+    match lt {
+        LogicalType::Integer | LogicalType::Decimal | LogicalType::Float => ColumnKind::Number,
+        LogicalType::Boolean => ColumnKind::Bool,
+        LogicalType::Date | LogicalType::Datetime => ColumnKind::Date,
+        LogicalType::Text | LogicalType::Uuid | LogicalType::Json => ColumnKind::Text,
+    }
+}
+
+/// Whether the (trimmed) cell matches one of the schema's null tokens.
+pub fn is_null_token(schema: &ColumnSchema, cell: &str) -> bool {
+    let trimmed = cell.trim();
+    schema.null_tokens.iter().any(|t| t.as_str() == trimmed)
 }
 
 /// A successfully parsed cell value.
@@ -949,6 +990,209 @@ pub fn format_value(schema: &ColumnSchema, raw: &str) -> String {
         _ => None,
     };
     formatted.unwrap_or_else(|| raw.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Typed ordering (sort / filter / group-by prefer the DECLARED type)
+// ---------------------------------------------------------------------------
+
+impl DecimalValue {
+    /// Numeric sign: -1, 0 or 1.
+    fn signum(&self) -> i8 {
+        if self.digits == "0" {
+            0
+        } else if self.negative {
+            -1
+        } else {
+            1
+        }
+    }
+
+    /// Exact numeric comparison (string arithmetic — no float error, any
+    /// precision).
+    pub fn cmp_value(&self, other: &DecimalValue) -> Ordering {
+        let (sa, sb) = (self.signum(), other.signum());
+        if sa != sb {
+            return sa.cmp(&sb);
+        }
+        if sa == 0 {
+            return Ordering::Equal;
+        }
+        // Rescaling UP is exact (zero padding only), so compare at the wider
+        // scale. Digits carry no leading zeros: longer means larger.
+        let scale = self.scale.max(other.scale);
+        let (a, b) = (self.rescaled(scale), other.rescaled(scale));
+        let magnitude = a
+            .digits
+            .len()
+            .cmp(&b.digits.len())
+            .then_with(|| a.digits.cmp(&b.digits));
+        if sa < 0 {
+            magnitude.reverse()
+        } else {
+            magnitude
+        }
+    }
+}
+
+/// Order two typed values of the SAME logical type (one column, one schema).
+/// Mismatched variants (impossible for cells classified under one schema)
+/// fall back to `Equal`.
+pub fn compare_typed(a: &TypedValue, b: &TypedValue) -> Ordering {
+    match (a, b) {
+        (TypedValue::Text(x), TypedValue::Text(y)) => x.cmp(y),
+        (TypedValue::Integer(x), TypedValue::Integer(y)) => x.cmp(y),
+        (TypedValue::Decimal(x), TypedValue::Decimal(y)) => x.cmp_value(y),
+        // Floats are finite by construction, so partial_cmp is total here.
+        (TypedValue::Float(x), TypedValue::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (TypedValue::Boolean(x), TypedValue::Boolean(y)) => x.cmp(y),
+        (TypedValue::Date(x), TypedValue::Date(y)) => x.cmp(y),
+        (TypedValue::DateTime(x), TypedValue::DateTime(y)) => x.cmp(y),
+        (TypedValue::Uuid(x), TypedValue::Uuid(y)) => x.cmp(y),
+        (TypedValue::Json(x), TypedValue::Json(y)) => {
+            // serde_json::Value has no order; canonical text is deterministic.
+            let xs = serde_json::to_string(x).unwrap_or_default();
+            let ys = serde_json::to_string(y).unwrap_or_default();
+            xs.cmp(&ys)
+        }
+        _ => Ordering::Equal,
+    }
+}
+
+/// Rank of a cell state in a typed ordering. Null-ish states sort FIRST
+/// ascending — mirroring how empty strings sort before text in the heuristic
+/// order — and invalid values sort LAST, grouped after every valid value.
+fn state_rank(state: &CellState) -> u8 {
+    match state {
+        CellState::Missing | CellState::NullToken | CellState::Empty => 0,
+        CellState::Valid(_) => 1,
+        CellState::Invalid(_) => 2,
+    }
+}
+
+/// Compare two raw cells under a declared schema: null-ish first, then valid
+/// values in TYPED order, then invalid values; raw text breaks ties within
+/// the null-ish and invalid bands.
+pub fn compare_cells(schema: &ColumnSchema, a: &str, b: &str) -> Ordering {
+    let (ca, cb) = (classify(Some(a), schema), classify(Some(b), schema));
+    let rank = state_rank(&ca).cmp(&state_rank(&cb));
+    if rank != Ordering::Equal {
+        return rank;
+    }
+    match (ca, cb) {
+        (CellState::Valid(va), CellState::Valid(vb)) => {
+            compare_typed(&va, &vb).then_with(|| a.cmp(b))
+        }
+        _ => a.cmp(b),
+    }
+}
+
+/// A declared cell's numeric reading, for aggregation paths that work in f64.
+pub enum NumericCell {
+    Value(f64),
+    /// Empty or a configured null token: skipped, never "invalid".
+    Null,
+    /// Present but not valid for the declared numeric type.
+    Invalid,
+}
+
+/// Read a cell of a NUMERIC-typed column as f64 (callers gate on
+/// [`LogicalType::is_numeric`]). Integers/decimals beyond f64 precision are
+/// approximated — aggregate math is f64 throughout the app.
+pub fn numeric_cell(schema: &ColumnSchema, cell: &str) -> NumericCell {
+    match classify(Some(cell), schema) {
+        CellState::Empty | CellState::NullToken | CellState::Missing => NumericCell::Null,
+        CellState::Valid(TypedValue::Integer(i)) => NumericCell::Value(i as f64),
+        CellState::Valid(TypedValue::Decimal(d)) => d
+            .to_plain_string()
+            .parse::<f64>()
+            .map(NumericCell::Value)
+            .unwrap_or(NumericCell::Invalid),
+        CellState::Valid(TypedValue::Float(f)) => NumericCell::Value(f),
+        _ => NumericCell::Invalid,
+    }
+}
+
+/// Read a cell of a TEMPORAL-typed column as a `NaiveDateTime` (dates land at
+/// midnight, matching [`crate::analyze::parse_date`]). `None` = null-ish or
+/// invalid.
+pub fn temporal_cell(schema: &ColumnSchema, cell: &str) -> Option<NaiveDateTime> {
+    match classify(Some(cell), schema) {
+        CellState::Valid(TypedValue::Date(d)) => d.and_hms_opt(0, 0, 0),
+        CellState::Valid(TypedValue::DateTime(dt)) => Some(dt),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Advisory validation issues + schema input validation
+// ---------------------------------------------------------------------------
+
+/// Cap on the recorded advisory-validation issues per document.
+pub const MAX_SCHEMA_ISSUES: usize = 1000;
+
+/// Longest cell text kept verbatim on a recorded issue.
+const ISSUE_VALUE_CAP: usize = 200;
+
+/// One advisory-mode validation issue: an edit that was ACCEPTED although it
+/// failed its column's declared type. Recorded outside the undo stack.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaIssue {
+    /// Absolute (unfiltered) row index at the time of the edit.
+    pub row: usize,
+    pub col: usize,
+    pub column_id: String,
+    /// The offending value (truncated to a bounded length).
+    pub value: String,
+    pub reason: String,
+    /// Document revision AFTER the edit was applied.
+    pub revision: u64,
+}
+
+impl SchemaIssue {
+    pub fn new(
+        row: usize,
+        col: usize,
+        column_id: impl Into<String>,
+        value: &str,
+        reason: impl Into<String>,
+        revision: u64,
+    ) -> SchemaIssue {
+        let truncated = value.chars().nth(ISSUE_VALUE_CAP).is_some();
+        let mut value: String = value.chars().take(ISSUE_VALUE_CAP).collect();
+        if truncated {
+            value.push('…');
+        }
+        SchemaIssue {
+            row,
+            col,
+            column_id: column_id.into(),
+            value,
+            reason: reason.into(),
+            revision,
+        }
+    }
+}
+
+/// Validate a column schema COMING FROM the front end before storing it.
+/// Unknown display formats are legal (ignored at render time); a time zone
+/// or input-format list that can never parse anything is not.
+pub fn validate_column_schema(schema: &ColumnSchema) -> AppResult<()> {
+    if schema.column_id.trim().is_empty() {
+        return Err(AppError::invalid("columnId must not be empty"));
+    }
+    if let Some(tz) = schema.time_zone.as_deref() {
+        if tz.parse::<chrono_tz::Tz>().is_err() {
+            return Err(AppError::invalid(format!("unknown time zone \"{tz}\"")));
+        }
+    }
+    if let Some(formats) = schema.input_formats.as_ref() {
+        if formats.iter().any(|f| f.trim().is_empty()) {
+            return Err(AppError::invalid("input formats must not be empty strings"));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1810,5 +2054,113 @@ mod tests {
         assert!(json.contains("\"strict\""));
         // Optional fields that are unset are omitted, not null.
         assert!(!json.contains("null,"));
+    }
+
+    // ----- typed ordering ---------------------------------------------------
+
+    #[test]
+    fn decimal_cmp_value_is_exact_across_scales() {
+        let schema = probe(LogicalType::Decimal);
+        let dec = |s: &str| match valid(&schema, s) {
+            TypedValue::Decimal(d) => d,
+            other => panic!("expected decimal, got {other:?}"),
+        };
+        use std::cmp::Ordering::*;
+        assert_eq!(dec("1.50").cmp_value(&dec("1.5")), Equal);
+        assert_eq!(dec("1.49").cmp_value(&dec("1.5")), Less);
+        assert_eq!(dec("-1.5").cmp_value(&dec("-1.49")), Less);
+        assert_eq!(dec("-0.00").cmp_value(&dec("0")), Equal);
+        assert_eq!(dec("10").cmp_value(&dec("9.999999")), Greater);
+        assert_eq!(dec("-3").cmp_value(&dec("2")), Less);
+        // Beyond f64 precision: differs only in the 18th digit.
+        assert_eq!(
+            dec("0.123456789012345678").cmp_value(&dec("0.123456789012345679")),
+            Less
+        );
+    }
+
+    #[test]
+    fn compare_cells_ranks_nullish_valid_invalid() {
+        let mut schema = probe(LogicalType::Integer);
+        schema.null_tokens = vec!["NULL".to_string()];
+        use std::cmp::Ordering::*;
+        // Null-ish first, then valid (typed), then invalid.
+        assert_eq!(compare_cells(&schema, "", "5"), Less);
+        assert_eq!(compare_cells(&schema, "NULL", "5"), Less);
+        assert_eq!(compare_cells(&schema, "5", "abc"), Less);
+        assert_eq!(compare_cells(&schema, "9", "10"), Less, "typed, not text");
+        // Within a band, raw text breaks ties deterministically.
+        assert_eq!(compare_cells(&schema, "", "NULL"), Less);
+        assert_eq!(compare_cells(&schema, "abc", "abd"), Less);
+        // Equal typed values with different text still order deterministically.
+        assert_eq!(compare_cells(&schema, "007", "7"), Less);
+    }
+
+    #[test]
+    fn numeric_and_temporal_cell_helpers() {
+        let mut schema = probe_locale(LogicalType::Decimal, "de-DE");
+        schema.null_tokens = vec!["NULL".to_string()];
+        assert!(matches!(
+            numeric_cell(&schema, "1.234,5"),
+            NumericCell::Value(v) if v == 1234.5
+        ));
+        assert!(matches!(numeric_cell(&schema, "NULL"), NumericCell::Null));
+        assert!(matches!(numeric_cell(&schema, ""), NumericCell::Null));
+        assert!(matches!(numeric_cell(&schema, "abc"), NumericCell::Invalid));
+
+        let date = probe(LogicalType::Date);
+        let midnight = NaiveDate::from_ymd_opt(2024, 1, 31)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        assert_eq!(temporal_cell(&date, "2024-01-31"), Some(midnight));
+        assert_eq!(temporal_cell(&date, "nope"), None);
+    }
+
+    // ----- schema input validation + issues ---------------------------------
+
+    #[test]
+    fn validate_column_schema_rejects_bad_inputs() {
+        let good = probe(LogicalType::Integer);
+        assert!(validate_column_schema(&good).is_ok());
+        let mut bad_tz = probe(LogicalType::Datetime);
+        bad_tz.time_zone = Some("Mars/Olympus_Mons".to_string());
+        assert!(validate_column_schema(&bad_tz).is_err());
+        let mut ok_tz = probe(LogicalType::Datetime);
+        ok_tz.time_zone = Some("Europe/Berlin".to_string());
+        assert!(validate_column_schema(&ok_tz).is_ok());
+        let mut bad_fmt = probe(LogicalType::Date);
+        bad_fmt.input_formats = Some(vec!["%Y".to_string(), "  ".to_string()]);
+        assert!(validate_column_schema(&bad_fmt).is_err());
+        let mut empty_id = probe(LogicalType::Text);
+        empty_id.column_id = String::new();
+        assert!(validate_column_schema(&empty_id).is_err());
+        // Unknown display formats are LEGAL (ignored at render time).
+        let mut odd_fmt = probe(LogicalType::Integer);
+        odd_fmt.display_format = Some("no-such-pattern".to_string());
+        assert!(validate_column_schema(&odd_fmt).is_ok());
+    }
+
+    #[test]
+    fn schema_issue_truncates_long_values() {
+        let long = "x".repeat(1000);
+        let issue = SchemaIssue::new(1, 2, "c0", &long, "reason", 7);
+        assert!(issue.value.chars().count() <= 201, "200 chars + ellipsis");
+        assert!(issue.value.ends_with('…'));
+        let short = SchemaIssue::new(1, 2, "c0", "ok", "reason", 7);
+        assert_eq!(short.value, "ok");
+    }
+
+    #[test]
+    fn column_kind_mapping_is_coarse() {
+        use crate::dto::ColumnKind;
+        assert_eq!(column_kind_of(LogicalType::Integer), ColumnKind::Number);
+        assert_eq!(column_kind_of(LogicalType::Decimal), ColumnKind::Number);
+        assert_eq!(column_kind_of(LogicalType::Float), ColumnKind::Number);
+        assert_eq!(column_kind_of(LogicalType::Boolean), ColumnKind::Bool);
+        assert_eq!(column_kind_of(LogicalType::Date), ColumnKind::Date);
+        assert_eq!(column_kind_of(LogicalType::Datetime), ColumnKind::Date);
+        assert_eq!(column_kind_of(LogicalType::Uuid), ColumnKind::Text);
+        assert_eq!(column_kind_of(LogicalType::Json), ColumnKind::Text);
     }
 }

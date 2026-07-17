@@ -44,6 +44,7 @@ mod save;
 /// typed parsing, inference, import/export) is a stable internal API consumed
 /// by later feature stages and the test harness.
 pub mod schema;
+mod schema_ops;
 mod semantic;
 mod settings;
 mod sort;
@@ -186,6 +187,18 @@ pub fn run() {
             commands::replace_all,
             commands::undo,
             commands::redo,
+            commands::get_schema,
+            commands::infer_schema,
+            commands::set_column_schema,
+            commands::remove_column_schema,
+            commands::export_schema,
+            commands::import_schema,
+            commands::validate_cell_edit,
+            commands::get_schema_issues,
+            commands::clear_schema_issues,
+            commands::schema_invalid_samples,
+            commands::convert_column_preview,
+            commands::convert_column_apply,
             commands::check_encoding_compatibility,
             commands::export_scope_counts,
             commands::start_save,

@@ -327,6 +327,19 @@ pub struct Document {
     fingerprint: Option<FileFingerprint>,
     /// Row storage: in-memory (editable) or a streaming record index (F10).
     backing: Backing,
+    /// F31 explicit schema: logical per-column metadata keyed by stable
+    /// column IDs. Lives OUTSIDE the undo stack on purpose — schema edits
+    /// (including `displayFormat` changes) are not undoable and never make
+    /// the document dirty, because they never touch stored cell text.
+    schema: crate::schema::DocumentSchema,
+    /// Bumped on every schema mutation so the front end (and later
+    /// persistence, F37) can detect schema changes without the document
+    /// revision — and therefore previews and the dirty flag — moving.
+    schema_revision: u64,
+    /// F31 advisory-mode validation issues: edits accepted despite failing
+    /// their column's declared type. Bounded
+    /// ([`crate::schema::MAX_SCHEMA_ISSUES`]), newest kept.
+    schema_issues: Vec<crate::schema::SchemaIssue>,
     /// F17: where the document came from when opened out of an archive.
     /// Archive-backed documents have no `path` (no in-place saving); Save As
     /// clears this and turns them into ordinary file documents.
@@ -402,6 +415,9 @@ impl Document {
             filter_revision: 1,
             import_info: import,
             fingerprint: None,
+            schema: crate::schema::DocumentSchema::default(),
+            schema_revision: 0,
+            schema_issues: Vec::new(),
             backing: Backing::Memory,
             archive: None,
             archive_guard: None,
@@ -447,6 +463,9 @@ impl Document {
             filter_revision: 1,
             import_info: ImportInfo::default(),
             fingerprint: None,
+            schema: crate::schema::DocumentSchema::default(),
+            schema_revision: 0,
+            schema_issues: Vec::new(),
             backing: Backing::Memory,
             archive: None,
             archive_guard: None,
@@ -499,6 +518,9 @@ impl Document {
             filter_revision: 1,
             import_info: import,
             fingerprint: None,
+            schema: crate::schema::DocumentSchema::default(),
+            schema_revision: 0,
+            schema_issues: Vec::new(),
             backing: Backing::Indexed(handle),
             archive: None,
             archive_guard: None,
@@ -527,6 +549,87 @@ impl Document {
     /// IDs survive renames, reorders, inserts, deletes and undo/redo.
     pub fn column_ids(&self) -> &[String] {
         &self.column_ids
+    }
+
+    // ----- explicit schema (F31) -------------------------------------------
+
+    /// The document's explicit schema (columns without an entry are plain
+    /// text). Metadata only — reading or assigning it never rewrites cells.
+    pub fn schema(&self) -> &crate::schema::DocumentSchema {
+        &self.schema
+    }
+
+    /// Bumped on every schema mutation; independent of [`Document::revision`]
+    /// so schema edits never dirty the document or invalidate previews.
+    pub fn schema_revision(&self) -> u64 {
+        self.schema_revision
+    }
+
+    /// The declared schema of the column at POSITION `col`, resolved through
+    /// its stable ID (so it survives renames and reorders).
+    pub fn column_schema_at(&self, col: usize) -> Option<&crate::schema::ColumnSchema> {
+        self.column_ids
+            .get(col)
+            .and_then(|id| self.schema.column(id))
+    }
+
+    /// Cloned per-key schemas, parallel to `keys`, for
+    /// [`crate::sort::compare_rows_schema`] (cloned so the comparator can run
+    /// while row storage is independently borrowed).
+    fn key_schemas(&self, keys: &[SortKey]) -> Vec<Option<crate::schema::ColumnSchema>> {
+        keys.iter()
+            .map(|k| self.column_schema_at(k.column).cloned())
+            .collect()
+    }
+
+    /// Replace the whole schema (import / clear).
+    pub fn set_document_schema(&mut self, schema: crate::schema::DocumentSchema) {
+        self.schema = schema;
+        self.schema_revision += 1;
+    }
+
+    /// Insert or replace one column's schema entry.
+    pub fn set_column_schema(&mut self, schema: crate::schema::ColumnSchema) {
+        self.schema.set_column(schema);
+        self.schema_revision += 1;
+    }
+
+    /// Remove one column's schema entry (back to implicit text). Removing a
+    /// missing entry still bumps the schema revision; harmless.
+    pub fn remove_column_schema(&mut self, column_id: &str) -> bool {
+        let removed = self.schema.columns.remove(column_id).is_some();
+        self.schema_revision += 1;
+        removed
+    }
+
+    /// Carry the schema across a whole-`Document` replacement (reparse /
+    /// reindex): entries are keyed by stable IDs, which restart positionally,
+    /// so they re-attach to the same positions the original open assigned.
+    pub fn inherit_schema(&mut self, prev: &Document) {
+        self.schema = prev.schema.clone();
+        self.schema_revision = prev.schema_revision + 1;
+    }
+
+    /// Record advisory-validation issues (bounded: oldest evicted).
+    pub fn record_schema_issues(
+        &mut self,
+        issues: impl IntoIterator<Item = crate::schema::SchemaIssue>,
+    ) {
+        self.schema_issues.extend(issues);
+        let len = self.schema_issues.len();
+        if len > crate::schema::MAX_SCHEMA_ISSUES {
+            self.schema_issues
+                .drain(..len - crate::schema::MAX_SCHEMA_ISSUES);
+        }
+    }
+
+    /// The recorded advisory-validation issues, oldest first.
+    pub fn schema_issues(&self) -> &[crate::schema::SchemaIssue] {
+        &self.schema_issues
+    }
+
+    pub fn clear_schema_issues(&mut self) {
+        self.schema_issues.clear();
     }
 
     /// The in-memory row slice. EDITABLE backing only: for indexed documents
@@ -871,7 +974,11 @@ impl Document {
             for (slot, &abs) in keyed.iter_mut().zip(base.iter()) {
                 slot.0 = abs;
             }
-            keyed.sort_by(|a, b| crate::sort::compare_rows(&a.1, &b.1, &local_keys));
+            // Columns with a declared schema (F31) view-sort in typed order.
+            let key_schemas = self.key_schemas(&self.view_sort);
+            keyed.sort_by(|a, b| {
+                crate::sort::compare_rows_schema(&a.1, &b.1, &local_keys, &key_schemas)
+            });
             Some(keyed.into_iter().map(|(abs, _)| abs).collect())
         };
         self.filter_view = composed;
@@ -1016,7 +1123,14 @@ impl Document {
         Ok(accs
             .into_iter()
             .enumerate()
-            .map(|(c, acc)| acc.into_summary(c, scan_end, sampled))
+            .map(|(c, acc)| {
+                let mut summary = acc.into_summary(c, scan_end, sampled);
+                // A DECLARED logical type (F31) beats the heuristic badge.
+                if let Some(schema) = self.column_schema_at(c) {
+                    summary.kind = crate::schema::column_kind_of(schema.logical_type);
+                }
+                summary
+            })
             .collect())
     }
 
@@ -1456,9 +1570,16 @@ impl Document {
             }
         }
 
+        // Columns with a declared schema (F31) sort in typed order.
+        let key_schemas = self.key_schemas(keys);
         let mut order: Vec<u32> = (0..self.rows.len() as u32).collect();
         order.sort_by(|&a, &b| {
-            crate::sort::compare_rows(&self.rows[a as usize], &self.rows[b as usize], keys)
+            crate::sort::compare_rows_schema(
+                &self.rows[a as usize],
+                &self.rows[b as usize],
+                keys,
+                &key_schemas,
+            )
         });
 
         // No-op if already sorted.
@@ -3692,5 +3813,88 @@ mod f12_tests {
         let mut d = doc_from("a\n1", true);
         assert!(d.set_view_sort(vec![key(5, false)]).is_err());
         assert!(!d.meta().view_sorted);
+    }
+
+    // ----- typed sort under a declared schema (F31) -------------------------
+
+    fn declare(d: &mut Document, col: usize, lt: crate::schema::LogicalType) {
+        let schema = crate::schema::ColumnSchema::new(
+            d.column_ids()[col].clone(),
+            d.headers()[col].clone(),
+            lt,
+        );
+        d.set_column_schema(schema);
+    }
+
+    #[test]
+    fn declared_integer_sorts_beyond_f64_precision() {
+        // These two differ only below f64 precision: the heuristic (f64)
+        // order ties them, the declared-integer order must not.
+        let mut d = doc_from("n\n9007199254740993\n9007199254740992", true);
+        declare(&mut d, 0, crate::schema::LogicalType::Integer);
+        d.sort(&[key(0, false)]).unwrap();
+        assert_eq!(d.cell(0, 0), "9007199254740992");
+        assert_eq!(d.cell(1, 0), "9007199254740993");
+    }
+
+    #[test]
+    fn declared_sort_orders_nullish_first_and_invalid_last() {
+        // Second column keeps the empty-cell row from being an empty line
+        // (which the parser would skip entirely).
+        let mut d = doc_from("n,k\nx,a\n10,b\nNULL,c\n,d\n2,e", true);
+        let mut schema = crate::schema::ColumnSchema::new(
+            d.column_ids()[0].clone(),
+            "n",
+            crate::schema::LogicalType::Integer,
+        );
+        schema.null_tokens = vec!["NULL".to_string()];
+        d.set_column_schema(schema);
+        d.sort(&[key(0, false)]).unwrap();
+        // Documented order: null-ish (empty + null tokens) first — matching
+        // how "" sorts before text heuristically — then valid values in
+        // typed order, then invalid values last.
+        assert_eq!(d.cell(0, 0), "");
+        assert_eq!(d.cell(1, 0), "NULL");
+        assert_eq!(d.cell(2, 0), "2");
+        assert_eq!(d.cell(3, 0), "10");
+        assert_eq!(d.cell(4, 0), "x");
+    }
+
+    #[test]
+    fn declared_date_view_sort_orders_chronologically() {
+        // Custom input format: the heuristic would see plain text and sort
+        // lexicographically ("02.01.2024" < "31.12.2023" as text).
+        let mut d = doc_from("d\n31.12.2023\n02.01.2024", true);
+        let mut schema = crate::schema::ColumnSchema::new(
+            d.column_ids()[0].clone(),
+            "d",
+            crate::schema::LogicalType::Date,
+        );
+        schema.input_formats = Some(vec!["%d.%m.%Y".to_string()]);
+        d.set_column_schema(schema);
+        d.set_view_sort(vec![key(0, false)]).unwrap();
+        assert_eq!(
+            d.filter_view().unwrap(),
+            &[0, 1],
+            "Dec 31 2023 displays before Jan 2 2024"
+        );
+        assert!(!d.is_dirty(), "view sort stays non-destructive");
+    }
+
+    #[test]
+    fn schema_survives_undo_of_column_delete() {
+        let mut d = doc_from("a,b\n1,x", true);
+        let id = d.column_ids()[0].clone();
+        declare(&mut d, 0, crate::schema::LogicalType::Integer);
+        d.delete_columns(vec![0]).unwrap();
+        // The entry lingers keyed by ID while the column is gone…
+        assert!(d.column_schema_at(0).map(|s| &s.column_id) != Some(&id));
+        d.undo().unwrap();
+        // …and resolves again when undo restores the column (same ID).
+        assert_eq!(d.column_ids()[0], id);
+        assert_eq!(
+            d.column_schema_at(0).unwrap().logical_type,
+            crate::schema::LogicalType::Integer
+        );
     }
 }

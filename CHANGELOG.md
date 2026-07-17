@@ -21,6 +21,25 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   protection so ZIP-like columns stay text), edit validation for the
   upcoming strict/advisory modes, display-only formatting patterns, and
   versioned schema import/export JSON. UI integration lands next.
+- **Explicit schemas and typed columns (F31, backend integration)**: the
+  full command surface — get/infer/assign/remove column schemas,
+  versioned JSON import/export (atomic writes, unknown columns skipped
+  and reported), invalid-value samples with exact five-state counts,
+  and canonical conversion as a previewed, revision-guarded job that
+  applies as ONE undoable operation (invalid cells keep their text and
+  are counted). Strict validation now rejects an invalid cell edit
+  before it reaches the document; advisory mode applies the edit and
+  records a bounded, retrievable issue list. Schema edits (including
+  display-format changes) never mark the document dirty and track their
+  own `schemaRevision`. Sorting (destructive and view), range filters,
+  column profiles and summaries, group-by aggregates and key ordering,
+  join key equivalence, and cross-field validation rules now prefer the
+  declared logical type over heuristics — integers compare as full-width
+  integers, decimals exactly, dates chronologically, locale decimals
+  parse under the declared locale, and configured null tokens count as
+  null (still distinguishable from empty strings) everywhere. Ragged
+  short rows classify as MISSING fields in schema scans, mapped exactly
+  through new record indices on the import diagnostics.
 
 ## [0.4.0]
 

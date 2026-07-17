@@ -312,14 +312,39 @@ fn resolve(doc: &Document, rules: &[CrossRule]) -> AppResult<HashMap<String, usi
     Ok(map)
 }
 
-/// One rule's verdict on one row: `None` = passes or not applicable.
-fn violation_reason(rule: &CrossRule, cell: &dyn Fn(&str) -> String) -> Option<String> {
-    let blank = |name: &str| cell(name).trim().is_empty();
+/// One rule's verdict on one row: `None` = passes or not applicable. When a
+/// referenced column has a DECLARED schema (F31), its configured null tokens
+/// count as blank, and numeric/date readings follow the declared type
+/// (locale separators, input formats) instead of the heuristics.
+fn violation_reason<'d>(
+    rule: &CrossRule,
+    cell: &dyn Fn(&str) -> String,
+    schema_of: &dyn Fn(&str) -> Option<&'d crate::schema::ColumnSchema>,
+) -> Option<String> {
+    let blank = |name: &str| {
+        let raw = cell(name);
+        raw.trim().is_empty()
+            || schema_of(name).is_some_and(|s| crate::schema::is_null_token(s, &raw))
+    };
     let number = |name: &str| -> Result<Option<f64>, String> {
         let raw = cell(name);
         let t = raw.trim();
         if t.is_empty() {
             return Ok(None);
+        }
+        if let Some(s) = schema_of(name) {
+            if crate::schema::is_null_token(s, t) {
+                return Ok(None);
+            }
+            if s.logical_type.is_numeric() {
+                return match crate::schema::numeric_cell(s, t) {
+                    crate::schema::NumericCell::Value(n) => Ok(Some(n)),
+                    crate::schema::NumericCell::Null => Ok(None),
+                    crate::schema::NumericCell::Invalid => Err(format!(
+                        "\"{name}\" is not valid for its declared numeric type ({t})"
+                    )),
+                };
+            }
         }
         analyze::as_number(t)
             .map(Some)
@@ -364,6 +389,16 @@ fn violation_reason(rule: &CrossRule, cell: &dyn Fn(&str) -> String) -> Option<S
                 let t = raw.trim();
                 if t.is_empty() {
                     return Ok(None);
+                }
+                if let Some(s) = schema_of(name) {
+                    if crate::schema::is_null_token(s, t) {
+                        return Ok(None);
+                    }
+                    if s.logical_type.is_temporal() {
+                        return crate::schema::temporal_cell(s, t).map(Some).ok_or_else(|| {
+                            format!("\"{name}\" is not valid for its declared date type ({t})")
+                        });
+                    }
                 }
                 analyze::parse_date(t)
                     .map(Some)
@@ -525,8 +560,11 @@ pub fn scan(doc: &Document, rules: &[CrossRule], ctx: &JobCtx) -> AppResult<Cros
                 .cloned()
                 .unwrap_or_default()
         };
+        let schema_of = |name: &str| -> Option<&crate::schema::ColumnSchema> {
+            index.get(name).and_then(|&c| doc.column_schema_at(c))
+        };
         for (rule, result) in rules.iter().zip(results.iter_mut()) {
-            if let Some(reason) = violation_reason(rule, &cell) {
+            if let Some(reason) = violation_reason(rule, &cell, &schema_of) {
                 result.violations += 1;
                 violating_rows.insert(i);
                 if result.sample.len() < SAMPLE_LIMIT {
@@ -584,9 +622,12 @@ pub fn violating_rows(
                 .cloned()
                 .unwrap_or_default()
         };
+        let schema_of = |name: &str| -> Option<&crate::schema::ColumnSchema> {
+            index.get(name).and_then(|&c| doc.column_schema_at(c))
+        };
         if selected
             .iter()
-            .any(|r| violation_reason(r, &cell).is_some())
+            .any(|r| violation_reason(r, &cell, &schema_of).is_some())
         {
             out.push(i);
         }
@@ -888,5 +929,69 @@ mod tests {
             serde_json::to_string(&r1).unwrap(),
             serde_json::to_string(&r2).unwrap()
         );
+    }
+
+    // ----- declared schemas (F31) -------------------------------------------
+
+    fn declare_with(
+        d: &mut Document,
+        col: usize,
+        lt: crate::schema::LogicalType,
+        f: impl FnOnce(&mut crate::schema::ColumnSchema),
+    ) {
+        let mut schema = crate::schema::ColumnSchema::new(
+            d.column_ids()[col].clone(),
+            d.headers()[col].clone(),
+            lt,
+        );
+        f(&mut schema);
+        d.set_column_schema(schema);
+    }
+
+    #[test]
+    fn numeric_rule_reads_declared_locale_decimals() {
+        // net <= gross, in de-DE notation (values quoted; comma delimits).
+        let mut d = doc("net,gross\n\"1,5\",\"2,5\"\n\"3,5\",\"2,5\"\n");
+        for col in [0, 1] {
+            declare_with(&mut d, col, crate::schema::LogicalType::Decimal, |s| {
+                s.locale = Some("de-DE".to_string());
+            });
+        }
+        let report = run(
+            &d,
+            vec![CrossRule::NumericCompare {
+                left: "net".into(),
+                op: CompareOp::Le,
+                right: "gross".into(),
+            }],
+        );
+        // Row 1 (3,5 > 2,5) violates; the heuristic would have flagged BOTH
+        // rows as non-numeric instead.
+        assert_eq!(report.rules[0].violations, 1);
+        assert_eq!(report.rules[0].sample[0].row, 1);
+    }
+
+    #[test]
+    fn date_rule_uses_declared_input_formats_and_null_tokens() {
+        let mut d =
+            doc("start,end\n31.12.2023,02.01.2024\n02.01.2024,31.12.2023\nNULL,01.01.2024\n");
+        for col in [0, 1] {
+            declare_with(&mut d, col, crate::schema::LogicalType::Date, |s| {
+                s.input_formats = Some(vec!["%d.%m.%Y".to_string()]);
+                s.null_tokens = vec!["NULL".to_string()];
+            });
+        }
+        let report = run(
+            &d,
+            vec![CrossRule::DateOrder {
+                earlier: "start".into(),
+                later: "end".into(),
+                allow_equal: false,
+            }],
+        );
+        // Row 0 is in order, row 1 violates, row 2's NULL start counts as
+        // blank and skips the rule instead of reading as "not a date".
+        assert_eq!(report.rules[0].violations, 1);
+        assert_eq!(report.rules[0].sample[0].row, 1);
     }
 }
