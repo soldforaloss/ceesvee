@@ -81,6 +81,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ordinary validation issues, and columns classified confidential or
   restricted are folded into the PII scan preflight even when no detector
   matches them.
+- **Sampling and partitioning** (F48): carve reproducible subsets and splits
+  out of a document without deleting a single row. Eight sampling methods —
+  first N, last N, a random fixed count (reservoir, single-pass and bounded so
+  it works over indexed sources), a random percentage, systematic every-Nth
+  (with a fixed or seed-drawn offset), proportional stratified (with a reported
+  tolerance), balanced (equal per stratum, shortfalls reported), and
+  deterministic hash-based (a stable subset that does not move when unrelated
+  rows change) — plus partitioning into weighted, named outputs
+  (train/validation/test presets or custom), optionally stratified or
+  group-preserving (rows sharing key-column values never split across
+  partitions). Every run is driven by a seed (supplied, or crypto-generated and
+  surfaced) so the same source + settings + seed produces byte-identical
+  outputs; partitions are disjoint by construction. A preview shows the
+  projected AND exact counts for each output (with a strata table when
+  stratifying) before anything is written, outputs preserve source order or an
+  explicit shuffle, results become new derived documents or direct CSV exports,
+  and each export gets a JSON manifest recording the method, seed, source
+  fingerprint, scope, and a SHA-256 per output.
 - **Explicit schemas and typed columns** (palette → "Edit schema…", or a
   column header's menu): declare an explicit logical type per column —
   text, integer, decimal, float, boolean, date, datetime, UUID, or JSON —
