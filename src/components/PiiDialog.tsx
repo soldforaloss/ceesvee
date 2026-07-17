@@ -253,6 +253,40 @@ export function PiiDialog({ onClose }: { onClose: () => void }) {
           <p className="text-xs text-red-600 dark:text-red-400">{error ?? actionError}</p>
         )}
 
+        {report && report.sensitivityFlags.length > 0 && (
+          <div className="space-y-1 rounded border border-amber-300 p-2 text-xs dark:border-amber-800/70">
+            <p className="font-medium text-amber-700 dark:text-amber-300">
+              {report.sensitivityFlags.length} column
+              {report.sensitivityFlags.length === 1 ? "" : "s"} declared sensitive in the data
+              dictionary
+            </p>
+            <ul className="space-y-0.5">
+              {report.sensitivityFlags.map((f) => (
+                <li key={f.columnId} className="flex items-center gap-1.5">
+                  <span
+                    className={`rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${
+                      f.sensitivity === "restricted"
+                        ? "bg-red-100 text-red-700 dark:bg-red-500/20 dark:text-red-200"
+                        : "bg-amber-100 text-amber-800 dark:bg-amber-500/20 dark:text-amber-200"
+                    }`}
+                  >
+                    {f.sensitivity}
+                  </span>
+                  <span className="min-w-0 truncate">
+                    {f.displayName || headers[f.column] || `Column ${f.column + 1}`}
+                  </span>
+                  {!f.hasPatternHit && (
+                    <span className="text-[11px] text-zinc-400">· no detector hit</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+            <p className="text-[11px] text-zinc-400">
+              These feed the export/package preflight regardless of pattern matches.
+            </p>
+          </div>
+        )}
+
         {report && report.findings.length > 0 && (
           <div className="max-h-[24vh] space-y-1 overflow-y-auto pr-1 text-xs">
             {report.findings.map((f, i) => {

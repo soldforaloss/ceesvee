@@ -100,6 +100,13 @@ import type {
   ProjectOpenPreview,
   ProjectOpenPlan,
   FileFingerprint,
+  DictionaryField,
+  DictionaryFormat,
+  DictionaryImportOutcome,
+  DictionaryView,
+  MergeMatchBy,
+  MergePlan,
+  MergeResolution,
 } from "../types";
 import type { GatingWarning } from "../lib/project";
 
@@ -144,6 +151,7 @@ export type ModalName =
   | "recovery"
   | "dialect"
   | "schema"
+  | "dictionary"
   | "views"
   | "jsonExport";
 
@@ -737,6 +745,11 @@ interface Store {
   schemaScan: SchemaScanState | null;
   /** Physical column the schema dialog should focus on open (F31). */
   schemaDialogColumn: number | null;
+  /** The ACTIVE document's data dictionary (F38), refreshed on load/edit.
+   * Drives the editor and the Grid header tooltips. */
+  dictionaryView: DictionaryView | null;
+  /** Physical column the dictionary dialog should focus on open (F38). */
+  dictionaryDialogColumn: number | null;
   /** Running derived-document job (F20–F23), if any. */
   derive: DeriveState | null;
   /** Error from the last derive job, for the dialog that started it. */
@@ -972,6 +985,30 @@ interface Store {
     expectedSchemaRevision: number,
   ) => Promise<boolean>;
   cancelColumnConversion: () => Promise<void>;
+
+  // data dictionary (F38)
+  /** Open the dictionary editor, optionally focused on one physical column. */
+  openDictionaryDialog: (col?: number) => void;
+  /** Fetch the active document's dictionary into the store (editor + tooltips). */
+  loadDictionary: () => Promise<void>;
+  /** Insert or replace one column's documentation (metadata: never dirties). */
+  setDictionaryField: (field: DictionaryField) => Promise<boolean>;
+  /** Drop one column's documentation entry (clear a column, or an orphan). */
+  removeDictionaryField: (columnId: string) => Promise<boolean>;
+  /** Discard every orphaned entry (documentation whose column is gone). */
+  discardDictionaryOrphans: () => Promise<boolean>;
+  /** Export the dictionary as JSON / Markdown / CSV; prompts for a path. */
+  exportDictionaryToFile: (format: DictionaryFormat) => Promise<void>;
+  /** Prompt for a CEESVEE dictionary JSON file to import; null if cancelled. */
+  pickDictionaryImportFile: () => Promise<string | null>;
+  /** Plan an import merge for a chosen file; null on error. Read-only. */
+  previewDictionaryImport: (path: string, matchBy: MergeMatchBy) => Promise<MergePlan | null>;
+  /** Apply an import merge under an explicit resolution; null on error. */
+  applyDictionaryImport: (
+    path: string,
+    matchBy: MergeMatchBy,
+    resolution: MergeResolution,
+  ) => Promise<DictionaryImportOutcome | null>;
 
   // compressed files (F17)
   /** Start extracting an archive (gzip member or chosen ZIP entry). */
@@ -1289,6 +1326,9 @@ export const useStore = create<Store>((set, get) => {
       schemaConvert: null,
       schemaScan: null,
       schemaDialogColumn: null,
+      // F38: the dictionary is per-document; the Grid reloads it for the tab.
+      dictionaryView: null,
+      dictionaryDialogColumn: null,
     };
   };
 
@@ -1860,6 +1900,8 @@ export const useStore = create<Store>((set, get) => {
     schemaConvert: null,
     schemaScan: null,
     schemaDialogColumn: null,
+    dictionaryView: null,
+    dictionaryDialogColumn: null,
     derive: null,
     deriveError: null,
     jsonImport: null,
@@ -3077,6 +3119,132 @@ export const useStore = create<Store>((set, get) => {
     cancelColumnConversion: async () => {
       const convert = get().schemaConvert;
       if (convert) await api.cancelJob(convert.jobId).catch(() => undefined);
+    },
+
+    // ----- data dictionary (F38) ---------------------------------------------
+
+    openDictionaryDialog: (col) =>
+      set({ dictionaryDialogColumn: col ?? null, activeModal: "dictionary" }),
+
+    loadDictionary: async () => {
+      const meta = activeMeta();
+      if (!meta) {
+        set({ dictionaryView: null });
+        return;
+      }
+      try {
+        const view = await api.getDictionary(meta.id);
+        // A tab switch may have landed during the await; don't cross-install.
+        if (get().activeId === meta.id) set({ dictionaryView: view });
+      } catch {
+        // A dictionary fetch failure is non-fatal: header tooltips stay off.
+      }
+    },
+
+    setDictionaryField: async (field) => {
+      const meta = activeMeta();
+      const view = get().dictionaryView;
+      if (!meta || !view) return false;
+      try {
+        // Guarded by the metadata revision the current view was taken at; a
+        // documentation edit never dirties the document or moves `revision`.
+        const next = await api.setDictionaryField(meta.id, field, view.dictionaryRevision);
+        if (get().activeId === meta.id) set({ dictionaryView: next });
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    removeDictionaryField: async (columnId) => {
+      const meta = activeMeta();
+      const view = get().dictionaryView;
+      if (!meta || !view) return false;
+      try {
+        const next = await api.removeDictionaryField(meta.id, columnId, view.dictionaryRevision);
+        if (get().activeId === meta.id) set({ dictionaryView: next });
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    discardDictionaryOrphans: async () => {
+      const meta = activeMeta();
+      const view = get().dictionaryView;
+      if (!meta || !view) return false;
+      try {
+        const next = await api.discardDictionaryOrphans(meta.id, view.dictionaryRevision);
+        if (get().activeId === meta.id) set({ dictionaryView: next });
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    exportDictionaryToFile: async (format) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const base = (meta.fileName || "dictionary").replace(/\.[^.]+$/, "");
+      const ext = format === "json" ? "json" : format === "markdown" ? "md" : "csv";
+      const filterName =
+        format === "json"
+          ? "Dictionary JSON"
+          : format === "markdown"
+            ? "Markdown documentation"
+            : "CSV documentation";
+      const chosen = await saveFileDialog({
+        defaultPath: `${base}.dictionary.${ext}`,
+        filters: [{ name: filterName, extensions: [ext] }],
+      });
+      if (!chosen) return;
+      try {
+        await api.exportDictionary(meta.id, chosen, format);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    pickDictionaryImportFile: async () => {
+      const chosen = await openFileDialog({
+        filters: [{ name: "Dictionary JSON", extensions: ["json"] }],
+      });
+      return typeof chosen === "string" ? chosen : null;
+    },
+
+    previewDictionaryImport: async (path, matchBy) => {
+      const meta = activeMeta();
+      if (!meta) return null;
+      try {
+        // Read-only: nothing changes until the user resolves conflicts + applies.
+        return await api.previewDictionaryImport(meta.id, path, matchBy);
+      } catch (e) {
+        set({ error: String(e) });
+        return null;
+      }
+    },
+
+    applyDictionaryImport: async (path, matchBy, resolution) => {
+      const meta = activeMeta();
+      const view = get().dictionaryView;
+      if (!meta || !view) return null;
+      try {
+        const outcome = await api.applyDictionaryImport(
+          meta.id,
+          path,
+          matchBy,
+          resolution,
+          view.dictionaryRevision,
+        );
+        if (get().activeId === meta.id) set({ dictionaryView: outcome.view });
+        return outcome;
+      } catch (e) {
+        set({ error: String(e) });
+        return null;
+      }
     },
 
     // ----- compressed files (F17) --------------------------------------------

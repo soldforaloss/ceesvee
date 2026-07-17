@@ -47,6 +47,7 @@ import { ReopenDialog } from "./components/ReopenDialog";
 import { RepairDialog } from "./components/RepairDialog";
 import { ReshapeDialog } from "./components/ReshapeDialog";
 import { SchemaDialog } from "./components/SchemaDialog";
+import { DictionaryDialog } from "./components/DictionaryDialog";
 import { SemanticDialog } from "./components/SemanticDialog";
 import { ShortcutsDialog } from "./components/ShortcutsDialog";
 import { SortDialog } from "./components/SortDialog";
@@ -310,6 +311,7 @@ export default function App() {
       {activeModal === "cluster" && <ClusterDialog onClose={() => setModal(null)} />}
       {activeModal === "semantic" && <SemanticDialog onClose={() => setModal(null)} />}
       {activeModal === "schema" && <SchemaDialog onClose={() => setModal(null)} />}
+      {activeModal === "dictionary" && <DictionaryDialog onClose={() => setModal(null)} />}
       {activeModal === "crossval" && <CrossValDialog onClose={() => setModal(null)} />}
       {activeModal === "repair" && <RepairDialog onClose={() => setModal(null)} />}
       {activeModal === "outlier" && <OutlierDialog onClose={() => setModal(null)} />}
