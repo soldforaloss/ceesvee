@@ -12,6 +12,14 @@ import type { ArrayPolicy, JsonImportOptions, MultiArrayMode, NestedPolicy } fro
 import { Modal } from "./Modal";
 
 /**
+ * Upper bound on how many columns the preview tables render at once. The
+ * import itself is unaffected (the backend allows up to 10,000 columns); this
+ * only keeps the dialog's DOM bounded, per the "bounded windows to React only"
+ * invariant. A wide import shows the first slice with a "+N more" affordance.
+ */
+const MAX_PREVIEW_COLUMNS = 200;
+
+/**
  * JSON / JSON Lines import preview + policy dialog (F33). Self-driven by the
  * `jsonImport` store slice, so opening a `.json` / `.jsonl` / `.ndjson` file
  * (or the "Open JSON…" command) shows it automatically. Every option change
@@ -64,7 +72,13 @@ export function JsonImportDialog() {
     (preview.shape === "objectDocument" || preview.needsPointer || preview.candidates.length > 0);
   const hasColumns = (preview?.columns.length ?? 0) > 0;
   const explodeActive = opts.arrayPolicy === "explode";
-  const needsMulti = preview ? needsMultiArrayChoice(preview.arrayFields, opts) : false;
+  const needsMulti = preview ? needsMultiArrayChoice(preview, opts) : false;
+
+  // Keep the preview tables bounded (the invariant is "bounded windows to
+  // React only"): the backend allows up to 10,000 flattened columns, which
+  // would otherwise render as hundreds of thousands of DOM nodes here.
+  const shownColumns = preview ? preview.columns.slice(0, MAX_PREVIEW_COLUMNS) : [];
+  const hiddenColumns = (preview?.columns.length ?? 0) - shownColumns.length;
 
   const canImport = !importing && !scanning && errors.length === 0 && hasColumns;
 
@@ -308,7 +322,7 @@ export function JsonImportDialog() {
                     </tr>
                   </thead>
                   <tbody>
-                    {preview!.columns.map((c) => (
+                    {shownColumns.map((c) => (
                       <tr key={c.name} className="border-t border-zinc-100 dark:border-zinc-800">
                         <td className="max-w-64 truncate px-2 py-1 font-mono" title={c.name}>
                           {c.name}
@@ -328,6 +342,13 @@ export function JsonImportDialog() {
                   </tbody>
                 </table>
               </div>
+              {hiddenColumns > 0 && (
+                <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                  + {hiddenColumns.toLocaleString()} more column
+                  {hiddenColumns === 1 ? "" : "s"} not shown (all{" "}
+                  {preview!.projectedColumns.toLocaleString()} import).
+                </p>
+              )}
             </Section>
 
             {/* Projected preview grid */}
@@ -337,7 +358,7 @@ export function JsonImportDialog() {
                   <table className="border-collapse text-[11px]">
                     <thead className="sticky top-0 bg-white text-left text-zinc-400 dark:bg-zinc-900">
                       <tr>
-                        {preview!.columns.map((c) => (
+                        {shownColumns.map((c) => (
                           <th
                             key={c.name}
                             className="whitespace-nowrap border-b border-zinc-200 px-2 py-1 font-mono font-medium dark:border-zinc-800"
@@ -345,12 +366,17 @@ export function JsonImportDialog() {
                             {c.name}
                           </th>
                         ))}
+                        {hiddenColumns > 0 && (
+                          <th className="whitespace-nowrap border-b border-zinc-200 px-2 py-1 font-medium text-zinc-400 dark:border-zinc-800">
+                            +{hiddenColumns.toLocaleString()}…
+                          </th>
+                        )}
                       </tr>
                     </thead>
                     <tbody>
                       {preview!.sampleRows.map((row, ri) => (
                         <tr key={ri} className="border-t border-zinc-100 dark:border-zinc-900">
-                          {row.map((cell, ci) => (
+                          {row.slice(0, MAX_PREVIEW_COLUMNS).map((cell, ci) => (
                             <td
                               key={ci}
                               className="max-w-64 truncate px-2 py-1 font-mono"
@@ -359,6 +385,7 @@ export function JsonImportDialog() {
                               {cell}
                             </td>
                           ))}
+                          {hiddenColumns > 0 && <td className="px-2 py-1 text-zinc-400">…</td>}
                         </tr>
                       ))}
                     </tbody>

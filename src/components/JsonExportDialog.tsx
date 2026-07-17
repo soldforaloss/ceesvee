@@ -9,6 +9,14 @@ import { Modal } from "./Modal";
 const FORMATS: JsonExportFormat[] = ["objects", "arrays", "jsonLines"];
 
 /**
+ * Upper bound on how many rebuild-mapping rows the dialog renders. Conflict
+ * detection still runs over EVERY column; this only bounds the DOM, per the
+ * "bounded windows to React only" invariant (a JSON-imported document can be
+ * thousands of columns wide).
+ */
+const MAX_MAPPING_ROWS = 200;
+
+/**
  * JSON / JSON Lines export (F33). Format choice, missing/null token mapping,
  * typed emission, and — for the object formats — a nested-rebuild mapping that
  * surfaces duplicate / conflicting output paths BEFORE the write is attempted
@@ -204,7 +212,7 @@ export function JsonExportDialog({ onClose }: { onClose: () => void }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {mapping.rows.map((r, i) => (
+                  {mapping.rows.slice(0, MAX_MAPPING_ROWS).map((r, i) => (
                     <tr
                       key={`${r.header}-${i}`}
                       className={`border-t border-zinc-100 dark:border-zinc-800 ${r.conflict ? "bg-red-50 dark:bg-red-950/40" : ""}`}
@@ -220,6 +228,13 @@ export function JsonExportDialog({ onClose }: { onClose: () => void }) {
                 </tbody>
               </table>
             </div>
+            {mapping.rows.length > MAX_MAPPING_ROWS && (
+              <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                + {(mapping.rows.length - MAX_MAPPING_ROWS).toLocaleString()} more column
+                {mapping.rows.length - MAX_MAPPING_ROWS === 1 ? "" : "s"} not shown (every column is
+                still checked for duplicate output paths).
+              </p>
+            )}
           </div>
         )}
 

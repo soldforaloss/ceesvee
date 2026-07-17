@@ -44,6 +44,7 @@ const preview = (over: Partial<JsonImportPreview> = {}): JsonImportPreview => ({
   recordCount: 1,
   projectedRows: 1,
   projectedColumns: 0,
+  maxRecordDims: 0,
   sampleRows: [],
   exploded: false,
   warnings: [],
@@ -116,26 +117,35 @@ describe("array explosion policy state", () => {
     expect(explodingFields(fields, "explode", ["scores"]).map((f) => f.path)).toEqual(["tags"]);
   });
 
-  it("requires a cartesian/zip choice for two exploding fields", () => {
-    const fields = [arr("tags"), arr("scores")];
+  it("requires a cartesian/zip choice only when a record co-occurs 2+ arrays", () => {
+    // Two array dimensions in a single record (maxRecordDims >= 2).
     expect(
-      needsMultiArrayChoice(fields, {
+      needsMultiArrayChoice(preview({ maxRecordDims: 2 }), {
         arrayPolicy: "explode",
-        ignorePaths: [],
         multiArray: undefined,
       }),
     ).toBe(true);
-    // One exploding field needs no choice.
+    // Two array FIELDS that never co-occur in one record (maxRecordDims 1):
+    // no choice needed even though the document-wide list has two entries.
     expect(
-      needsMultiArrayChoice(fields, {
+      needsMultiArrayChoice(preview({ maxRecordDims: 1, arrayFields: [arr("x"), arr("y")] }), {
         arrayPolicy: "explode",
-        ignorePaths: ["scores"],
         multiArray: undefined,
       }),
     ).toBe(false);
     // A chosen mode clears the requirement.
     expect(
-      needsMultiArrayChoice(fields, { arrayPolicy: "explode", ignorePaths: [], multiArray: "zip" }),
+      needsMultiArrayChoice(preview({ maxRecordDims: 2 }), {
+        arrayPolicy: "explode",
+        multiArray: "zip",
+      }),
+    ).toBe(false);
+    // A non-explode policy never needs the choice.
+    expect(
+      needsMultiArrayChoice(preview({ maxRecordDims: 2 }), {
+        arrayPolicy: "preserveJson",
+        multiArray: undefined,
+      }),
     ).toBe(false);
   });
 });
@@ -156,18 +166,26 @@ describe("import option validation", () => {
     expect(ok.some((e) => /JSON Pointer/.test(e))).toBe(false);
   });
 
-  it("blocks a dual-array explode without a mode", () => {
+  it("blocks a dual-array explode without a mode (per-record co-occurrence)", () => {
     const opts = { ...defaultImportOptions(), arrayPolicy: "explode" as const };
-    const errs = validateImportOptions(
-      opts,
-      preview({ arrayFields: [arr("tags"), arr("scores")] }),
-    );
+    const errs = validateImportOptions(opts, preview({ maxRecordDims: 2 }));
     expect(errs.some((e) => /cartesian or zip/.test(e))).toBe(true);
   });
 
   it("passes a clean single-array explode", () => {
     const opts = { ...defaultImportOptions(), arrayPolicy: "explode" as const };
-    expect(validateImportOptions(opts, preview({ arrayFields: [arr("tags")] }))).toEqual([]);
+    expect(validateImportOptions(opts, preview({ maxRecordDims: 1 }))).toEqual([]);
+  });
+
+  it("does not block two array fields that never co-occur in one record", () => {
+    const opts = { ...defaultImportOptions(), arrayPolicy: "explode" as const };
+    // Document-wide there are two array fields, but no single record explodes
+    // both at once (maxRecordDims === 1), so the import must not be blocked.
+    const errs = validateImportOptions(
+      opts,
+      preview({ maxRecordDims: 1, arrayFields: [arr("x"), arr("y")] }),
+    );
+    expect(errs).toEqual([]);
   });
 });
 

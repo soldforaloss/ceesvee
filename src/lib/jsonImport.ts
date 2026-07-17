@@ -120,18 +120,22 @@ export function explodingFields(
 }
 
 /**
- * Whether the current options force an explicit cartesian-or-zip decision:
- * two or more array fields exploding in the same import (the engine rejects
- * this without a `multiArray` mode).
+ * Whether the current options force an explicit cartesian-or-zip decision.
+ *
+ * This mirrors the engine's REAL, per-record condition: a `multiArray` mode is
+ * required only when some SINGLE record explodes along two or more array
+ * dimensions at once (`preview.maxRecordDims >= 2`), which the scan reports
+ * under the current options. Two array fields that merely both exist in a
+ * heterogeneous file but never co-occur in one record do NOT need a choice, so
+ * they must not block the import. The `arrayPolicy === "explode"` guard makes
+ * the gate release immediately when the user switches policy, before the
+ * debounced re-scan refreshes `maxRecordDims`.
  */
 export function needsMultiArrayChoice(
-  arrayFields: ArrayFieldInfo[],
-  options: Pick<JsonImportOptions, "arrayPolicy" | "ignorePaths" | "multiArray">,
+  preview: Pick<JsonImportPreview, "maxRecordDims">,
+  options: Pick<JsonImportOptions, "arrayPolicy" | "multiArray">,
 ): boolean {
-  return (
-    explodingFields(arrayFields, options.arrayPolicy, options.ignorePaths).length >= 2 &&
-    !options.multiArray
-  );
+  return options.arrayPolicy === "explode" && preview.maxRecordDims >= 2 && !options.multiArray;
 }
 
 /**
@@ -160,9 +164,9 @@ export function validateImportOptions(
     if (preview.needsPointer && !hasPointer(options)) {
       errors.push("Choose the record-array location (a JSON Pointer) to scan first.");
     }
-    if (needsMultiArrayChoice(preview.arrayFields, options)) {
+    if (needsMultiArrayChoice(preview, options)) {
       errors.push(
-        "Two or more array fields would explode — choose how to combine them (cartesian or zip).",
+        "Two or more array fields explode in the same record — choose how to combine them (cartesian or zip).",
       );
     }
   }

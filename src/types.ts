@@ -1572,6 +1572,13 @@ export interface JsonImportPreview {
   /** Rows the import will produce (explosion accounted for). */
   projectedRows: number;
   projectedColumns: number;
+  /**
+   * The most array dimensions any single record explodes along at once under
+   * the current options. `>= 2` means an explicit `multiArray` choice is
+   * required — this mirrors the backend's real per-record condition, unlike a
+   * document-wide array-field count.
+   */
+  maxRecordDims: number;
   /** Up to N rows exactly as they would land in the grid. */
   sampleRows: string[][];
   exploded: boolean;

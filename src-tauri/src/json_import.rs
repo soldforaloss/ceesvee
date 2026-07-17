@@ -806,13 +806,35 @@ impl Read for CountingReader<'_> {
 
 /// Stream the record array at `segments` inside the JSON document at
 /// `path`, feeding each element to `f`. Returns the record count.
+/// Advance `file` past a leading UTF-8 BOM if present (leaving it at byte 0
+/// otherwise). `serde_json` does NOT tolerate a BOM, so every raw-reader parse
+/// must skip it first — `detect_shape` and the JSONL framer already do.
+fn skip_utf8_bom(file: &mut File) -> std::io::Result<()> {
+    let mut probe = [0u8; 3];
+    let mut got = 0usize;
+    while got < 3 {
+        let n = file.read(&mut probe[got..])?;
+        if n == 0 {
+            break;
+        }
+        got += n;
+    }
+    if !(got == 3 && probe == UTF8_BOM) {
+        file.seek(SeekFrom::Start(0))?;
+    }
+    Ok(())
+}
+
 fn stream_doc(
     path: &Path,
     segments: &[String],
     ctx: Option<&JobCtx>,
     f: &mut dyn FnMut(u64, Loc, JVal) -> AppResult<()>,
 ) -> AppResult<u64> {
-    let file = File::open(path)?;
+    let mut file = File::open(path)?;
+    // A BOM-prefixed array/object document detects fine (detect_shape strips
+    // it) but serde_json would choke on it; skip it before the streaming parse.
+    skip_utf8_bom(&mut file)?;
     let reader = BufReader::with_capacity(64 * 1024, CountingReader { inner: file, ctx });
     let mut de = serde_json::Deserializer::from_reader(reader);
     let mut adapter = |index: u64, value: JVal| {
@@ -1429,7 +1451,8 @@ fn combo_count(dims: &[(String, Vec<JVal>)], multi: Option<MultiArrayMode>) -> u
             Some(MultiArrayMode::Zip) => {
                 dims.iter().map(|(_, i)| i.len()).max().unwrap_or(1).max(1) as u64
             }
-            // Cartesian (an unresolved choice is rejected before this).
+            // Cartesian. An unresolved (None) choice is projected as the
+            // cartesian upper bound for the preview; the import pass rejects it.
             _ => dims.iter().fold(1u64, |acc, (_, i)| {
                 acc.saturating_mul(i.len().max(1) as u64)
             }),
@@ -1567,6 +1590,11 @@ struct ScanState {
     null_collisions: u64,
     missing_collisions: u64,
     exploded: bool,
+    /// The most array dimensions any SINGLE record explodes along at once.
+    /// `>= 2` is exactly the backend's per-record condition for demanding an
+    /// explicit `multiArray` (cartesian/zip) choice, so the preview can mirror
+    /// it instead of over-approximating from the document-wide array list.
+    max_record_dims: usize,
 }
 
 impl ScanState {
@@ -1585,9 +1613,15 @@ impl ScanState {
             Some(_) => {}
         }
         let rec = flatten_record(kind, value, res, loc)?;
-        if rec.dims.len() > 1 && res.multi.is_none() {
-            return Err(multi_choice_error(&rec, loc));
-        }
+        // Record — but do NOT reject here — records that explode along two or
+        // more array dimensions at once. The preview stays permissive (rows
+        // projected under the cartesian upper bound) so the dialog can prompt
+        // for the combine mode inline and can tell a genuine co-occurrence
+        // apart from two array fields that merely both exist somewhere in a
+        // heterogeneous file. The import/emit pass (see `import`) is the
+        // authority that rejects a missing multiArray choice, so "no partial
+        // documents on invalid input" still holds.
+        self.max_record_dims = self.max_record_dims.max(rec.dims.len());
         let first_record = self.records == 0;
         self.records += 1;
         self.projected_rows = self
@@ -1745,6 +1779,11 @@ pub struct JsonImportPreview {
     /// Rows the import will produce (explosion accounted for).
     pub projected_rows: u64,
     pub projected_columns: usize,
+    /// The most array dimensions any single record explodes along at once
+    /// under the current options. `>= 2` means an explicit `multiArray`
+    /// (cartesian/zip) choice is required; the frontend gate mirrors this
+    /// rather than counting the document-wide array-field list.
+    pub max_record_dims: usize,
     /// Up to [`SAMPLE_ROWS`] rows exactly as they would land in the grid
     /// (null/missing tokens applied).
     pub sample_rows: Vec<Vec<String>>,
@@ -1785,6 +1824,7 @@ impl JsonImportScan {
                 record_count: 0,
                 projected_rows: 0,
                 projected_columns: 0,
+                max_record_dims: 0,
                 sample_rows: Vec::new(),
                 exploded: false,
                 warnings,
@@ -1955,6 +1995,7 @@ fn scan_impl(
         record_count: state.records,
         projected_rows: state.projected_rows,
         projected_columns: n_cols,
+        max_record_dims: state.max_record_dims,
         sample_rows,
         exploded: state.exploded,
         warnings,
@@ -2078,6 +2119,26 @@ pub fn import(
         }
     }
     Ok(doc)
+}
+
+// ----- preview cache ---------------------------------------------------------------
+
+/// Finished preview scans keyed by the job id that produced them. The front
+/// end fetches the preview with `get_json_import_preview` after the
+/// `job-finished` event (mirrors the recipe-batch report cache).
+#[derive(Default)]
+pub struct JsonImportPreviewCache(
+    std::sync::Arc<std::sync::Mutex<HashMap<u64, JsonImportPreview>>>,
+);
+
+impl JsonImportPreviewCache {
+    pub fn share(&self) -> std::sync::Arc<std::sync::Mutex<HashMap<u64, JsonImportPreview>>> {
+        std::sync::Arc::clone(&self.0)
+    }
+
+    pub fn get(&self, job_id: u64) -> Option<JsonImportPreview> {
+        self.0.lock().ok()?.get(&job_id).cloned()
+    }
 }
 
 // ----- tests -----------------------------------------------------------------------
@@ -2563,10 +2624,70 @@ mod tests {
     fn dual_array_explode_requires_an_explicit_choice() {
         let mut opts = options();
         opts.array_policy = ArrayPolicy::Explode;
+        // A SINGLE record with two arrays that co-occur.
         let contents = "{\"x\": [1, 2], \"y\": [\"a\", \"b\"]}\n";
-        let err = err_of(scan_str("m.jsonl", contents, &opts));
+        // The scan is permissive so the dialog can prompt inline: it succeeds
+        // and reports the co-occurrence (max_record_dims == 2) instead of
+        // erroring.
+        let scan = scan_str("m.jsonl", contents, &opts).unwrap();
+        assert_eq!(scan.preview.max_record_dims, 2);
+        // The import/emit pass is the authority and rejects the missing choice.
+        let err = err_of(import_str("m.jsonl", contents, &opts));
         assert!(err.contains("cartesian or zip"), "{err}");
         assert!(err.contains("x, y"), "{err}");
+    }
+
+    #[test]
+    fn heterogeneous_arrays_that_never_co_occur_need_no_multi_choice() {
+        // Two DIFFERENT array fields, each alone in its own record: the
+        // per-record explode dimension is always 1, so no multiArray choice is
+        // needed even though the document-wide array list has two entries.
+        let mut opts = options();
+        opts.array_policy = ArrayPolicy::Explode;
+        let contents = "{\"x\": [1, 2]}\n{\"y\": [\"a\", \"b\"]}\n";
+        let scan = scan_str("h.jsonl", contents, &opts).unwrap();
+        assert_eq!(scan.preview.array_fields.len(), 2, "both arrays reported");
+        assert_eq!(
+            scan.preview.max_record_dims, 1,
+            "no single record explodes two dimensions"
+        );
+        // And the import runs with no multiArray mode set.
+        let (_dir, doc) = import_str("h.jsonl", contents, &opts).unwrap();
+        assert_eq!(doc.rows().len(), 4);
+    }
+
+    #[test]
+    fn bom_prefixed_array_document_scans_and_imports() {
+        // A UTF-8 BOM in front of a plain array document must not break the
+        // streaming parse (regression: stream_doc fed the raw file, BOM and
+        // all, to serde_json).
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = UTF8_BOM.to_vec();
+        bytes.extend_from_slice(b"[{\"a\":1},{\"a\":2}]");
+        let path = write(dir.path(), "b.json", &bytes);
+        let opts = options();
+        let scan = scan(&path, &opts, None).unwrap();
+        assert_eq!(scan.preview.record_count, 2);
+        assert_eq!(preview_col(&scan, "a").present, 2);
+        let cache = dir.path().join("cache");
+        let doc = import(&path, &opts, &cache, 1, None).unwrap();
+        assert_eq!(doc.rows().len(), 2);
+    }
+
+    #[test]
+    fn bom_prefixed_object_document_with_pointer_imports() {
+        // BOM + object document reached through a JSON Pointer.
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = UTF8_BOM.to_vec();
+        bytes.extend_from_slice(b"{\"items\":[{\"a\":1},{\"a\":2},{\"a\":3}]}");
+        let path = write(dir.path(), "bo.json", &bytes);
+        let mut opts = options();
+        opts.pointer = Some("/items".to_string());
+        let scan = scan(&path, &opts, None).unwrap();
+        assert_eq!(scan.preview.record_count, 3);
+        let cache = dir.path().join("cache");
+        let doc = import(&path, &opts, &cache, 1, None).unwrap();
+        assert_eq!(doc.rows().len(), 3);
     }
 
     #[test]
