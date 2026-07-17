@@ -19,34 +19,72 @@ pub fn atomic_write(
     backup: BackupPolicy,
     write: impl FnOnce(&mut File) -> AppResult<u64>,
 ) -> AppResult<u64> {
-    let dir = dest
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| AppError::invalid("destination has no parent directory"))?;
-
-    let mut staging = tempfile::Builder::new()
-        .prefix(".ceesvee-save-")
-        .suffix(".tmp")
-        .tempfile_in(dir)?;
+    let mut writer = AtomicWriter::create(dest, backup)?;
 
     // Stream the content. On any error (I/O, encoding, cancellation) the
-    // `NamedTempFile` guard removes the staging file on drop and the
-    // destination has not been touched.
-    let bytes = write(staging.as_file_mut())?;
+    // writer's drop removes the staging file and the destination has not
+    // been touched.
+    let bytes = write(writer.file_mut())?;
 
-    staging.as_file_mut().flush()?;
-    // Push the bytes to the platform's storage before the rename, so a crash
-    // right after the swap cannot leave a truncated destination.
-    staging.as_file().sync_all()?;
+    writer.commit()?;
+    Ok(bytes)
+}
 
-    if backup == BackupPolicy::Single && dest.exists() {
-        // Copy (not rename) so the destination remains present at every
-        // instant; only the atomic swap below ever replaces it.
-        std::fs::copy(dest, bak_path(dest))?;
+/// The staging half of an atomic write, for PUSH-style producers (streaming
+/// sinks) that receive their data over multiple calls instead of inside one
+/// closure. [`atomic_write`] is a thin wrapper around this. Dropping the
+/// writer without [`AtomicWriter::commit`] removes the staging file and
+/// leaves the destination byte-for-byte untouched.
+pub struct AtomicWriter {
+    staging: tempfile::NamedTempFile,
+    dest: PathBuf,
+    backup: BackupPolicy,
+}
+
+impl AtomicWriter {
+    /// Open a staging file next to `dest` (same directory, same filesystem,
+    /// so the final rename is atomic).
+    pub fn create(dest: &Path, backup: BackupPolicy) -> AppResult<AtomicWriter> {
+        let dir = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| AppError::invalid("destination has no parent directory"))?;
+
+        let staging = tempfile::Builder::new()
+            .prefix(".ceesvee-save-")
+            .suffix(".tmp")
+            .tempfile_in(dir)?;
+        Ok(AtomicWriter {
+            staging,
+            dest: dest.to_path_buf(),
+            backup,
+        })
     }
 
-    staging.persist(dest).map_err(|e| AppError::Io(e.error))?;
-    Ok(bytes)
+    /// The staging file to stream content into.
+    pub fn file_mut(&mut self) -> &mut File {
+        self.staging.as_file_mut()
+    }
+
+    /// Flush + fsync the staging file, take the backup copy when requested,
+    /// and atomically swap the staging file into place.
+    pub fn commit(mut self) -> AppResult<()> {
+        self.staging.as_file_mut().flush()?;
+        // Push the bytes to the platform's storage before the rename, so a
+        // crash right after the swap cannot leave a truncated destination.
+        self.staging.as_file().sync_all()?;
+
+        if self.backup == BackupPolicy::Single && self.dest.exists() {
+            // Copy (not rename) so the destination remains present at every
+            // instant; only the atomic swap below ever replaces it.
+            std::fs::copy(&self.dest, bak_path(&self.dest))?;
+        }
+
+        self.staging
+            .persist(&self.dest)
+            .map_err(|e| AppError::Io(e.error))?;
+        Ok(())
+    }
 }
 
 /// `data.csv` -> `data.csv.bak`, next to the destination.

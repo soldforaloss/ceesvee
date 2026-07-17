@@ -19,6 +19,7 @@ use crate::index;
 use crate::job::JobCtx;
 use crate::parse::{parse, ParseSettings};
 use crate::state::SharedDocument;
+use crate::tabular::{DocumentSource, TabularSource, DEFAULT_WINDOW};
 
 /// Bytes read to sniff a file's header row during preview/schema building.
 const HEADER_PROBE_BYTES: usize = 256 * 1024;
@@ -433,13 +434,19 @@ pub fn run(
         let mapping = &mappings[i];
         let mut rows_in = 0usize;
         let push = |source_row: usize,
-                    cells: &[String],
+                    cells: &[Option<String>],
                     builder: &mut DerivedDocumentBuilder|
          -> AppResult<()> {
             let mut out_row: Vec<String> = Vec::with_capacity(width);
             for m in mapping {
                 out_row.push(match m {
-                    Some(c) => cells.get(*c).cloned().unwrap_or_default(),
+                    // Missing cells (absent from the record) blank, exactly
+                    // like unmapped columns.
+                    Some(c) => cells
+                        .get(*c)
+                        .and_then(|v| v.as_deref())
+                        .unwrap_or("")
+                        .to_string(),
                     None => String::new(),
                 });
             }
@@ -454,17 +461,40 @@ pub fn run(
             builder.push_row(out_row)
         };
 
+        // Every input streams through the shared [`crate::tabular`] window
+        // contract: bounded owned windows, identical for both document
+        // backings, with cooperative cancellation inside the reads.
+        let stream = |doc: &Document,
+                      start: usize,
+                      rows_in: &mut usize,
+                      builder: &mut DerivedDocumentBuilder|
+         -> AppResult<()> {
+            let source = DocumentSource::new(doc);
+            let mut offset = start as u64;
+            loop {
+                let rows = source.read_rows(offset, DEFAULT_WINDOW, Some(ctx))?;
+                if rows.is_empty() {
+                    break;
+                }
+                for (k, cells) in rows.iter().enumerate() {
+                    *rows_in += 1;
+                    push(offset as usize + k - start, cells, builder)?;
+                }
+                let n = rows.len();
+                offset += n as u64;
+                if n < DEFAULT_WINDOW {
+                    break;
+                }
+            }
+            Ok(())
+        };
+
         let result: AppResult<()> = match input {
             ResolvedInput::Doc { doc, .. } => {
                 let doc = doc
                     .read()
                     .map_err(|_| AppError::Other("internal document lock error".into()))?;
-                doc.visit_rows(0..doc.n_rows(), &mut |r, cells| {
-                    ctx.check()?;
-                    rows_in += 1;
-                    push(r, cells, &mut builder)?;
-                    Ok(true)
-                })
+                stream(&doc, 0, &mut rows_in, &mut builder)
             }
             ResolvedInput::File { path, .. } => (|| {
                 // Stream the file through a TEMPORARY record index instead of
@@ -483,12 +513,7 @@ pub fn run(
                 // the index classified it as data instead, skip it here so
                 // the header line never lands in the output as a row.
                 let start = usize::from(!temp.meta().has_header_row);
-                temp.visit_rows(start..temp.n_rows(), &mut |r, cells| {
-                    ctx.check()?;
-                    rows_in += 1;
-                    push(r - start, cells, &mut builder)?;
-                    Ok(true)
-                })
+                stream(&temp, start, &mut rows_in, &mut builder)
             })(),
         };
 

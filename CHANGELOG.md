@@ -42,6 +42,23 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the backend), advisory accepts it and records a bounded, retrievable
   issue — while schema edits themselves never touch the undo stack.
 
+### Internal
+
+- **Shared tabular contracts**: new backend `TabularSource` /
+  `TabularSink` traits — logical schema (stable column IDs + declared
+  types), row-count hints, bounded windowed reads with a missing-vs-empty
+  cell distinction, cooperative cancellation, content fingerprints, and
+  atomic streamed CSV output through the existing crash-safe save
+  pipeline. Both document backings (editable and indexed) read through the
+  contract, and the multi-file append reader now streams its inputs over
+  it. Groundwork for upcoming import/export formats and sampling.
+- **Shared row identity**: new backend model for upcoming annotations,
+  patches, and three-way merge — session-stable editor row ids, source
+  record numbers for read-only documents, normalized composite keys
+  (trim / case fold / Unicode NFKC, deterministic order) with explicit
+  duplicate-key reporting (every involved row is flagged, never silently
+  first-wins), and boundary-safe SHA-256 row content hashes.
+
 ## [0.4.0]
 
 ### Added

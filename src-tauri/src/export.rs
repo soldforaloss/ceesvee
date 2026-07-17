@@ -19,7 +19,7 @@ use crate::job::JobCtx;
 use crate::{encoding, util};
 
 /// Drain the staging buffer to the sink once it grows past this.
-const FLUSH_THRESHOLD: usize = 64 * 1024;
+pub(crate) const FLUSH_THRESHOLD: usize = 64 * 1024;
 
 /// Stream the whole of `doc` into `out` using `opts`. Returns the total bytes
 /// written. Progress (rows + bytes) and cancellation flow through `ctx`.
@@ -62,6 +62,24 @@ enum RowSelection<'a> {
     Indices(&'a [usize]),
 }
 
+/// The `csv` quote style an [`ExportOptions`] string selects.
+pub(crate) fn quote_style_of(opts: &ExportOptions) -> QuoteStyle {
+    match opts.quote_style.as_str() {
+        "always" => QuoteStyle::Always,
+        "never" => QuoteStyle::Never,
+        // "minimal" / "necessary" / anything else
+        _ => QuoteStyle::Necessary,
+    }
+}
+
+/// The `csv` record terminator an [`ExportOptions`] string selects.
+pub(crate) fn terminator_of(opts: &ExportOptions) -> Terminator {
+    match LineEnding::parse(&opts.line_ending) {
+        LineEnding::Crlf => Terminator::CRLF,
+        LineEnding::Lf => Terminator::Any(b'\n'),
+    }
+}
+
 fn write_rows<W: Write>(
     doc: &Document,
     rows: RowSelection<'_>,
@@ -71,16 +89,8 @@ fn write_rows<W: Write>(
     ctx: Option<&JobCtx>,
 ) -> AppResult<u64> {
     let delimiter = util::delimiter_to_byte(&opts.delimiter);
-    let quote_style = match opts.quote_style.as_str() {
-        "always" => QuoteStyle::Always,
-        "never" => QuoteStyle::Never,
-        // "minimal" / "necessary" / anything else
-        _ => QuoteStyle::Necessary,
-    };
-    let terminator = match LineEnding::parse(&opts.line_ending) {
-        LineEnding::Crlf => Terminator::CRLF,
-        LineEnding::Lf => Terminator::Any(b'\n'),
-    };
+    let quote_style = quote_style_of(opts);
+    let terminator = terminator_of(opts);
     let target = encoding::from_name(&opts.encoding);
 
     let make_writer = |buf: Vec<u8>| {
@@ -160,7 +170,8 @@ fn write_rows<W: Write>(
 /// Transcode one UTF-8 chunk to the target encoding and write it out,
 /// clearing the buffer. Record-aligned chunks keep multi-byte characters
 /// intact. Fails on unmappable characters instead of substituting.
-fn transcode_chunk<W: Write>(
+/// Shared with the [`crate::tabular`] CSV sink.
+pub(crate) fn transcode_chunk<W: Write>(
     buf: &mut Vec<u8>,
     target: &'static Encoding,
     out: &mut W,
