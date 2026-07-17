@@ -19,6 +19,7 @@ use crate::index;
 use crate::job::JobCtx;
 use crate::parse::{parse, ParseSettings};
 use crate::state::SharedDocument;
+use crate::tabular::{DocumentSource, TabularSource, CANCEL_CHECK_EVERY, DEFAULT_WINDOW};
 
 /// Bytes read to sniff a file's header row during preview/schema building.
 const HEADER_PROBE_BYTES: usize = 256 * 1024;
@@ -433,13 +434,19 @@ pub fn run(
         let mapping = &mappings[i];
         let mut rows_in = 0usize;
         let push = |source_row: usize,
-                    cells: &[String],
+                    cells: &[Option<String>],
                     builder: &mut DerivedDocumentBuilder|
          -> AppResult<()> {
             let mut out_row: Vec<String> = Vec::with_capacity(width);
             for m in mapping {
                 out_row.push(match m {
-                    Some(c) => cells.get(*c).cloned().unwrap_or_default(),
+                    // Missing cells (absent from the record) blank, exactly
+                    // like unmapped columns.
+                    Some(c) => cells
+                        .get(*c)
+                        .and_then(|v| v.as_deref())
+                        .unwrap_or("")
+                        .to_string(),
                     None => String::new(),
                 });
             }
@@ -454,17 +461,49 @@ pub fn run(
             builder.push_row(out_row)
         };
 
+        // Every input streams through the shared [`crate::tabular`] window
+        // contract: bounded owned windows, identical for both document
+        // backings, with cooperative cancellation inside the reads.
+        let stream = |doc: &Document,
+                      start: usize,
+                      rows_in: &mut usize,
+                      builder: &mut DerivedDocumentBuilder|
+         -> AppResult<()> {
+            let source = DocumentSource::new(doc);
+            let mut offset = start as u64;
+            loop {
+                let rows = source.read_rows(offset, DEFAULT_WINDOW, Some(ctx))?;
+                if rows.is_empty() {
+                    break;
+                }
+                for (k, cells) in rows.iter().enumerate() {
+                    // `read_rows` checks cancellation up front, but a full
+                    // DEFAULT_WINDOW batch is then pushed here one row at a
+                    // time — each `push` can spill the builder to disk — before
+                    // the next read observes a cancel. Check mid-batch at the
+                    // same granularity the window reader uses so Cancel is
+                    // honoured within CANCEL_CHECK_EVERY rows, not a whole window.
+                    if k % CANCEL_CHECK_EVERY == 0 {
+                        ctx.check()?;
+                    }
+                    *rows_in += 1;
+                    push(offset as usize + k - start, cells, builder)?;
+                }
+                let n = rows.len();
+                offset += n as u64;
+                if n < DEFAULT_WINDOW {
+                    break;
+                }
+            }
+            Ok(())
+        };
+
         let result: AppResult<()> = match input {
             ResolvedInput::Doc { doc, .. } => {
                 let doc = doc
                     .read()
                     .map_err(|_| AppError::Other("internal document lock error".into()))?;
-                doc.visit_rows(0..doc.n_rows(), &mut |r, cells| {
-                    ctx.check()?;
-                    rows_in += 1;
-                    push(r, cells, &mut builder)?;
-                    Ok(true)
-                })
+                stream(&doc, 0, &mut rows_in, &mut builder)
             }
             ResolvedInput::File { path, .. } => (|| {
                 // Stream the file through a TEMPORARY record index instead of
@@ -483,12 +522,7 @@ pub fn run(
                 // the index classified it as data instead, skip it here so
                 // the header line never lands in the output as a row.
                 let start = usize::from(!temp.meta().has_header_row);
-                temp.visit_rows(start..temp.n_rows(), &mut |r, cells| {
-                    ctx.check()?;
-                    rows_in += 1;
-                    push(r - start, cells, &mut builder)?;
-                    Ok(true)
-                })
+                stream(&temp, start, &mut rows_in, &mut builder)
             })(),
         };
 
@@ -751,5 +785,59 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn append_honours_cancellation_through_the_window_reader() {
+        // A cancelled job must stop the append cooperatively via the shared
+        // tabular window reads (DocumentSource::read_rows) rather than run to
+        // completion — regression cover for the reroute onto the window reader.
+        let a = doc_input("a", "id\n1\n2\n3\n");
+        let registry = JobRegistry::default();
+        let ctx = registry.begin("derive", None, |_| {});
+        registry.cancel(ctx.id);
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            std::slice::from_ref(&a),
+            &options(AlignMode::ExactName, SchemaMode::Union),
+            99,
+            dir.path().to_path_buf(),
+            &ctx,
+        );
+        assert!(matches!(result, Err(AppError::Cancelled)));
+    }
+
+    #[test]
+    fn append_checks_cancellation_while_pushing_a_window() {
+        // A single input larger than CANCEL_CHECK_EVERY (but within one
+        // DEFAULT_WINDOW read) streams through the push loop, which now checks
+        // cancellation mid-batch rather than only between window reads. A
+        // normal run copies every row (exercising the in-batch checkpoints);
+        // a cancelled job aborts cooperatively with Cancelled.
+        let n = crate::tabular::CANCEL_CHECK_EVERY + 500;
+        let mut csv = String::from("id\n");
+        for i in 0..n {
+            csv.push_str(&i.to_string());
+            csv.push('\n');
+        }
+        let opts = options(AlignMode::ExactName, SchemaMode::Union);
+
+        let a = doc_input("a", &csv);
+        let (doc, _) = run_append(std::slice::from_ref(&a), &opts).unwrap();
+        assert_eq!(doc.n_rows(), n, "a normal run streams the whole window");
+
+        let a = doc_input("a", &csv);
+        let registry = JobRegistry::default();
+        let ctx = registry.begin("derive", None, |_| {});
+        registry.cancel(ctx.id);
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(
+            std::slice::from_ref(&a),
+            &opts,
+            99,
+            dir.path().to_path_buf(),
+            &ctx,
+        );
+        assert!(matches!(result, Err(AppError::Cancelled)));
     }
 }
