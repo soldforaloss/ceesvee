@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type {
   DocumentMeta,
+  NamedView,
   PlanEntry,
   ProjectSource,
   SourcePreviewEntry,
@@ -13,6 +14,7 @@ import {
   buildResolutions,
   buildSources,
   buildTabsSection,
+  buildViewsSection,
   canApply,
   canOpenInPlace,
   defaultChoice,
@@ -27,7 +29,23 @@ import {
   projectSnapshotsEqual,
   statusDisplay,
   type PanelLayout,
+  type SourceViewsSection,
 } from "./project";
+
+function nv(id: string): NamedView {
+  return {
+    id,
+    name: id,
+    filter: null,
+    filterColumnIds: [],
+    sortKeys: [],
+    hiddenColumnIds: [],
+    pinnedColumnIds: [],
+    columnOrder: [],
+    columnWidths: {},
+    wrapText: false,
+  };
+}
 
 function meta(partial: Partial<DocumentMeta> & Pick<DocumentMeta, "id">): DocumentMeta {
   return {
@@ -217,8 +235,6 @@ function planEntry(sourceId: string, reapplyViews: boolean, viewWarnings: string
     viewWarnings,
     views: [],
     activeViewId: null,
-    schema: null,
-    rowKey: null,
   };
 }
 
@@ -297,6 +313,75 @@ describe("buildTabsSection", () => {
   });
 });
 
+describe("buildViewsSection", () => {
+  const sources: ProjectSource[] = [
+    { id: "src-1", path: "C:\\data\\a.csv" },
+    { id: "src-2", path: "C:\\data\\b.csv" },
+  ];
+
+  it("captures each open source's views + active view and preserves closed ones", () => {
+    const tabs = [meta({ id: 1, path: "C:\\data\\a.csv" })]; // only a.csv is open
+    const existing: SourceViewsSection[] = [
+      { sourceId: "src-2", views: [nv("old")], activeViewId: "old" },
+    ];
+    const section = buildViewsSection(
+      sources,
+      tabs,
+      existing,
+      (tab) => (tab.id === 1 ? [nv("v1"), nv("v2")] : []),
+      (tab) => (tab.id === 1 ? "v1" : null),
+    );
+    expect(section).toEqual([
+      { sourceId: "src-1", views: [nv("v1"), nv("v2")], activeViewId: "v1" },
+      // A referenced-but-closed source keeps its previously-saved views.
+      { sourceId: "src-2", views: [nv("old")], activeViewId: "old" },
+    ]);
+  });
+
+  it("omits an open source that has no views and no active view", () => {
+    const tabs = [meta({ id: 1, path: "C:\\data\\a.csv" })];
+    expect(
+      buildViewsSection(
+        sources,
+        tabs,
+        [],
+        () => [],
+        () => null,
+      ),
+    ).toEqual([]);
+  });
+
+  it("drops preserved views for a source the project no longer references", () => {
+    const existing: SourceViewsSection[] = [
+      { sourceId: "gone", views: [nv("x")], activeViewId: "x" },
+    ];
+    expect(
+      buildViewsSection(
+        sources,
+        [],
+        existing,
+        () => [],
+        () => null,
+      ),
+    ).toEqual([]);
+  });
+
+  it("captures no cell data", () => {
+    const tabs = [meta({ id: 1, path: "C:\\data\\a.csv" })];
+    const section = buildViewsSection(
+      sources,
+      tabs,
+      [],
+      () => [nv("v1")],
+      () => "v1",
+    );
+    const json = JSON.stringify(section);
+    for (const key of ["cells", "rows", "records", "values", "cellValues"]) {
+      expect(json.includes(`"${key}"`)).toBe(false);
+    }
+  });
+});
+
 describe("layout section round-trip", () => {
   it("captures and reads back panel flags", () => {
     const panels: PanelLayout = { diagnostics: true, explorer: false, changes: true };
@@ -342,6 +427,14 @@ describe("projectSnapshot + deriveProjectDirty", () => {
     expect(deriveProjectDirty(base, next)).toBe(true);
   });
 
+  it("dirties on a changed active named view for a document", () => {
+    const base = projectSnapshot(tabs, 1, layout, { 1: "v1" });
+    expect(deriveProjectDirty(base, projectSnapshot(tabs, 1, layout, { 1: "v1" }))).toBe(false);
+    expect(deriveProjectDirty(base, projectSnapshot(tabs, 1, layout, { 1: "v2" }))).toBe(true);
+    // Clearing a previously-active view is also a change.
+    expect(deriveProjectDirty(base, projectSnapshot(tabs, 1, layout, {}))).toBe(true);
+  });
+
   it("ignores unsaved buffers in the tab order", () => {
     const withBuffer = [...tabs, meta({ id: 5, path: null })];
     const base = projectSnapshot(tabs, 1, layout);
@@ -381,7 +474,5 @@ function planEntry2(path: string): PlanEntry {
     viewWarnings: [],
     views: [],
     activeViewId: null,
-    schema: null,
-    rowKey: null,
   };
 }

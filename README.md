@@ -218,15 +218,17 @@ and faithful on large, real-world delimited files.**
 
 **Comfort**
 
-- **Project workspaces** — save a whole working context across related
-  datasets to a versioned `.ceesveeproj` file: which files are open, their
-  tab order and the active tab, panel layout, named views, schemas, file
-  profiles, row keys, recipes, joins, and comparison definitions. Projects
-  **reference** your data, never copy it — no cell values are ever written
-  to the file — and source paths are stored relative to the project so a
-  folder can move as a unit. Reopening restores the session and surfaces any
-  missing, moved, or changed sources with per-source choices (relink, open
-  what's available, or leave a source out); saved views reapply only when a
+- **Project workspaces** — save a working context across related datasets
+  to a versioned `.ceesveeproj` file: which files are open (with
+  fingerprints and parse settings), their tab order and the active tab,
+  panel layout, and each document's named views. Schemas, file profiles,
+  row keys, recipes, joins, and comparison definitions round-trip as
+  configuration a project or template carries. Projects **reference** your
+  data, never copy it — no cell values are ever written to the file — and
+  source paths are stored relative to the project so a folder can move as a
+  unit. Reopening restores the session and surfaces any missing, moved, or
+  changed sources with per-source choices (relink, open what's available,
+  or leave a source out); each document's saved views reapply only when the
   file still matches (otherwise you get a warning, never a broken view), and
   nothing — no recipe, join, or export — ever runs just because you opened a
   project. Save any project as a **template** to capture a repeatable

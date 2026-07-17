@@ -25,8 +25,12 @@
 //! - **Safe open.** The file is fully parsed before any state changes; a
 //!   corrupt file errors clearly and is never modified or moved aside. Files
 //!   written by a newer MAJOR format are rejected with a clear message; a
-//!   newer minor is accepted and its unknown fields (and version string) are
-//!   preserved on round-trip via serde flatten catch-alls.
+//!   newer minor is accepted, and the unknown fields it adds at the envelope,
+//!   section-map, source, tabs and per-source open-settings levels are
+//!   preserved on round-trip via serde flatten catch-alls, alongside the
+//!   version string. Typed sub-sections owned by other features (views,
+//!   schemas, comparisons, row keys) round-trip through those features' own
+//!   versioned payloads rather than through a catch-all here.
 //! - **Nothing runs on open.** Opening a project yields a [`ProjectOpenPlan`]
 //!   describing what to open and which named views are safe to reapply
 //!   (fingerprint + column compatibility gated — warn, never break). Recipes,
@@ -47,7 +51,7 @@ use crate::error::{AppError, AppResult};
 use crate::row_identity::KeySpec;
 use crate::save;
 use crate::schema::SchemaExport;
-use crate::settings::{FileProfile, NamedView};
+use crate::settings::{FileProfile, NamedView, ProfileMatch};
 use crate::{encoding, util};
 
 /// Major format version this build reads and writes. Files with a HIGHER
@@ -277,6 +281,10 @@ pub struct ProjectOpenSettings {
     pub delimiter: Option<String>,
     pub encoding: Option<String>,
     pub has_header_row: Option<bool>,
+    /// Fields a future minor adds to a source's open settings, preserved
+    /// verbatim on round-trip.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, Value>,
 }
 
 /// One referenced document.
@@ -308,6 +316,10 @@ pub struct ProjectSource {
 pub struct TabsSection {
     pub open: Vec<String>,
     pub active: Option<String>,
+    /// Fields a future minor adds to the tabs section, preserved verbatim on
+    /// round-trip.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, Value>,
 }
 
 /// F12 named views attached to one source.
@@ -671,8 +683,13 @@ pub struct ResolutionEntry {
 }
 
 /// One document the front end should open (via the normal `open_file`
-/// path), with the configuration to reapply afterwards. Views/schemas are
-/// carried even when gated so the UI can offer a manual "apply anyway".
+/// path), with the named views to reapply afterwards. The front end reapplies
+/// each source's active view once its document has actually opened, but ONLY
+/// when `reapply_views` is set (fingerprint + column compatibility held).
+/// Views are carried even when gated so the warning banner can explain what
+/// was skipped. Schemas and row-key definitions are NOT part of the open plan:
+/// they stay in the persisted `schemas`/`rowKeys` sections and are consumed by
+/// their owning features on demand, never reapplied as a side effect of open.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanEntry {
@@ -686,8 +703,6 @@ pub struct PlanEntry {
     pub view_warnings: Vec<String>,
     pub views: Vec<NamedView>,
     pub active_view_id: Option<String>,
-    pub schema: Option<SchemaExport>,
-    pub row_key: Option<KeySpec>,
 }
 
 /// The resolved open plan. NOTHING here executes: the front end drives each
@@ -1026,8 +1041,6 @@ pub(crate) fn open_apply(
                         view_warnings: warnings,
                         views: Vec::new(),
                         active_view_id: None,
-                        schema: None,
-                        row_key: None,
                     },
                 );
             }
@@ -1055,15 +1068,15 @@ pub(crate) fn open_apply(
                         view_warnings: check.warnings.clone(),
                         views: Vec::new(),
                         active_view_id: None,
-                        schema: None,
-                        row_key: None,
                     },
                 );
             }
         }
     }
 
-    // Attach per-source configuration from the (post-removal) sections.
+    // Attach each source's saved named views (for reapplication after open)
+    // from the post-removal sections. Schemas and row keys stay in their
+    // persisted sections and are NOT surfaced in the open plan.
     for entry in entries.values_mut() {
         if let Some(v) = sections
             .views
@@ -1073,16 +1086,6 @@ pub(crate) fn open_apply(
             entry.views = v.views.clone();
             entry.active_view_id = v.active_view_id.clone();
         }
-        entry.schema = sections
-            .schemas
-            .iter()
-            .find(|s| s.source_id == entry.source_id)
-            .map(|s| s.schema.clone());
-        entry.row_key = sections
-            .row_keys
-            .iter()
-            .find(|k| k.source_id == entry.source_id)
-            .map(|k| k.key.clone());
     }
 
     // Restore tab order over the sources actually being opened; sources not
@@ -1238,10 +1241,56 @@ fn set_section_typed(sections: &mut ProjectSections, name: &str, value: Value) -
     Ok(())
 }
 
+/// Whether a string looks like an absolute filesystem path under EITHER
+/// convention (so a Windows-authored pattern is still detected on a Linux
+/// build and vice versa): a POSIX root, a UNC prefix, or a `C:\`/`C:/` drive
+/// prefix. Used to catch a `Glob` pattern that embeds a concrete location.
+fn looks_absolute(s: &str) -> bool {
+    if s.starts_with('/') || s.starts_with('\\') {
+        return true; // POSIX root or UNC/backslash root
+    }
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
+}
+
+/// Rewrite a profile matcher into a portable, path-free form. `ExactPath`
+/// and `Directory` embed a literal absolute path, and a `Glob` pattern can
+/// too; each is generalized (an `ExactPath` keeps its file extension when it
+/// has one, verified separator-free) so a template never carries the authoring
+/// machine's layout. Any other matcher (`Extension`, a relative `Glob`) is
+/// left untouched.
+fn portable_matcher(matcher: &ProfileMatch) -> ProfileMatch {
+    let wildcard = || ProfileMatch::Glob {
+        pattern: "*".to_string(),
+    };
+    // A path's final `.segment`, but only when it is a real extension
+    // (non-empty and carrying no path separator), computed without relying on
+    // the host OS's separator so a Windows path scrubs the same way on Linux.
+    let extension_of = |path: &str| -> Option<String> {
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+        match name.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => Some(ext.to_string()),
+            _ => None,
+        }
+    };
+    match matcher {
+        ProfileMatch::ExactPath { path } => match extension_of(path) {
+            Some(ext) => ProfileMatch::Extension { extension: ext },
+            None => wildcard(),
+        },
+        ProfileMatch::Directory { .. } => wildcard(),
+        ProfileMatch::Glob { pattern } if looks_absolute(pattern) => wildcard(),
+        other => other.clone(),
+    }
+}
+
 /// Strip everything that references concrete source files, leaving pure
 /// configuration: this is what "save as template" writes and what
-/// new-from-template starts from. Unknown sections are preserved — the
-/// no-cell-data scan already guarantees they carry configuration only.
+/// new-from-template starts from. Bundled profiles are kept (their validation
+/// rules are portable) but their matchers are scrubbed of any absolute path,
+/// so a template never leaks a filesystem layout regardless of section.
+/// Unknown sections are preserved — the no-cell-data scan already guarantees
+/// they carry configuration only.
 fn strip_sources(sections: &mut ProjectSections) {
     sections.sources.clear();
     sections.tabs = TabsSection::default();
@@ -1250,6 +1299,9 @@ fn strip_sources(sections: &mut ProjectSections) {
     sections.row_keys.clear();
     sections.join_mappings.clear();
     sections.comparisons.clear();
+    for profile in &mut sections.profiles {
+        profile.matcher = portable_matcher(&profile.matcher);
+    }
 }
 
 /// Create a new project, optionally initialized from a template (or any
@@ -1458,6 +1510,7 @@ mod tests {
                 delimiter: Some(",".into()),
                 encoding: Some("UTF-8".into()),
                 has_header_row: Some(true),
+                ..Default::default()
             },
             columns: vec![
                 ProjectColumn {
@@ -1524,6 +1577,7 @@ mod tests {
         s.tabs = TabsSection {
             open: vec!["srcB".into(), "srcA".into()],
             active: Some("srcA".into()),
+            ..Default::default()
         };
         s.layout = Some(serde_json::json!({"sidebar": "left", "width": 320}));
         s.views = vec![SourceViews {
@@ -1686,6 +1740,45 @@ mod tests {
         assert!(
             raw.contains("\"note\": \"check this\""),
             "reserved content kept: {raw}"
+        );
+    }
+
+    #[test]
+    fn nested_unknown_fields_in_tabs_and_open_survive_a_round_trip() {
+        // Unknown fields a future minor adds INSIDE the tabs section and inside
+        // a source's open-settings object must survive re-save (the flatten
+        // catch-alls on those F37-owned types).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested.ceesveeproj");
+        std::fs::write(
+            &path,
+            br#"{
+              "formatVersion": "1.4",
+              "appVersion": "9.1.0",
+              "sections": {
+                "tabs": {"open": ["s1"], "active": "s1", "futureTabsField": {"k": 1}},
+                "sources": [{
+                  "id": "s1",
+                  "path": "x.csv",
+                  "open": {"delimiter": ",", "futureOpenField": "keep-me"}
+                }]
+              }
+            }"#,
+        )
+        .unwrap();
+        write_csv(dir.path(), "x.csv", "a,b\n1,2\n");
+
+        let loaded = load_project_file(&path).unwrap();
+        let out = dir.path().join("resaved.ceesveeproj");
+        write_project_file(&out, &loaded).unwrap();
+        let raw = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            raw.contains("\"futureTabsField\""),
+            "tabs-level extras kept: {raw}"
+        );
+        assert!(
+            raw.contains("\"futureOpenField\""),
+            "open-settings extras kept: {raw}"
         );
     }
 
@@ -1953,13 +2046,25 @@ mod tests {
         assert!(s.sources.iter().any(|x| x.id == "srcB"));
         assert!(s.join_mappings.iter().any(|j| j.right_source_id == "srcB"));
 
-        // The plan carries the per-source config for reapplication.
+        // The plan carries the per-source named views for reapplication...
         let a = &plan.entries[0];
         assert_eq!(a.views.len(), 1);
         assert_eq!(a.active_view_id.as_deref(), Some("v1"));
-        assert!(a.schema.is_some());
-        assert!(a.row_key.is_some());
         assert_eq!(plan.active_tab.as_deref(), Some("srcA"));
+        // ...while schemas and row keys stay in the persisted sections (they
+        // are consumed on demand, never reapplied as a side effect of open).
+        assert!(project
+            .file
+            .sections
+            .schemas
+            .iter()
+            .any(|s| s.source_id == "srcA"));
+        assert!(project
+            .file
+            .sections
+            .row_keys
+            .iter()
+            .any(|k| k.source_id == "srcA"));
     }
 
     #[test]
@@ -2074,6 +2179,82 @@ mod tests {
         assert_eq!(fresh.file.sections.recipes.len(), 1);
         assert!(fresh.file.sections.sources.is_empty());
         assert_eq!(fresh.meta().name, "Untitled project");
+    }
+
+    #[test]
+    fn templates_scrub_absolute_paths_from_bundled_profiles() {
+        // A profile whose matcher embeds an absolute path must never ride into
+        // a portable template: ExactPath with an extension generalizes to that
+        // extension, and Directory / an absolute Glob collapse to "*".
+        let dir = tempfile::tempdir().unwrap();
+        let (mut file, _, _) = full_project(dir.path());
+        let secret_dir = r"C:\Users\alice\secret";
+        let secret_file = r"C:\Users\alice\secret\orders.csv";
+        let mut exact = a_profile();
+        exact.id = "exact".into();
+        exact.matcher = ProfileMatch::ExactPath {
+            path: secret_file.into(),
+        };
+        let mut directory = a_profile();
+        directory.id = "dir".into();
+        directory.matcher = ProfileMatch::Directory {
+            directory: secret_dir.into(),
+        };
+        let mut abs_glob = a_profile();
+        abs_glob.id = "glob".into();
+        abs_glob.matcher = ProfileMatch::Glob {
+            pattern: r"C:\Users\alice\secret\*.csv".into(),
+        };
+        file.sections.profiles = vec![exact, directory, abs_glob];
+
+        let project = OpenProject {
+            path: Some(dir.path().join("p.ceesveeproj")),
+            file,
+            revision: 0,
+            saved_revision: 0,
+        };
+        let template_path = dir.path().join("workflow.ceesveeproj");
+        save_template(&project, &template_path).unwrap();
+
+        let raw = std::fs::read_to_string(&template_path).unwrap();
+        assert!(
+            !raw.contains("alice"),
+            "no fragment of the authoring path survives: {raw}"
+        );
+        assert!(!raw.contains("secret"), "no directory name survives: {raw}");
+
+        // The ExactPath's extension is retained as a portable matcher; the
+        // others become a wildcard glob.
+        let fresh = new_project(Some(&template_path)).unwrap();
+        let by_id = |id: &str| {
+            fresh
+                .file
+                .sections
+                .profiles
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .matcher
+                .clone()
+        };
+        assert_eq!(
+            by_id("exact"),
+            ProfileMatch::Extension {
+                extension: "csv".into()
+            }
+        );
+        assert_eq!(
+            by_id("dir"),
+            ProfileMatch::Glob {
+                pattern: "*".into()
+            }
+        );
+        assert_eq!(
+            by_id("glob"),
+            ProfileMatch::Glob {
+                pattern: "*".into()
+            }
+        );
     }
 
     #[test]

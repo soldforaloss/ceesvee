@@ -28,6 +28,7 @@ import {
   buildResolutions,
   buildSources,
   buildTabsSection,
+  buildViewsSection,
   deriveProjectDirty,
   gatingWarnings,
   orderTabsForPlan,
@@ -37,6 +38,7 @@ import {
   type PanelLayout,
   type ProjectSnapshot,
   type SourceChoice,
+  type SourceViewsSection,
 } from "../lib/project";
 import type {
   AppSettings,
@@ -1680,10 +1682,19 @@ export const useStore = create<Store>((set, get) => {
     changes: s.changesOpen,
   });
 
-  /** The live project-relevant UI snapshot (open docs, active, panels). */
+  /** Each open tab's active named-view id (live active tab + saved per-tab). */
+  const activeViewByTab = (s: Store): Record<number, string | null> => {
+    const out: Record<number, string | null> = {};
+    for (const t of s.tabs) {
+      out[t.id] = t.id === s.activeId ? s.activeViewId : (s.uiStates[t.id]?.activeViewId ?? null);
+    }
+    return out;
+  };
+
+  /** The live project-relevant UI snapshot (open docs, active, panels, views). */
   const currentProjectSnapshot = (): ProjectSnapshot => {
     const s = get();
-    return projectSnapshot(s.tabs, s.activeId, currentPanels(s));
+    return projectSnapshot(s.tabs, s.activeId, currentPanels(s), activeViewByTab(s));
   };
 
   /**
@@ -1700,9 +1711,12 @@ export const useStore = create<Store>((set, get) => {
   };
 
   /**
-   * Push the live sources/tabs/layout into the backend ProjectStore (THE
+   * Push the live sources/tabs/layout/views into the backend ProjectStore (THE
    * persistence boundary). Reuses existing source ids by path so ids stay
    * stable across saves. Captures configuration only — never cell data.
+   * Schemas, recipes, joins, comparisons and row keys are NOT captured from the
+   * live session this cycle; they round-trip when a template or existing
+   * project file carries them (see CHANGELOG for the deferred scope).
    */
   const captureProjectSections = async () => {
     const s = get();
@@ -1713,21 +1727,30 @@ export const useStore = create<Store>((set, get) => {
         fingerprints[t.id] = await api.getFileFingerprint(t.id).catch(() => null);
       }),
     );
-    const existing = await api
-      .projectGet()
-      .then((state) => state?.sections.sources ?? [])
-      .catch(() => []);
-    const sources = buildSources(s.tabs, existing, fingerprints);
+    const state = await api.projectGet().catch(() => null);
+    const existingSources = state?.sections.sources ?? [];
+    const existingViews = (state?.sections.views as SourceViewsSection[] | undefined) ?? [];
+    const sources = buildSources(s.tabs, existingSources, fingerprints);
+    const views = buildViewsSection(
+      sources,
+      s.tabs,
+      existingViews,
+      (tab) => viewProfileFor(tab)?.namedViews ?? [],
+      (tab) =>
+        tab.id === s.activeId ? s.activeViewId : (s.uiStates[tab.id]?.activeViewId ?? null),
+    );
     await api.projectSetSection("sources", sources);
     await api.projectSetSection("tabs", buildTabsSection(sources, s.tabs, s.activeId));
     await api.projectSetSection("layout", buildLayoutSection(currentPanels(s)));
+    await api.projectSetSection("views", views);
   };
 
   /**
    * Drive an open plan: open each referenced document through the ordinary
-   * open pipeline, restore tab order/active tab/panel layout, and reapply the
-   * active document's saved view only when the gating allows. NEVER runs
-   * recipes, queries, joins, comparisons or exports.
+   * open pipeline, restore tab order/panel layout, reapply EVERY opened
+   * source's saved view (not just the active tab's) when the gating allows,
+   * then end focused on the saved active tab. NEVER runs recipes, queries,
+   * joins, comparisons or exports.
    */
   const applyProjectPlan = async (plan: ProjectOpenPlan) => {
     for (const entry of plan.entries) {
@@ -1740,12 +1763,6 @@ export const useStore = create<Store>((set, get) => {
       const tabs = order.map((id) => byId.get(id)).filter((t): t is DocumentMeta => !!t);
       return { tabs };
     });
-    // Restore the active tab.
-    const activeEntry = plan.entries.find((e) => e.sourceId === plan.activeTab);
-    if (activeEntry) {
-      const tab = get().tabs.find((t) => t.path && pathKey(t.path) === pathKey(activeEntry.path));
-      if (tab) set((s) => switchPatch(s, tab.id));
-    }
     // Restore the saved panel layout (front-end config only; runs nothing).
     const panels = panelsFromLayout(
       await api
@@ -1758,14 +1775,35 @@ export const useStore = create<Store>((set, get) => {
       changesOpen: panels.changes,
       explorer: { ...s.explorer, open: panels.explorer },
     }));
-    // Reapply the active document's saved view when it stayed compatible.
-    if (activeEntry?.reapplyViews && activeEntry.activeViewId) {
-      const view = activeEntry.views.find((v) => v.id === activeEntry.activeViewId);
-      if (view)
-        await get()
-          .applyNamedView(view)
-          .catch(() => undefined);
+
+    // Reapply each opened source's saved view against ITS OWN document. A
+    // source still pending a large-file decision or archive extraction has no
+    // tab yet — skip it rather than applying its view to whatever document is
+    // active. applyNamedView targets the active document, so switch to each
+    // source's tab first; the saved active tab is done LAST so the session ends
+    // focused on it.
+    const findTab = (path: string) =>
+      get().tabs.find((t) => t.path && pathKey(t.path) === pathKey(path));
+    const reapplyOrder = [
+      ...plan.entries.filter((e) => e.sourceId !== plan.activeTab),
+      ...plan.entries.filter((e) => e.sourceId === plan.activeTab),
+    ];
+    for (const entry of reapplyOrder) {
+      if (!entry.reapplyViews || !entry.activeViewId) continue;
+      const tab = findTab(entry.path);
+      if (!tab) continue;
+      const view = entry.views.find((v) => v.id === entry.activeViewId);
+      if (!view) continue;
+      set((s) => switchPatch(s, tab.id));
+      await get()
+        .applyNamedView(view)
+        .catch(() => undefined);
     }
+    // End focused on the saved active tab when it actually opened.
+    const activeEntry = plan.entries.find((e) => e.sourceId === plan.activeTab);
+    const activeTab = activeEntry ? findTab(activeEntry.path) : undefined;
+    if (activeTab) set((s) => switchPatch(s, activeTab.id));
+
     set({
       project: plan.meta,
       projectBaseline: currentProjectSnapshot(),
@@ -4762,20 +4800,30 @@ export function useActiveMeta(): DocumentMeta | null {
 
 /**
  * Whether the open project has unsaved changes (F37). Derived reactively from
- * the open documents, active tab and panel layout versus the snapshot captured
- * at the last save/open, so the dirty dot updates without event bookkeeping.
+ * the open documents, active tab, panel layout and each document's active named
+ * view versus the snapshot captured at the last save/open, so the dirty dot
+ * updates without event bookkeeping.
  */
 export function useProjectDirty(): boolean {
-  return useStore((s) =>
-    s.project == null
-      ? false
-      : deriveProjectDirty(
-          s.projectBaseline,
-          projectSnapshot(s.tabs, s.activeId, {
-            diagnostics: s.diagnosticsOpen,
-            explorer: s.explorer.open,
-            changes: s.changesOpen,
-          }),
-        ),
-  );
+  return useStore((s) => {
+    if (s.project == null) return false;
+    const activeViews: Record<number, string | null> = {};
+    for (const t of s.tabs) {
+      activeViews[t.id] =
+        t.id === s.activeId ? s.activeViewId : (s.uiStates[t.id]?.activeViewId ?? null);
+    }
+    return deriveProjectDirty(
+      s.projectBaseline,
+      projectSnapshot(
+        s.tabs,
+        s.activeId,
+        {
+          diagnostics: s.diagnosticsOpen,
+          explorer: s.explorer.open,
+          changes: s.changesOpen,
+        },
+        activeViews,
+      ),
+    );
+  });
 }

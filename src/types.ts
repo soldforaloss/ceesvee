@@ -1720,7 +1720,12 @@ export type SourceResolution =
 /** One resolution, addressed by source id. */
 export type ResolutionEntry = { sourceId: string } & SourceResolution;
 
-/** One document the front end should open, with config to reapply after. */
+/**
+ * One document the front end should open, with the named views to reapply
+ * after it opens. Schemas and row keys are NOT part of the open plan: they stay
+ * in the persisted project sections and are consumed by their owning features
+ * on demand, never reapplied as a side effect of opening a project.
+ */
 export interface PlanEntry {
   sourceId: string;
   path: string;
@@ -1731,8 +1736,6 @@ export interface PlanEntry {
   viewWarnings: string[];
   views: NamedView[];
   activeViewId: string | null;
-  schema: SchemaExport | null;
-  rowKey: unknown | null;
 }
 
 /** The resolved open plan. Nothing here executes on its own. */

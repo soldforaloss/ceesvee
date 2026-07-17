@@ -6,6 +6,7 @@
 import type {
   DocumentMeta,
   FileFingerprint,
+  NamedView,
   PlanEntry,
   ProjectLayoutSection,
   ProjectSource,
@@ -35,6 +36,12 @@ export interface ProjectSnapshot {
   /** Active document path, or null. */
   active: string | null;
   layout: PanelLayout;
+  /**
+   * Each open document's active named-view id, keyed by normalized path. Part
+   * of the snapshot so applying/switching a view marks the project dirty (the
+   * `views` section is captured on save).
+   */
+  activeViews: Record<string, string | null>;
 }
 
 /**
@@ -49,19 +56,38 @@ export function pathKey(path: string): string {
     .toLowerCase();
 }
 
-/** Capture the current project-relevant UI state (pure). */
+/**
+ * Capture the current project-relevant UI state (pure). `activeViewByTab` maps
+ * a tab id to the named-view id active for that document (including the active
+ * tab); omit it (or leave entries unset) when no view is active.
+ */
 export function projectSnapshot(
   tabs: Pick<DocumentMeta, "id" | "path">[],
   activeId: number | null,
   panels: PanelLayout,
+  activeViewByTab: Record<number, string | null> = {},
 ): ProjectSnapshot {
   const order = tabs.map((t) => t.path).filter((p): p is string => p != null);
   const active = tabs.find((t) => t.id === activeId)?.path ?? null;
-  return { order, active, layout: { ...panels } };
+  const activeViews: Record<string, string | null> = {};
+  for (const t of tabs) {
+    if (t.path) activeViews[pathKey(t.path)] = activeViewByTab[t.id] ?? null;
+  }
+  return { order, active, layout: { ...panels }, activeViews };
 }
 
 export function panelLayoutsEqual(a: PanelLayout, b: PanelLayout): boolean {
   return a.diagnostics === b.diagnostics && a.explorer === b.explorer && a.changes === b.changes;
+}
+
+/** Whether two path→activeViewId maps agree (keys are already normalized). */
+function activeViewsEqual(
+  a: Record<string, string | null>,
+  b: Record<string, string | null>,
+): boolean {
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  return keys.every((k) => a[k] === b[k]);
 }
 
 export function projectSnapshotsEqual(a: ProjectSnapshot, b: ProjectSnapshot): boolean {
@@ -72,7 +98,8 @@ export function projectSnapshotsEqual(a: ProjectSnapshot, b: ProjectSnapshot): b
     sameActive &&
     a.order.length === b.order.length &&
     a.order.every((p, i) => pathKey(p) === pathKey(b.order[i])) &&
-    panelLayoutsEqual(a.layout, b.layout)
+    panelLayoutsEqual(a.layout, b.layout) &&
+    activeViewsEqual(a.activeViews, b.activeViews)
   );
 }
 
@@ -358,6 +385,55 @@ export function panelsFromLayout(layout: ProjectLayoutSection | null | undefined
     explorer: !!p?.explorer,
     changes: !!p?.changes,
   };
+}
+
+/** One source's saved named views, mirroring the backend `views` section. */
+export interface SourceViewsSection {
+  sourceId: string;
+  views: NamedView[];
+  activeViewId: string | null;
+}
+
+/**
+ * Build the `views` section: for each open, file-backed source, the named
+ * views of its owning profile plus which view is active for that document.
+ * Sources the project references but that are NOT open now keep their
+ * previously-saved views (merged from `existing`), so leaving a document out
+ * on open never drops its saved views. Never captures cell data — a named view
+ * is filter/sort/column configuration referencing columns by stable id.
+ */
+export function buildViewsSection(
+  sources: ProjectSource[],
+  tabs: DocumentMeta[],
+  existing: SourceViewsSection[],
+  viewsForTab: (tab: DocumentMeta) => NamedView[],
+  activeViewForTab: (tab: DocumentMeta) => string | null,
+): SourceViewsSection[] {
+  const tabByPath = new Map<string, DocumentMeta>();
+  for (const t of tabs) if (t.path) tabByPath.set(pathKey(t.path), t);
+  const out: SourceViewsSection[] = [];
+  const seen = new Set<string>();
+
+  // Capture live view state for every referenced source that is open now.
+  for (const src of sources) {
+    const tab = tabByPath.get(pathKey(src.path));
+    if (!tab) continue;
+    const views = viewsForTab(tab);
+    const activeViewId = activeViewForTab(tab);
+    if (views.length > 0 || activeViewId != null) {
+      out.push({ sourceId: src.id, views, activeViewId });
+    }
+    seen.add(src.id);
+  }
+  // Preserve saved views for still-referenced sources that aren't open.
+  const referenced = new Set(sources.map((s) => s.id));
+  for (const prior of existing) {
+    if (referenced.has(prior.sourceId) && !seen.has(prior.sourceId)) {
+      out.push(prior);
+      seen.add(prior.sourceId);
+    }
+  }
+  return out;
 }
 
 /**
