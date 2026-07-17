@@ -733,12 +733,25 @@ fn apply_order(indices: &mut [u64], order: SampleOrder, seed: u64, ordinal: u64)
     }
 }
 
+/// Hard cap on the number of distinct strata / groups a stratify-or-group-by key
+/// may produce. Mirrors the bounded-grouping guards elsewhere in the core
+/// ([`crate::groupby::MAX_GROUPS`], [`crate::cluster::MAX_DISTINCT_VALUES`]): a
+/// near-unique key column (an id, an email) would otherwise grow an unbounded
+/// `HashMap` and — for stratified/balanced sampling, whose strata table is
+/// serialized to the UI on every preview — an unbounded IPC payload. Set to
+/// cluster's 200 000, the tighter of the two precedents, because that IPC path
+/// is the binding constraint here.
+const MAX_STRATA: usize = 200_000;
+
 /// Strata/groups: the keys in first-seen order, plus each key's member rows
 /// (absolute indices, in source order).
 type KeyGroups = (Vec<CompositeKey>, HashMap<CompositeKey, Vec<u64>>);
 
 /// Group scope positions by a composite stratum/group key, preserving
-/// first-seen key order. Returns `(ordered_keys, key -> abs indices)`.
+/// first-seen key order. Returns `(ordered_keys, key -> abs indices)`. The
+/// distinct-key count is bounded by [`MAX_STRATA`]; a higher-cardinality key
+/// fails fast rather than growing memory (and the IPC strata payload) without
+/// bound.
 fn group_by_key(
     source: &dyn TabularSource,
     universe: &Universe,
@@ -750,11 +763,19 @@ fn group_by_key(
     let mut groups: HashMap<CompositeKey, Vec<u64>> = HashMap::new();
     scan_universe(source, universe, ctx, |_pos, abs, row| {
         let key = composite_key(row, positions, &norm);
-        let entry = groups.entry(key.clone()).or_insert_with(|| {
-            order.push(key.clone());
-            Vec::new()
-        });
-        entry.push(abs);
+        match groups.get_mut(&key) {
+            Some(entry) => entry.push(abs),
+            None => {
+                if groups.len() >= MAX_STRATA {
+                    return Err(AppError::invalid(format!(
+                        "more than {MAX_STRATA} distinct strata/groups — stratify or \
+                         group by fewer or coarser columns"
+                    )));
+                }
+                order.push(key.clone());
+                groups.insert(key, vec![abs]);
+            }
+        }
         Ok(true)
     })?;
     Ok((order, groups))
@@ -1576,6 +1597,38 @@ mod tests {
         }
     }
 
+    /// A synthetic source whose single column `k` takes a DISTINCT value on
+    /// every row, so grouping by it yields one stratum per row — used to prove
+    /// the cardinality cap fires without materialising the source.
+    struct DistinctKeySource {
+        n: u64,
+    }
+
+    impl TabularSource for DistinctKeySource {
+        fn columns(&self) -> Vec<TabularColumn> {
+            vec![col("k")]
+        }
+        fn row_count(&self) -> crate::tabular::RowCountHint {
+            crate::tabular::RowCountHint::Exact(self.n)
+        }
+        fn read_rows(
+            &self,
+            offset: u64,
+            limit: usize,
+            ctx: Option<&JobCtx>,
+        ) -> AppResult<Vec<TabularRow>> {
+            if let Some(ctx) = ctx {
+                ctx.check()?;
+            }
+            let start = offset.min(self.n);
+            let end = start.saturating_add(limit as u64).min(self.n);
+            Ok((start..end).map(|i| vec![Some(i.to_string())]).collect())
+        }
+        fn fingerprint(&self) -> ContentFingerprint {
+            ContentFingerprint::Unknown
+        }
+    }
+
     fn mem(rows: usize, cols: usize) -> MemSource {
         let columns: Vec<TabularColumn> = (0..cols).map(|c| col(&format!("c{c}"))).collect();
         let data: Vec<TabularRow> = (0..rows)
@@ -1767,6 +1820,77 @@ mod tests {
         assert!(out.iter().all(|&i| i < 1_000_000));
         let unique: std::collections::HashSet<u64> = out.iter().copied().collect();
         assert_eq!(unique.len(), cap, "no row selected twice");
+    }
+
+    // ----- strata cardinality cap ------------------------------------------
+
+    #[test]
+    fn high_cardinality_stratify_key_is_capped() {
+        // One distinct stratum per row, just past the cap: grouping must fail
+        // fast (bounded memory + bounded IPC strata payload) instead of building
+        // an unbounded map, like groupby's MAX_GROUPS / cluster's guard.
+        let source = DistinctKeySource {
+            n: MAX_STRATA as u64 + 1,
+        };
+        let u = Universe::All(source.n);
+        let method = SamplingMethod::Balanced {
+            columns: vec!["k".into()],
+            per_stratum: 1,
+        };
+        let err = plan_sample(&source, &u, &method, SampleOrder::SourceOrder, 1, None).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected an invalid-argument error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("strata") || err.to_string().contains("group"),
+            "message should name strata/groups: {err}"
+        );
+
+        // Comfortably under the cap still groups fine (one row per stratum).
+        let ok_source = DistinctKeySource { n: 10 };
+        let ok_u = Universe::All(ok_source.n);
+        let plan = plan_sample(
+            &ok_source,
+            &ok_u,
+            &method,
+            SampleOrder::SourceOrder,
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.outputs[0].indices.len(), 10);
+        assert_eq!(plan.strata.as_ref().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn high_cardinality_group_partition_key_is_capped() {
+        // The same guard protects group-preserving partitioning.
+        let source = DistinctKeySource {
+            n: MAX_STRATA as u64 + 1,
+        };
+        let u = Universe::All(source.n);
+        let spec = PartitionSpec {
+            parts: vec![
+                PartitionOutput {
+                    name: "a".into(),
+                    weight: 0.5,
+                },
+                PartitionOutput {
+                    name: "b".into(),
+                    weight: 0.5,
+                },
+            ],
+            stratify_by: vec![],
+            group_by: vec!["k".into()],
+            allow_overlap: false,
+        };
+        let err =
+            plan_partition(&source, &u, &spec, SampleOrder::SourceOrder, 1, None).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected an invalid-argument error, got {err:?}"
+        );
     }
 
     // ----- hash-based -------------------------------------------------------

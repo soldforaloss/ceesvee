@@ -9,6 +9,7 @@ import {
   methodProblem,
   normalizeWeights,
   parseSeed,
+  partitionConstraintProblem,
   partitionProblem,
   projectPartitionCounts,
   projectSampleCount,
@@ -191,12 +192,13 @@ export function SamplingDialog({ onClose }: { onClose: () => void }) {
         : methodProblem(buildMethod())
       : seed == null
         ? "Enter a whole-number seed"
-        : partitionProblem({
+        : (partitionConstraintProblem(partMode, partColumns) ??
+          partitionProblem({
             parts,
             stratifyBy: partMode === "stratified" ? partColumns : [],
             groupBy: partMode === "group" ? partColumns : [],
             allowOverlap: false,
-          });
+          }));
 
   const destProblem =
     dest === "export"

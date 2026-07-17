@@ -194,6 +194,32 @@ export function partitionProblem(spec: PartitionSpec): string | null {
   return null;
 }
 
+/** The partition constraint the dialog offers (mirrors the UI's part mode). */
+export type PartitionConstraint = "plain" | "stratified" | "group";
+
+/**
+ * A stratified or group-preserving constraint needs at least one column. Once
+ * the spec crosses to the backend an empty column list is indistinguishable
+ * from "no constraint requested" — both `stratifyBy` and `groupBy` arrive empty
+ * and the split silently degrades to a plain per-row split (splitting rows that
+ * share a group key across partitions, the exact leakage the constraint exists
+ * to prevent). So the UI must reject it here, mirroring how `methodProblem`
+ * requires columns for stratified/balanced sampling. Returns a problem string,
+ * or `null` when the constraint is satisfiable.
+ */
+export function partitionConstraintProblem(
+  constraint: PartitionConstraint,
+  columns: string[],
+): string | null {
+  if (constraint === "plain") return null;
+  if (columns.length === 0) {
+    return constraint === "stratified"
+      ? "Pick at least one column to stratify by"
+      : "Pick at least one column to keep groups together";
+  }
+  return null;
+}
+
 /** A named partition preset (train/validation/test and friends). */
 export interface PartitionPreset {
   id: string;

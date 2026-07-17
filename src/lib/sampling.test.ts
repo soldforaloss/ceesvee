@@ -8,6 +8,7 @@ import {
   methodProblem,
   normalizeWeights,
   parseSeed,
+  partitionConstraintProblem,
   partitionProblem,
   projectPartitionCounts,
   projectSampleCount,
@@ -258,6 +259,23 @@ describe("partition spec validation", () => {
 
   it("rejects the unsupported overlap flag", () => {
     expect(partitionProblem(spec({ allowOverlap: true }))).not.toBeNull();
+  });
+});
+
+describe("partition constraint validation", () => {
+  it("accepts the plain constraint with no columns", () => {
+    expect(partitionConstraintProblem("plain", [])).toBeNull();
+    expect(partitionConstraintProblem("plain", ["c0"])).toBeNull();
+  });
+
+  it("requires at least one column for a stratified or group constraint", () => {
+    // The bug this guards: a stratified/group constraint with no columns picked
+    // sends empty stratifyBy AND groupBy, which the backend cannot distinguish
+    // from a plain split — so it must be rejected before Preview/Run.
+    expect(partitionConstraintProblem("stratified", [])).not.toBeNull();
+    expect(partitionConstraintProblem("group", [])).not.toBeNull();
+    expect(partitionConstraintProblem("stratified", ["c0"])).toBeNull();
+    expect(partitionConstraintProblem("group", ["c1", "c2"])).toBeNull();
   });
 });
 
