@@ -233,6 +233,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the backend), advisory accepts it and records a bounded, retrievable
   issue — while schema edits themselves never touch the undo stack.
 
+### Fixed
+
+- **Project open now restores Parquet / Arrow sources non-interactively**:
+  reopening a project that referenced a columnar source no longer routes it
+  through the interactive inspect dialog (which returned without creating a
+  tab, so the source was left missing until the user manually confirmed the
+  dialog while the project baseline had already advanced). A restore reopens a
+  columnar source directly as an indexed read-only document with default
+  policies, matching the non-interactive restore of every other source type.
+
 ### Internal
 
 - **Shared tabular contracts**: new backend `TabularSource` /
