@@ -1575,6 +1575,7 @@ mod tests {
             column_widths: std::collections::HashMap::new(),
             wrap_text: false,
             highlight_rules: Vec::new(),
+            facets: None,
         }
     }
 

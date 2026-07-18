@@ -74,6 +74,8 @@ export function Toolbar() {
   const setDiagnosticsOpen = useStore((s) => s.setDiagnosticsOpen);
   const explorerOpen = useStore((s) => s.explorer.open);
   const setExplorerOpen = useStore((s) => s.setExplorerOpen);
+  const facetsOpen = useStore((s) => s.facets.open);
+  const setFacetsOpen = useStore((s) => s.setFacetsOpen);
   const annotationsPanelOpen = useStore((s) => s.annotationsPanelOpen);
   const setAnnotationsPanelOpen = useStore((s) => s.setAnnotationsPanelOpen);
 
@@ -176,6 +178,14 @@ export function Toolbar() {
       icon: <BarChart />,
       onClick: () => setExplorerOpen(!explorerOpen),
       active: explorerOpen,
+      disabled: !hasDoc,
+    },
+    {
+      label: "Facets",
+      title: "Multi-facet exploration (cross-filtered)",
+      icon: <Layers />,
+      onClick: () => setFacetsOpen(!facetsOpen),
+      active: facetsOpen,
       disabled: !hasDoc,
     },
     {

@@ -106,6 +106,12 @@ pub struct NamedView {
     /// decoration; carries no cell data).
     #[serde(default)]
     pub highlight_rules: Vec<crate::highlight::HighlightRule>,
+    /// F39: multi-facet exploration configuration saved with this view — the
+    /// active facet panels, their selections and (non-computational) panel
+    /// layout. Faceting is non-destructive, so this carries no cell data;
+    /// restoring a view re-applies the facets exactly. `None` = no facets saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facets: Option<crate::facets::FacetConfig>,
 }
 
 /// A reusable description of a recurring file format.
@@ -567,6 +573,7 @@ mod tests {
             column_widths: std::collections::HashMap::from([("c1".to_string(), 240.0)]),
             wrap_text: true,
             highlight_rules: Vec::new(),
+            facets: None,
         }];
         p.last_view_id = Some("v1".into());
         settings.profiles.push(p);
@@ -636,6 +643,7 @@ mod tests {
             column_widths: std::collections::HashMap::new(),
             wrap_text: false,
             highlight_rules: vec![rule],
+            facets: None,
         }];
         settings.profiles.push(p);
         save_settings(dir.path(), &settings).unwrap();
@@ -647,6 +655,83 @@ mod tests {
         assert_eq!(
             loaded.profiles[0].named_views[0].highlight_rules,
             settings.profiles[0].named_views[0].highlight_rules
+        );
+    }
+
+    #[test]
+    fn view_facets_round_trip_and_default_none() {
+        use crate::facets::{
+            FacetConfig, FacetKind, FacetMode, FacetRange, FacetSelection, FacetSpec,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = AppSettings::default();
+        let mut p = profile();
+
+        let mut view = NamedView {
+            id: "v1".into(),
+            name: "facet slice".into(),
+            filter: None,
+            filter_column_ids: Vec::new(),
+            sort_keys: Vec::new(),
+            hidden_column_ids: Vec::new(),
+            pinned_column_ids: Vec::new(),
+            column_order: Vec::new(),
+            column_widths: std::collections::HashMap::new(),
+            wrap_text: false,
+            highlight_rules: Vec::new(),
+            facets: None,
+        };
+        // Defaults to None (a view without facets saved).
+        assert!(view.facets.is_none());
+
+        view.facets = Some(FacetConfig {
+            facets: vec![
+                FacetSpec {
+                    id: "city".into(),
+                    kind: FacetKind::Text,
+                    column_id: Some("c0".into()),
+                    semantic: None,
+                    selection: FacetSelection {
+                        mode: FacetMode::Include,
+                        values: vec!["NYC".into(), "LA".into()],
+                        range: FacetRange::default(),
+                    },
+                    top_n: Some(25),
+                    search: None,
+                    bins: None,
+                    pinned: true,
+                    collapsed: false,
+                    width: Some(220.0),
+                },
+                FacetSpec {
+                    id: "age".into(),
+                    kind: FacetKind::Number,
+                    column_id: Some("c1".into()),
+                    semantic: None,
+                    selection: FacetSelection {
+                        mode: FacetMode::Exclude,
+                        values: Vec::new(),
+                        range: FacetRange {
+                            min: Some("18".into()),
+                            max: Some("65".into()),
+                        },
+                    },
+                    top_n: None,
+                    search: None,
+                    bins: Some(12),
+                    pinned: false,
+                    collapsed: true,
+                    width: None,
+                },
+            ],
+        });
+        p.named_views = vec![view];
+        settings.profiles.push(p);
+        save_settings(dir.path(), &settings).unwrap();
+        let loaded = load_settings(dir.path());
+        assert_eq!(
+            loaded.profiles[0].named_views[0].facets,
+            settings.profiles[0].named_views[0].facets
         );
     }
 

@@ -4,6 +4,7 @@
 
 import type {
   DocumentMeta,
+  FacetConfig,
   FilterGroup,
   FilterNode,
   HighlightRule,
@@ -87,11 +88,18 @@ export interface ViewSnapshotInput {
   wrapText: boolean;
   /** F42: the active document's conditional-highlighting rules, if any. */
   highlightRules?: HighlightRule[];
+  /** F39: the active document's multi-facet configuration, if any. */
+  facets?: FacetConfig | null;
 }
 
 /** Build a persistable NamedView from the current state. */
 export function snapshotView(input: ViewSnapshotInput): NamedView {
   const ids = input.meta.columnIds;
+  // Only persist a facet config when it actually carries panels.
+  const facets =
+    input.facets && input.facets.facets.length > 0
+      ? { facets: input.facets.facets.map((f) => ({ ...f })) }
+      : null;
   return {
     id: input.id ?? newViewId(),
     name: input.name,
@@ -104,6 +112,7 @@ export function snapshotView(input: ViewSnapshotInput): NamedView {
     columnWidths: widthsToIds(input.columnWidths, ids),
     wrapText: input.wrapText,
     highlightRules: (input.highlightRules ?? []).map((r) => ({ ...r })),
+    facets,
   };
 }
 
@@ -122,6 +131,9 @@ export function describeView(view: NamedView): string {
     parts.push(
       `${view.highlightRules.length} highlight${view.highlightRules.length === 1 ? "" : "s"}`,
     );
+  }
+  if (view.facets && view.facets.facets.length > 0) {
+    parts.push(`${view.facets.facets.length} facet${view.facets.facets.length === 1 ? "" : "s"}`);
   }
   return parts.length > 0 ? parts.join(" · ") : "layout only";
 }

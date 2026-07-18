@@ -45,6 +45,9 @@ use crate::excel::{
     self, ExcelImportOptions, ExcelImportPreview, ExcelInspectCache, ExcelPreviewCache,
     SheetSource, WorkbookInfo,
 };
+use crate::facets::{
+    FacetConfig, FacetConversion, FacetInputs, FacetKind, FacetResultSet, StatusInput,
+};
 use crate::follow::{self, FollowRegistry};
 use crate::groupby::{self, GroupByPreview, GroupBySpec};
 use crate::highlight::{
@@ -3077,6 +3080,154 @@ pub async fn start_highlight_report(
         .await;
     });
     Ok(job_id)
+}
+
+// ----- multi-facet exploration (F39) -----------------------------------------
+
+/// Snapshot the status-facet row memberships the config asks for, from the live
+/// analysis caches (cloned so the engine never holds a cache lock while it
+/// scans). Only the status facets actually present in `config` are resolved;
+/// any that cannot be sourced are left `None`, so the engine renders them
+/// `unresolved` (the UI explains what scan to run). Value facets read the
+/// document directly and need no inputs.
+///
+/// * annotation — always resolvable: the F40 marks are re-resolved against the
+///   current document (a matched record IS the current absolute row).
+/// * diagnostics — resolvable once a diagnostics report (F02) is cached.
+/// * validation — always resolvable: the document's advisory schema issues
+///   (F31) are folded with any cached cross-column rules (F27).
+/// * duplicate — resolvable when the caller passes the dedup spec/scope (F05);
+///   the dedup cache stores only a report, so the rows are recomputed exactly.
+#[allow(clippy::too_many_arguments)]
+fn facet_inputs(
+    doc_id: u64,
+    doc: &Document,
+    config: &FacetConfig,
+    dedup: Option<&DedupSpec>,
+    dedup_scope: Option<&ExportScope>,
+    annotations: &State<'_, AnnotationRegistry>,
+    diagnostics_cache: &State<'_, DiagnosticsCache>,
+    crossval_cache: &State<'_, CrossValCache>,
+) -> AppResult<FacetInputs> {
+    let has = |kind: FacetKind| config.facets.iter().any(|f| f.kind == kind);
+    let mut inputs = FacetInputs::default();
+
+    if has(FacetKind::Annotation) {
+        let source = DocumentSource::new(doc);
+        let idx = annotations.try_with(doc_id, |ann| ann.mark_index(&source, None))?;
+        inputs.annotation = Some(StatusInput::from_marks(&idx));
+    }
+    if has(FacetKind::Diagnostics) {
+        if let Some(report) = diagnostics_cache.get(doc_id) {
+            inputs.diagnostics = Some(StatusInput::from_diagnostics(doc, &report)?);
+        }
+    }
+    if has(FacetKind::Validation) {
+        let rules = crossval_cache
+            .get(doc_id)
+            .map(|(rules, _)| rules)
+            .unwrap_or_default();
+        inputs.validation = Some(StatusInput::from_validation(
+            doc,
+            &rules,
+            doc.schema_issues(),
+        )?);
+    }
+    if has(FacetKind::Duplicate) {
+        if let (Some(spec), Some(scope)) = (dedup, dedup_scope) {
+            inputs.duplicate = Some(StatusInput::from_duplicates(doc, spec, scope)?);
+        }
+    }
+    Ok(inputs)
+}
+
+/// Compute every facet's cross-filtered bucket counts against the current
+/// document (F39). Read-only: never mutates or dirties the document, so it is
+/// safe to recompute on every selection change. Guarded by `expected_revision`.
+/// Counts on a very large indexed document may be estimated from a leading
+/// sample (`FacetResultSet::sampled`); the applied filter is always exact.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn compute_facets(
+    doc_id: u64,
+    config: FacetConfig,
+    expected_revision: u64,
+    dedup: Option<DedupSpec>,
+    dedup_scope: Option<ExportScope>,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+    diagnostics_cache: State<'_, DiagnosticsCache>,
+    crossval_cache: State<'_, CrossValCache>,
+) -> AppResult<FacetResultSet> {
+    read_doc(&state, doc_id, |doc| {
+        doc.check_revision(expected_revision)?;
+        let inputs = facet_inputs(
+            doc_id,
+            doc,
+            &config,
+            dedup.as_ref(),
+            dedup_scope.as_ref(),
+            &annotations,
+            &diagnostics_cache,
+            &crossval_cache,
+        )?;
+        crate::facets::compute(doc, &config, &inputs, None)
+    })
+}
+
+/// Drive the grid row view from the current facet selection (F39): an exact
+/// full-document scan of the matching absolute rows, handed to the existing
+/// row-filter pipeline so view sort, scoped previews and visible-row export all
+/// compose. When no facet is active the facet-driven filter is cleared. A view
+/// operation — never enters the undo stack and never dirties the document.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn apply_facets(
+    doc_id: u64,
+    config: FacetConfig,
+    expected_revision: u64,
+    dedup: Option<DedupSpec>,
+    dedup_scope: Option<ExportScope>,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+    diagnostics_cache: State<'_, DiagnosticsCache>,
+    crossval_cache: State<'_, CrossValCache>,
+) -> AppResult<DocumentMeta> {
+    let handle = doc_handle(&state, doc_id)?;
+    let mut doc = handle.write().map_err(poisoned)?;
+    doc.check_revision(expected_revision)?;
+    if !config.any_active() {
+        doc.clear_filter()?;
+        return Ok(doc.meta());
+    }
+    let inputs = facet_inputs(
+        doc_id,
+        &doc,
+        &config,
+        dedup.as_ref(),
+        dedup_scope.as_ref(),
+        &annotations,
+        &diagnostics_cache,
+        &crossval_cache,
+    )?;
+    let rows = crate::facets::matching_rows(&doc, &config, &inputs)?;
+    doc.set_filter(rows)?;
+    Ok(doc.meta())
+}
+
+/// Convert the active facets to the standard filter-builder tree (F39): a
+/// deliberately one-way, lossy conversion. Facets with no faithful column-filter
+/// equivalent (semantic, the four status facets, some nullability/boolean
+/// exclusions) are reported in `dropped` so the UI can explain what it left out.
+#[tauri::command]
+pub fn convert_facets_to_filter(
+    doc_id: u64,
+    config: FacetConfig,
+    state: Db<'_>,
+) -> AppResult<FacetConversion> {
+    read_doc(&state, doc_id, |doc| {
+        Ok(crate::facets::to_filter_group(doc, &config))
+    })
 }
 
 #[tauri::command]
