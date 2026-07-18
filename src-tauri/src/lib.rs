@@ -48,6 +48,14 @@ mod error;
 pub mod excel;
 mod export;
 mod export_scope;
+/// Multi-facet exploration (F39): the cross-filtering facet engine — the ten
+/// facet types, single-pass per-facet count recomputation against the
+/// other-facets population, the exact row-view producer that composes with the
+/// filter/sort/export pipeline, the facets→filter-builder conversion and the
+/// F12 named-view facet payload. Public like [`job`] so the command surface,
+/// the F12 view persistence and the test harness treat it as a stable internal
+/// API.
+pub mod facets;
 mod filter;
 mod find;
 mod follow;
