@@ -69,6 +69,16 @@ and faithful on large, real-world delimited files.**
   1900 leap-year quirk preserved) and leading-zero text stays text. Every
   import creates a new document — there is no in-place `.xlsx` save, so the
   original workbook is never modified.
+- **Open a SQLite database** — browse a `.db` / `.sqlite` file's tables and
+  views (columns with type / NOT NULL / defaults / primary keys, plus
+  indexes, foreign keys, row-count estimates, and bounded preview rows), then
+  open any table or view as a read-only indexed document (paged straight out
+  of the database, never copied into memory) or import it into a fully
+  editable document (guarded by a memory check). A database changed outside
+  CEESVEE is detected — rows and schema — and offers a reload, and every read
+  goes through a read-only, authorizer-guarded connection restricted to the
+  files you explicitly open. _Database support is SQLite only this cycle —
+  DuckDB is deliberately out of scope._
 - Auto-detect the **delimiter** (comma, tab, semicolon, pipe) with a manual /
   custom override — plus an **advanced import** for preambles, comment
   lines, custom quoting/escaping, multi-row headers, and footers.
@@ -140,6 +150,15 @@ and faithful on large, real-world delimited files.**
   back to text). Excel's 1,048,576-row × 16,384-column limits are checked
   before anything is written, and the workbook commits through the same atomic
   save pipeline, so a failed or cancelled export never touches an existing file.
+- **Export to a database** — write the active document into a SQLite table:
+  create a new table, append to a compatible existing one, or replace one
+  after explicit confirmation. A preview shows the resolved document-column →
+  SQL-type mapping (from the declared schema, TEXT by default, with per-column
+  name / type / primary-key overrides) and a bounded scan of the cells that
+  would fail to convert before anything is written; the write runs in one
+  transaction that rolls back completely on any failure, under an explicit
+  primary-key conflict policy (abort / skip / replace) and never altering an
+  existing table's schema.
 
 **Reliability**
 
