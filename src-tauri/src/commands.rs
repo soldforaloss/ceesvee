@@ -52,6 +52,7 @@ use crate::paste::{self, PasteOptions, PastePreview};
 use crate::pii::{self, CachedPii, PiiCache, PiiSpec, RedactionAction, RedactionPreview};
 use crate::profile::{self, ColumnProfile, ProfileCache, ProfileOptions, ProfileScope};
 use crate::recipe::{self, BatchOptions, BatchReport, RecipeCache};
+use crate::record;
 use crate::reopen::{self, CurrentInterpretation};
 use crate::repair::{self, RepairPreview, RepairSpec};
 use crate::reshape::{self, ReshapePreview, ReshapeSpec};
@@ -3459,6 +3460,68 @@ pub fn set_cells(
         }
         schema_ops::apply_validated_cells(doc, translated)?;
         Ok(doc.meta())
+    })
+}
+
+// ----- record form (F41) -------------------------------------------------
+
+/// Assemble the F41 record-form view for ONE visible row (display coordinates,
+/// so filters and the view sort are honoured): per field the raw + display
+/// text, the five-way classification, the stored value's current validity, and
+/// the joined schema / dictionary / semantic metadata. Bounded — exactly one
+/// row is read, even on an indexed document. The returned revisions let the
+/// form refetch when the model, schema or dictionary moves and guard a later
+/// draft save against a row that a changed filter would have remapped.
+#[tauri::command]
+pub fn fetch_record(
+    doc_id: u64,
+    row: usize,
+    state: Db<'_>,
+    semantic_cache: State<'_, SemanticCache>,
+) -> AppResult<record::RecordView> {
+    // The cached semantic report (if any) is read outside the document lock;
+    // the join treats its badges as advisory.
+    let semantic = semantic_cache.get(doc_id);
+    read_doc(&state, doc_id, |doc| {
+        let abs = abs_row(doc, row)?;
+        let cells = doc
+            .fetch_rows(&[abs])?
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        Ok(record::assemble_record(
+            doc,
+            row,
+            abs,
+            &cells,
+            semantic.as_ref(),
+        ))
+    })
+}
+
+/// Validate a whole record draft (the changed fields of one row) BEFORE the
+/// commit: per-field verdicts plus whether a strict column blocks the batch.
+/// Pure — records nothing; the `set_cells` apply path stays the single
+/// recorder of advisory issues, so this cannot double-count.
+#[tauri::command]
+pub fn validate_record_draft(
+    doc_id: u64,
+    edits: Vec<record::DraftField>,
+    state: Db<'_>,
+) -> AppResult<record::DraftValidation> {
+    read_doc(&state, doc_id, |doc| {
+        Ok(record::validate_draft(doc, &edits))
+    })
+}
+
+/// The recorded advisory schema issues for ONE visible row (display
+/// coordinates), oldest first — the per-row slice of `get_schema_issues` the
+/// record form surfaces for the active record.
+#[tauri::command]
+pub fn get_record_issues(doc_id: u64, row: usize, state: Db<'_>) -> AppResult<Vec<SchemaIssue>> {
+    read_doc(&state, doc_id, |doc| {
+        let abs = abs_row(doc, row)?;
+        Ok(record::issues_for_row(doc, abs))
     })
 }
 
