@@ -86,7 +86,11 @@ and faithful on large, real-world delimited files.**
   commits every changed field as one undo step; strict-invalid drafts cannot
   commit; unsaved drafts prompt on navigation (or auto-save, per preference).
   Fields can be grouped, hidden, and shown compact or comfortable; indexed
-  documents open the form read-only.
+  documents open the form read-only. The header carries a row bookmark strip
+  (star, flag, tags, and a row note) and every field shows a cell-note
+  indicator you can click to add or edit its note — the same annotations as the
+  grid and the annotations panel, so a note taken in the form appears
+  everywhere.
 - Insert / delete / reorder rows; insert / delete / rename / reorder columns.
 - Multi-cell selection and **Excel-compatible copy/paste** (TSV on the clipboard).
 - **Copy As** JSON / Markdown / SQL / CSV variants, and **Paste Special** with

@@ -1,12 +1,14 @@
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { buildRecordIndex, tagColor } from "../lib/annotations";
 import {
   addGroup,
   assignToGroup,
   changedFields,
   clampRecord,
   emptyLayout,
+  fieldCellNotes,
   fieldChanged,
   fieldValue,
   isDraftDirty,
@@ -21,7 +23,14 @@ import {
 import { SEMANTIC_LABELS } from "../lib/semantics";
 import * as api from "../lib/tauri";
 import { useActiveMeta, useStore } from "../store/useStore";
-import type { DraftValidation, LogicalType, RecordField, RecordLayout, RecordView } from "../types";
+import type {
+  DraftValidation,
+  LogicalType,
+  RecordField,
+  RecordLayout,
+  RecordView,
+  RowAnnotationView,
+} from "../types";
 import { ChevronDown, ChevronUp, Close, Layers } from "./Icons";
 import { Modal } from "./Modal";
 
@@ -36,6 +45,56 @@ const TYPE_LABELS: Record<LogicalType, string> = {
   uuid: "UUID",
   json: "JSON",
 };
+
+/** The friendliest display label for a field: the data-dictionary display name,
+ * else the technical header, else a positional fallback. */
+function fieldLabel(field: RecordField): string {
+  return field.dictionary?.displayName?.trim() || field.header || `Column ${field.col + 1}`;
+}
+
+// Inline annotation glyphs, matching the grid gutter / annotations panel
+// vocabulary (star = amber, flag = rose, note = violet).
+function StarGlyph({ on }: { on: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" aria-hidden>
+      <path
+        d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77 5.82 21l1.18-6.88-5-4.87 6.91-1.01L12 2z"
+        fill={on ? "#f59e0b" : "none"}
+        stroke="#f59e0b"
+        strokeWidth="1.5"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function FlagGlyph({ on }: { on: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" aria-hidden>
+      <path
+        d="M5 21V4h11l-1.5 4L16 12H5"
+        fill={on ? "#f43f5e" : "none"}
+        stroke="#f43f5e"
+        strokeWidth="1.5"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function NoteGlyph({ on }: { on: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" aria-hidden>
+      <path
+        d="M4 4h16v11H9l-4 4V4z"
+        fill={on ? "#8b5cf6" : "none"}
+        stroke={on ? "#8b5cf6" : "currentColor"}
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
 
 /**
  * Record form (F41): edit ONE visible record at a time — schema-aware field
@@ -58,6 +117,14 @@ export function FormView() {
   const setLayout = useStore((s) => s.setRecordLayout);
   const jumpToColumn = useStore((s) => s.jumpToRecordColumn);
   const setAutoSave = useStore((s) => s.setAutoSaveRecordOnNavigate);
+  // F40 annotations wired into the form: the row's star/flag/tag strip and the
+  // per-field cell-note indicators reuse F40's commands, dialogs and glyphs.
+  const annotationsView = useStore((s) => s.annotationsView);
+  const applyRowMarks = useStore((s) => s.applyRowMarks);
+  const openTagPicker = useStore((s) => s.openTagPicker);
+  const openRowNoteEditor = useStore((s) => s.openRowNoteEditor);
+  const openCellNoteEditor = useStore((s) => s.openCellNoteEditor);
+  const loadAnnotations = useStore((s) => s.loadAnnotations);
 
   const [view, setView] = useState<RecordView | null>(null);
   const [validation, setValidation] = useState<DraftValidation | null>(null);
@@ -77,6 +144,14 @@ export function FormView() {
   const fields = view?.fields ?? [];
   const dirty = isDraftDirty(fields, draft);
   const readOnly = view?.readOnly ?? meta?.backing === "indexedReadOnly";
+
+  // The resolved F40 annotation for the record on show (matched entries are
+  // keyed by absolute row — the same coordinate `fetch_record` reads at). Drives
+  // the header star/flag/tag strip and the per-field cell-note indicators.
+  // Annotations are pure metadata, so they stay available on a read-only form.
+  const recordIndex = useMemo(() => buildRecordIndex(annotationsView), [annotationsView]);
+  const entry = view ? recordIndex.get(view.absRow) : undefined;
+  const cellNotes = useMemo(() => fieldCellNotes(entry), [entry]);
 
   // ---- fetch the record whenever the doc, row or revision moves -------------
   useEffect(() => {
@@ -148,6 +223,14 @@ export function FormView() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, docId, readOnly, draft, view]);
+
+  // Make sure the annotation surface is loaded for the strip/indicators when the
+  // form opens (the grid normally loads it, but the form can be the first to
+  // need it). Idempotent and cheap; re-resolves against the current view.
+  useEffect(() => {
+    if (open && docId != null && annotationsView === null) void loadAnnotations();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, docId, annotationsView]);
 
   const visibleLen = view?.visibleLen ?? meta?.rowCount ?? 0;
   const blocked = saveBlocked(validation);
@@ -278,6 +361,17 @@ export function FormView() {
         </form>
       </div>
 
+      {/* Row bookmarks/tags/notes strip (F40): mark the whole record. */}
+      {!noRecords && view && (
+        <RowAnnotationStrip
+          entry={entry}
+          onStar={() => void applyRowMarks([row], { star: !(entry?.star ?? false) })}
+          onFlag={() => void applyRowMarks([row], { flag: !(entry?.flag ?? false) })}
+          onTags={() => openTagPicker([row])}
+          onNote={() => openRowNoteEditor(row, `Row ${view.absRow + 1}`, entry?.note?.text ?? "")}
+        />
+      )}
+
       {notice && (
         <p className="shrink-0 border-b border-amber-200 bg-amber-50 px-3 py-1.5 text-xs text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/40 dark:text-amber-300">
           {notice}
@@ -318,9 +412,18 @@ export function FormView() {
                       dense={dense}
                       readOnly={readOnly}
                       verdict={validation?.fields.find((f) => f.col === field.col) ?? null}
+                      hasNote={cellNotes.has(field.columnId)}
                       onEdit={(value) => setDraftField(field.col, value)}
                       onCopy={() => void writeText(fieldValue(field, draft)).catch(() => undefined)}
                       onJump={() => jumpToColumn(field.col)}
+                      onNote={() =>
+                        openCellNoteEditor(
+                          row,
+                          field.columnId,
+                          `Row ${(view?.absRow ?? row) + 1} · ${fieldLabel(field)}`,
+                          cellNotes.get(field.columnId) ?? "",
+                        )
+                      }
                     />
                   ))}
                   {section.fields.length === 0 && (
@@ -408,9 +511,11 @@ function FieldRow({
   dense,
   readOnly,
   verdict,
+  hasNote,
   onEdit,
   onCopy,
   onJump,
+  onNote,
 }: {
   field: RecordField;
   draft: RecordDraft;
@@ -418,13 +523,17 @@ function FieldRow({
   dense: boolean;
   readOnly: boolean;
   verdict: DraftValidation["fields"][number] | null;
+  /** Whether this field carries an F40 cell note (drives the indicator). */
+  hasNote: boolean;
   onEdit: (value: string) => void;
   onCopy: () => void;
   onJump: () => void;
+  /** Open the reused cell-note editor for this field. */
+  onNote: () => void;
 }) {
   const value = fieldValue(field, draft);
   const changed = fieldChanged(field, draft);
-  const label = field.dictionary?.displayName?.trim() || field.header || `Column ${field.col + 1}`;
+  const label = fieldLabel(field);
   const hasNullTokens = (field.nullTokens?.length ?? 0) > 0;
   const multiline = field.logicalType === "json" || value.includes("\n") || value.length > 48;
   // Show the F31 formatted rendering under the raw editor (unless in raw mode,
@@ -459,6 +568,17 @@ function FieldRow({
           className="shrink-0 rounded px-1 text-zinc-400 hover:bg-zinc-100 hover:text-violet-600 dark:hover:bg-zinc-800"
         >
           ▦
+        </button>
+        <button
+          title={hasNote ? "Edit cell note" : "Add cell note"}
+          onClick={onNote}
+          className={`shrink-0 rounded p-0.5 ${
+            hasNote
+              ? "text-violet-600 hover:bg-violet-100 dark:text-violet-300 dark:hover:bg-violet-900/40"
+              : "text-zinc-400 hover:bg-zinc-100 hover:text-violet-600 dark:hover:bg-zinc-800"
+          }`}
+        >
+          <NoteGlyph on={hasNote} />
         </button>
       </div>
 
@@ -632,6 +752,87 @@ function editorClass(readOnly: boolean): string {
 }
 
 // ---------------------------------------------------------------------------
+// Row bookmarks / tags / notes strip (F40 reuse)
+// ---------------------------------------------------------------------------
+
+/**
+ * The whole-record annotation strip for the form header: toggle a star or flag,
+ * open the tag picker, and open the row-note editor — all reusing F40's store
+ * commands and globally-mounted dialogs. Reflects the record's current
+ * annotation state; annotations are pure metadata, so it stays live on a
+ * read-only form.
+ */
+function RowAnnotationStrip({
+  entry,
+  onStar,
+  onFlag,
+  onTags,
+  onNote,
+}: {
+  entry: RowAnnotationView | undefined;
+  onStar: () => void;
+  onFlag: () => void;
+  onTags: () => void;
+  onNote: () => void;
+}) {
+  const starred = entry?.star ?? false;
+  const flagged = entry?.flag ?? false;
+  const tags = entry?.tags ?? [];
+  const hasNote = entry?.note != null;
+  const btn = (active: boolean) =>
+    `flex items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] ${
+      active
+        ? "border-violet-300 bg-violet-50 text-violet-700 dark:border-violet-500/40 dark:bg-violet-500/10 dark:text-violet-300"
+        : "border-zinc-300 text-zinc-500 hover:border-violet-400 hover:text-violet-600 dark:border-zinc-700 dark:hover:border-violet-500/50"
+    }`;
+
+  return (
+    <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-zinc-100 px-3 py-2 dark:border-zinc-800/60">
+      <button
+        title={starred ? "Remove star" : "Star this record"}
+        onClick={onStar}
+        className={btn(starred)}
+      >
+        <StarGlyph on={starred} />
+        Star
+      </button>
+      <button
+        title={flagged ? "Remove flag" : "Flag this record"}
+        onClick={onFlag}
+        className={btn(flagged)}
+      >
+        <FlagGlyph on={flagged} />
+        Flag
+      </button>
+      <button title="Tags…" onClick={onTags} className={btn(tags.length > 0)}>
+        # Tags{tags.length > 0 ? ` (${tags.length})` : ""}
+      </button>
+      <button
+        title={hasNote ? "Edit row note" : "Add row note"}
+        onClick={onNote}
+        className={btn(hasNote)}
+      >
+        <NoteGlyph on={hasNote} />
+        Note
+      </button>
+      {tags.length > 0 && (
+        <div className="flex w-full flex-wrap gap-1 pt-0.5">
+          {tags.map((t) => (
+            <span
+              key={t}
+              className="rounded px-1.5 py-0.5 text-[10px] font-medium text-white"
+              style={{ background: tagColor(t) }}
+            >
+              {t}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Layout editor (groups, hidden fields, density)
 // ---------------------------------------------------------------------------
 
@@ -722,7 +923,7 @@ function LayoutEditor({
       <div className="max-h-48 space-y-0.5 overflow-y-auto">
         {fields.map((f) => {
           const hidden = base.hiddenColumnIds.includes(f.columnId);
-          const label = f.dictionary?.displayName?.trim() || f.header || `Column ${f.col + 1}`;
+          const label = fieldLabel(f);
           return (
             <div key={f.col} className="flex items-center gap-1.5">
               <input

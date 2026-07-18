@@ -3582,6 +3582,8 @@ export const useStore = create<Store>((set, get) => {
         diagnosticsOpen: open ? false : s.diagnosticsOpen,
         changesOpen: open ? false : s.changesOpen,
         explorer: open ? { ...s.explorer, open: false } : s.explorer,
+        // One side panel at a time — the record form (F41) shares the rail.
+        recordFormOpen: open ? false : s.recordFormOpen,
       }));
       if (open) void get().loadAnnotations();
     },
@@ -4134,6 +4136,7 @@ export const useStore = create<Store>((set, get) => {
           changesOpen: open ? false : s.changesOpen,
           diagnosticsOpen: open ? false : s.diagnosticsOpen,
           explorer: open ? { ...s.explorer, open: false } : s.explorer,
+          annotationsPanelOpen: open ? false : s.annotationsPanelOpen,
         };
       }),
 

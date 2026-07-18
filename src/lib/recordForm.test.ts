@@ -5,6 +5,7 @@ import {
   assignToGroup,
   changedFields,
   clampRecord,
+  fieldCellNotes,
   fieldChanged,
   isDraftDirty,
   layoutSections,
@@ -15,7 +16,13 @@ import {
   toggleHidden,
   type RecordDraft,
 } from "./recordForm";
-import type { DraftValidation, RecordField, RecordLayout } from "../types";
+import type {
+  AnnotationNote,
+  DraftValidation,
+  RecordField,
+  RecordLayout,
+  RowAnnotationView,
+} from "../types";
 
 /** A minimal RecordField for the reducer/layout tests. */
 function field(col: number, columnId: string, raw: string): RecordField {
@@ -202,5 +209,53 @@ describe("layout mutations", () => {
       "c1",
       "c2",
     ]);
+  });
+});
+
+// ----- field cell-note mapping (F40 annotation reuse) ------------------------
+
+describe("field cell-note mapping", () => {
+  /** A dated note; timestamps are irrelevant to the mapping. */
+  function note(text: string): AnnotationNote {
+    return { text, createdMs: 1, updatedMs: 1 };
+  }
+  /** A matched annotation entry carrying the given cell notes. */
+  function entry(cellNotes: RowAnnotationView["cellNotes"]): RowAnnotationView {
+    return {
+      handle: 1,
+      status: "matched",
+      record: 4,
+      anchorKind: "record",
+      star: false,
+      flag: false,
+      cellNotes,
+      createdMs: 1,
+      updatedMs: 1,
+    };
+  }
+
+  it("maps each cell note to its column id → text, keeping presence checkable", () => {
+    const map = fieldCellNotes(
+      entry([
+        { columnId: "c0", note: note("check this") },
+        { columnId: "c2", note: note("verified") },
+      ]),
+    );
+    // Presence (the field's note indicator) and text (the editor prefill).
+    expect(map.has("c0")).toBe(true);
+    expect(map.get("c0")).toBe("check this");
+    expect(map.get("c2")).toBe("verified");
+    // A field with no cell note is absent → no indicator.
+    expect(map.has("c1")).toBe(false);
+    expect(map.get("c1")).toBeUndefined();
+    expect(map.size).toBe(2);
+  });
+
+  it("yields an empty map for an unannotated, note-less, or null entry", () => {
+    expect(fieldCellNotes(undefined).size).toBe(0);
+    expect(fieldCellNotes(null).size).toBe(0);
+    // A row starred/flagged but with no cell notes maps nothing.
+    expect(fieldCellNotes(entry(undefined)).size).toBe(0);
+    expect(fieldCellNotes(entry([])).size).toBe(0);
   });
 });

@@ -9,6 +9,7 @@ import type {
   RecordField,
   RecordFieldGroup,
   RecordLayout,
+  RowAnnotationView,
 } from "../types";
 
 /** A record-form draft: drafted raw text keyed by grid column position. */
@@ -188,4 +189,21 @@ export function removeGroup(layout: RecordLayout | null, groupId: string): Recor
 /** A fresh, empty layout (comfortable density, nothing hidden, no groups). */
 export function emptyLayout(): RecordLayout {
   return { density: "comfortable", hiddenColumnIds: [], groups: [] };
+}
+
+// ----- annotation wiring (F40 reuse) ----------------------------------------
+
+/**
+ * The per-field cell-note presence map for the record form: stable column ID →
+ * note text, drawn from a resolved F40 annotation entry for the current record.
+ * `map.has(columnId)` is a field's note indicator; `map.get(columnId)` prefills
+ * the reused cell-note editor. An absent (unannotated) or note-less entry yields
+ * an empty map, so the form shows no indicators. Only MATCHED entries carry a
+ * single record and reach here — an ambiguous/orphaned row never maps a field
+ * to a note. Notes are pure metadata: this never inspects or emits cell values.
+ */
+export function fieldCellNotes(entry: RowAnnotationView | null | undefined): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const cn of entry?.cellNotes ?? []) map.set(cn.columnId, cn.note.text);
+  return map;
 }

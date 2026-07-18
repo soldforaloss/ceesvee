@@ -45,7 +45,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   prompts to save or discard — or auto-saves, per a persisted preference.
   Fields can be arranged into named groups, hidden, and shown compact or
   comfortable (persisted per document); indexed documents open the form
-  read-only.
+  read-only. The form reuses the F40 annotations: a row bookmark strip in the
+  header (star, flag, tags, and a row note) and a per-field cell-note indicator
+  that opens the same note editor — annotations taken in the form resolve to
+  the same rows as the grid gutter and the annotations panel, and stay
+  available on a read-only form since they are pure metadata.
 - **JSON & JSON Lines interoperability** (palette → "Open JSON…" and
   "Export as JSON…"): open structured JSON without pre-converting to CSV —
   an array of objects, an array of arrays, JSON Lines / NDJSON, or an
