@@ -7,13 +7,14 @@ interface ModalProps {
   onClose: () => void;
   children: React.ReactNode;
   footer?: React.ReactNode;
-  size?: "md" | "lg" | "xl";
+  size?: "md" | "lg" | "xl" | "2xl";
 }
 
 const MAX_WIDTH: Record<NonNullable<ModalProps["size"]>, string> = {
   md: "max-w-md",
   lg: "max-w-xl",
   xl: "max-w-3xl",
+  "2xl": "max-w-5xl",
 };
 
 export function Modal({ title, onClose, children, footer, size = "md" }: ModalProps) {

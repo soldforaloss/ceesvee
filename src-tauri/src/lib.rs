@@ -34,6 +34,13 @@ mod filter;
 mod find;
 mod follow;
 mod groupby;
+/// Conditional highlighting (F42): the view-only rule engine — rule model,
+/// condition evaluation over the document and cached analysis results,
+/// per-rule cached match sets with targeted invalidation, the windowed
+/// priority-flattened query, explain, and the match-report export. Public like
+/// [`job`] so the persistence layer (F12 views / F08 profiles) and the test
+/// harness can treat the rule model as a stable internal API.
+pub mod highlight;
 mod index;
 /// Public so downstream features (and the test harness) can treat the job
 /// registry, progress plumbing and cancellation as a stable internal API.
@@ -159,6 +166,7 @@ pub fn run() {
         .manage(crate::json_import::JsonImportPreviewCache::default())
         .manage(crate::project::ProjectStore::default())
         .manage(crate::annotations::AnnotationRegistry::default())
+        .manage(crate::highlight::HighlightStore::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -349,6 +357,15 @@ pub fn run() {
             commands::annotations_load_export,
             commands::annotations_load_sidecar,
             commands::annotations_save_sidecar,
+            commands::highlight_list_rules,
+            commands::highlight_set_rules,
+            commands::highlight_upsert_rule,
+            commands::highlight_delete_rule,
+            commands::highlight_clear,
+            commands::highlight_window,
+            commands::highlight_explain,
+            commands::highlight_counts,
+            commands::start_highlight_report,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

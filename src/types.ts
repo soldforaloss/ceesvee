@@ -1234,6 +1234,121 @@ export interface RangeRule {
   max: number | null;
 }
 
+// ----- conditional highlighting (F42) ---------------------------------------
+// TS mirror of `src-tauri/src/highlight.rs`. Rules are VIEW-ONLY decoration:
+// applying, editing or removing one never touches data, never dirties the
+// document, and never enters the undo stack. Colours are never stored raw —
+// a decoration carries a SEMANTIC tone the theme maps to a readable pair for
+// light and dark (see `gridTheme.ts`).
+
+/** Visual weight of a decoration (mapped to a tone's light/dark tints). */
+export type HighlightEmphasis = "subtle" | "normal" | "strong";
+
+/** Semantic colour role — never a raw colour. */
+export type HighlightTone = "accent" | "info" | "warn" | "error" | "success" | "neutral";
+
+/** Optional text-weight override for a decorated cell. */
+export type HighlightTextStyle = "normal" | "bold" | "italic";
+
+/** How a matched cell/row is decorated (theme-aware; colour-free by default). */
+export interface HighlightDecoration {
+  tone: HighlightTone;
+  emphasis: HighlightEmphasis;
+  /** Optional short glyph the UI renders as a leading marker. */
+  icon?: string | null;
+  textStyle: HighlightTextStyle;
+}
+
+/** What a matching rule decorates. */
+export type HighlightTarget =
+  | { type: "cell" }
+  | { type: "row" }
+  | { type: "columns"; columnIds: string[] };
+
+/**
+ * The predicate a rule tests. Column-scoped predicates carry an optional
+ * `columnId`; when omitted they apply to the columns named by a `columns`
+ * target, or to every column for a `cell` / `row` target. The `bookmarked`,
+ * `flagged` and `tagged` variants are RESERVED for row annotations (F40) and
+ * currently match nothing until that feature lands beneath this one.
+ */
+export type HighlightCondition =
+  | { type: "equals"; columnId?: string | null; value: string; caseSensitive?: boolean }
+  | { type: "notEquals"; columnId?: string | null; value: string; caseSensitive?: boolean }
+  | { type: "contains"; columnId?: string | null; value: string; caseSensitive?: boolean }
+  | { type: "regex"; columnId?: string | null; pattern: string; caseSensitive?: boolean }
+  | {
+      type: "numericRange";
+      columnId?: string | null;
+      min?: number | null;
+      max?: number | null;
+      inclusive?: boolean;
+    }
+  | { type: "dateRange"; columnId?: string | null; min?: string | null; max?: string | null }
+  | { type: "blank"; columnId?: string | null }
+  | { type: "invalid"; columnId?: string | null }
+  | {
+      type: "duplicate";
+      columnId?: string | null;
+      trim?: boolean;
+      caseInsensitive?: boolean;
+      collapseWhitespace?: boolean;
+    }
+  | { type: "diagnostic"; issueId?: string | null }
+  | { type: "crossColumn"; ruleIndex?: number | null }
+  | { type: "outlier" }
+  | { type: "changedSinceSave"; columnId?: string | null }
+  | { type: "bookmarked" }
+  | { type: "flagged"; label?: string | null }
+  | { type: "tagged"; tag: string };
+
+/** One conditional-highlighting rule (persists in views (F12) & profiles (F08)). */
+export interface HighlightRule {
+  id: string;
+  name: string;
+  condition: HighlightCondition;
+  target: HighlightTarget;
+  /** Higher wins per overlapping target; ties break by `id`. */
+  priority: number;
+  decoration: HighlightDecoration;
+  enabled: boolean;
+}
+
+/** One decorated cell in a window response (DISPLAY row, PHYSICAL col). */
+export interface PaintedCell {
+  row: number;
+  col: number;
+  ruleId: string;
+  decoration: HighlightDecoration;
+}
+
+/** Decorations for a bounded, priority-flattened window (one rule per cell). */
+export interface HighlightWindow {
+  revision: number;
+  start: number;
+  cells: PaintedCell[];
+}
+
+/** One rule matching a cell, in the explain response. */
+export interface ExplainedRule {
+  ruleId: string;
+  name: string;
+  priority: number;
+  decoration: HighlightDecoration;
+  /** Whether this rule wins the cell (highest priority, id tie-break). */
+  winning: boolean;
+}
+
+/** Every rule matching one cell, in winning order (first wins). */
+export interface CellExplanation {
+  row: number;
+  col: number;
+  rules: ExplainedRule[];
+}
+
+/** Output format for the highlight match report. */
+export type HighlightReportFormat = "json" | "csv";
+
 /** A reusable description of a recurring file format (F08). */
 export interface FileProfile {
   id: string;
@@ -1263,6 +1378,8 @@ export interface FileProfile {
   namedViews?: NamedView[];
   /** F12: the view last applied to a matching file, restored on reopen. */
   lastViewId?: string | null;
+  /** F42: conditional-highlighting rules applied to matching files. */
+  highlightRules?: HighlightRule[];
 }
 
 /** One key of a named view's non-destructive sort (F12), by stable column ID. */
@@ -1294,6 +1411,8 @@ export interface NamedView {
   /** Column widths in px, keyed by column ID. */
   columnWidths: Record<string, number>;
   wrapText: boolean;
+  /** F42: conditional-highlighting rules saved with this view (view-only). */
+  highlightRules?: HighlightRule[];
 }
 
 /** The persisted settings document (versioned JSON in app-data). */

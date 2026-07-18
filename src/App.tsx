@@ -35,6 +35,7 @@ import { GroupByDialog } from "./components/GroupByDialog";
 import { NoteEditorDialog } from "./components/NoteEditorDialog";
 import { TagPickerDialog } from "./components/TagPickerDialog";
 import { TagToColumnDialog } from "./components/TagToColumnDialog";
+import { HighlightRulesDialog } from "./components/HighlightRulesDialog";
 import { Close } from "./components/Icons";
 import { JoinDialog } from "./components/JoinDialog";
 import { JsonExportDialog } from "./components/JsonExportDialog";
@@ -339,6 +340,7 @@ export default function App() {
       {activeModal === "recovery" && <RecoveryDialog onClose={() => setModal(null)} />}
       {activeModal === "dialect" && <DialectDialog onClose={() => setModal(null)} />}
       {activeModal === "views" && <ViewsDialog onClose={() => setModal(null)} />}
+      {activeModal === "highlight" && <HighlightRulesDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       {activeModal === "jsonExport" && <JsonExportDialog onClose={() => setModal(null)} />}
       {jsonImportPath && <JsonImportDialog key={jsonImportPath} />}
