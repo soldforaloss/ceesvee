@@ -52,6 +52,9 @@ getrandom = "0.2"
 # Compressed CSV support (F17): streaming gzip + ZIP archives.
 flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Parquet & Arrow interop (F32): typed columnar open/export.
+arrow = { version = "59", default-features = false, features = ["ipc"] }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
 
 # Single-instance is desktop-only: it forwards a second "Open with" launch
 # (and its file argument) to the already-running window instead of spawning a

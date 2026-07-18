@@ -498,7 +498,17 @@ pub async fn start_convert_to_editable(
             return Err(AppError::invalid("document is already editable"));
         }
         if !force {
-            if let Some(path) = doc.path.as_deref() {
+            // F32 columnar documents carry their own open-time estimate (the
+            // CSV sampler cannot read a binary parquet/arrow file).
+            if let Some(columnar) = doc.columnar_handle() {
+                if columnar.convert_needs_decision() {
+                    return Err(AppError::invalid(format!(
+                        "the estimated in-memory size is about {} MB, which may exhaust memory — \
+                         export a slice instead, or convert anyway",
+                        columnar.editable_estimate() / (1024 * 1024)
+                    )));
+                }
+            } else if let Some(path) = doc.path.as_deref() {
                 let est = index::estimate(path)?;
                 if est.needs_decision {
                     return Err(AppError::invalid(format!(
@@ -517,26 +527,41 @@ pub async fn start_convert_to_editable(
         let _ = crate::job::run_blocking(ctx, move |ctx| {
             // Stream the rows out under a read lock (reads stay available),
             // then commit under a brief write lock, revision-guarded.
-            let (rows, revision) = {
+            let (rows, schemas, revision) = {
                 let doc = handle.read().map_err(poisoned)?;
                 if doc.is_editable() {
                     return Err(AppError::invalid("document is already editable"));
                 }
-                let n = doc.n_rows();
-                ctx.set_total(n as u64);
-                let mut rows: Vec<Vec<String>> = Vec::with_capacity(n);
-                let mut pending = 0u64;
-                doc.visit_rows(0..n, &mut |_, row| {
-                    rows.push(row.to_vec());
-                    pending += 1;
-                    if pending >= 4096 {
-                        ctx.advance(pending)?;
-                        pending = 0;
+                // F32 columnar documents convert through the Option plane so
+                // NULL stays distinct from the empty string: each
+                // null-containing column gets a collision-free null token
+                // recorded in its schema.
+                if let Some(columnar) = doc.columnar_handle() {
+                    let plan = crate::parquet_arrow::plan_editable(columnar, Some(ctx))?;
+                    let mut schemas = plan.schemas;
+                    for (i, schema) in schemas.iter_mut().enumerate() {
+                        if let Some(id) = doc.column_ids().get(i) {
+                            schema.column_id = id.clone();
+                        }
                     }
-                    Ok(true)
-                })?;
-                ctx.advance(pending)?;
-                (rows, doc.revision())
+                    (plan.rows, Some(schemas), doc.revision())
+                } else {
+                    let n = doc.n_rows();
+                    ctx.set_total(n as u64);
+                    let mut rows: Vec<Vec<String>> = Vec::with_capacity(n);
+                    let mut pending = 0u64;
+                    doc.visit_rows(0..n, &mut |_, row| {
+                        rows.push(row.to_vec());
+                        pending += 1;
+                        if pending >= 4096 {
+                            ctx.advance(pending)?;
+                            pending = 0;
+                        }
+                        Ok(true)
+                    })?;
+                    ctx.advance(pending)?;
+                    (rows, None, doc.revision())
+                }
             };
             ctx.check()?; // last cancellation point before the commit
 
@@ -545,6 +570,11 @@ pub async fn start_convert_to_editable(
             // materialised rows would no longer match.
             doc.check_revision(revision)?;
             doc.make_editable(rows)?;
+            if let Some(schemas) = schemas {
+                for schema in schemas {
+                    doc.set_column_schema(schema);
+                }
+            }
             Ok(())
         })
         .await;
@@ -568,6 +598,13 @@ pub async fn start_reindex(
         if doc.is_editable() {
             return Err(AppError::invalid(
                 "only indexed documents reload by re-indexing",
+            ));
+        }
+        // The CSV indexer cannot read a binary columnar file; F32 documents
+        // reload by reopening the file through the columnar open flow.
+        if doc.columnar_handle().is_some() {
+            return Err(AppError::invalid(
+                "Parquet/Arrow documents reload by reopening the file",
             ));
         }
         let path = doc

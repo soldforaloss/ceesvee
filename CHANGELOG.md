@@ -8,6 +8,25 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Parquet & Arrow interop — read engine** (F32, backend): open typed
+  columnar datasets — Apache Parquet, Arrow IPC files (Feather v2 is the
+  Arrow IPC file format) and Arrow IPC streams — preserving types and nulls.
+  Inspection reports row count, columns mapped to the F31 logical types,
+  row-group/batch count, compression codecs, nested fields and an
+  editable-memory estimate before anything is opened. Large files open
+  through an indexed read-only columnar backing (windowed reads over row
+  groups / record batches with a bounded decoded-block cache) so the grid,
+  filters and export work unchanged; convert-to-editable runs behind an
+  explicit memory check and preserves the null-vs-empty-string distinction
+  by assigning collision-free per-column null tokens. Signed/unsigned 64-bit
+  integers, exact decimal precision+scale, floats, booleans, dates and
+  timestamps (with time-zone metadata mapped onto the column schema) all
+  round-trip as canonical text; structs flatten to stable path-based names,
+  and lists/maps follow an explicit policy (preserve as JSON, explode into
+  rows on editable opens, or reject the field). Equality and range filters
+  on numeric/date columns of indexed parquet documents skip row groups via
+  their statistics, with identical results to a full scan. (UI, commands and
+  typed export land in the follow-up stages.)
 - **Row bookmarks, tags & notes** (F40): mark and annotate records without
   touching the source data. Star or flag a row, apply multiple named tags
   (a per-document tag namespace with usage counts), and attach a row note or

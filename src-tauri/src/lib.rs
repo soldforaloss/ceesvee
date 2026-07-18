@@ -55,6 +55,12 @@ mod json_export;
 /// JSON export stage.
 pub mod json_import;
 mod outlier;
+/// Public like [`job`]: the F32 Parquet/Arrow read engine (format detection,
+/// inspection, the indexed read-only columnar backing with typed-text
+/// conversion and row-group statistics pruning, nested-field policies, and
+/// editable materialisation) consumed by the F32 command surface, the export
+/// stage and the test harness.
+pub mod parquet_arrow;
 mod parse;
 mod paste;
 mod pii;
