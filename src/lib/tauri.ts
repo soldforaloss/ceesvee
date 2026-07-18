@@ -49,6 +49,11 @@ import type {
   DuplicateKeepStrategy,
   DuplicateReport,
   EncodingCompatibility,
+  ExcelExportOptions,
+  ExcelImportOptions,
+  ExcelImportPreview,
+  ExcelSheetExport,
+  ExcelWorkbookInfo,
   ExportOptions,
   ExportScope,
   ExternalChange,
@@ -1209,6 +1214,57 @@ export const columnarExport = (
  * invalid-cell counts), by its job id. */
 export const getColumnarExportReport = (jobId: number) =>
   invoke<ColumnarExportReport | null>("get_columnar_export_report", { jobId });
+
+// ----- Excel .xlsx interoperability (F34) ----------------------------------
+
+/**
+ * Start a workbook inspection as a cancellable "scan" job (F34): sheets (with
+ * visibility), named tables, named ranges, used ranges + dimensions, formula
+ * and merged-cell counts, header candidates and bounded previews. Resolves
+ * with the job id; fetch the result with {@link getExcelInspect} once the
+ * `job-finished` event arrives. Nothing is opened.
+ */
+export const excelInspect = (path: string) => invoke<number>("excel_inspect", { path });
+
+/** The inspection of a finished Excel workbook scan, by its job id (F34). */
+export const getExcelInspect = (jobId: number) =>
+  invoke<ExcelWorkbookInfo | null>("get_excel_inspect", { jobId });
+
+/**
+ * Start an import preview of the chosen source/options as a cancellable "scan"
+ * job (F34): columns with inferred types, sample rows, projected dimensions and
+ * warnings (including formula cells with no cached result). Fetch the result
+ * with {@link getExcelImportPreview} after `job-finished`.
+ */
+export const excelImportPreview = (path: string, options?: ExcelImportOptions) =>
+  invoke<number>("excel_import_preview", { path, options });
+
+/** The preview of a finished Excel import scan, by its job id (F34). */
+export const getExcelImportPreview = (jobId: number) =>
+  invoke<ExcelImportPreview | null>("get_excel_import_preview", { jobId });
+
+/**
+ * Run an Excel import as a cancellable "derive" job (F34): the selected sheet /
+ * table / named range (optionally a cell sub-range) is read into a NEW CEESVEE
+ * document that registers under the returned docId when the job finishes. The
+ * original workbook is never modified; a failure leaves no document behind.
+ */
+export const excelImportApply = (path: string, options?: ExcelImportOptions) =>
+  invoke<IndexedOpenStart>("excel_import_apply", { path, options });
+
+/**
+ * Start an Excel `.xlsx` export as a cancellable "export" job (F34): one sheet
+ * from one document, or several sheets (one per selected tab) into a single
+ * workbook. Revisions, scopes, sheet names and Excel's row/column limits are
+ * validated BEFORE the job spawns (the invoke rejects an over-limit request),
+ * then again inside it; the workbook commits through the atomic-save pipeline,
+ * so a failure or cancellation never touches an existing destination.
+ */
+export const excelExport = (
+  sheets: ExcelSheetExport[],
+  path: string,
+  options: ExcelExportOptions,
+) => invoke<number>("excel_export", { sheets, path, options });
 
 // ----- project workspaces (F37) ---------------------------------------------
 // The ProjectStore is THE persistence boundary: typed, versioned sections are
