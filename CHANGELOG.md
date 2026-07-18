@@ -8,39 +8,39 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Sandboxed SQL query workspace (engine)** (F36, backend): query open
-  documents, user-approved local files, and F35-approved SQLite databases
-  with read-only SQL through the SafeQueryEngine. Approved CSV / JSON /
-  Parquet / Arrow files become queryable tables without a full import
-  (windowed reads over a generic tabular virtual table; a file rewritten
-  mid-query aborts the query instead of mixing versions, and a document
-  edited mid-query keeps the F35 snapshot semantics). Only `SELECT`,
-  `WITH`, `VALUES` and `EXPLAIN` statements run — multi-statement input,
-  DDL/DML (including CTE- or EXPLAIN-wrapped), `ATTACH`, PRAGMA writes and
-  extension loading are all rejected before execution, layered on the F35
-  authorizer and read-only connections. Typed named parameters
-  (`:name` — text/integer/decimal/float/boolean/date/datetime/null) are
-  validated up front and always bound, never spliced into SQL. Runs are
-  cancellable jobs with row-produced progress and configurable row / byte /
-  time limits; results land in a bounded spool that can be read in windows,
-  materialized as a new derived document (editable or indexed by size), or
-  exported to CSV. Includes a prepare-only validation dry run (errors +
-  output columns + parameter list), an `EXPLAIN QUERY PLAN` tree, a bounded
-  schema/autocomplete DTO, a settings-persisted query history ring (capped,
-  never auto-executed), and the project file's `queries` section for saved
-  query definitions (sql + params + sources — never results, never auto-run).
-- **Sandboxed SQL query workspace (UI)** (F36, palette → "SQL workspace…"): a
-  dialog that composes the open documents, approved files and one approved
-  SQLite database into read-only SQL. A monospace editor (no editor
-  dependencies) with a prefix-matched suggestion list built from the bounded
-  schema DTO; a typed `:param` table that auto-tracks the query and flags bad
-  values before a run; Validate / Explain / Run with rows-produced progress and
-  a working cancel; a bounded results grid with windowed "load more"; an
-  EXPLAIN QUERY PLAN tree; configurable row / byte / time limits; the persisted
-  history ring (click to reload, never auto-run); save / load query definitions
-  into the open project; and materialize-to-document (editable or indexed) or
-  direct CSV export of a result. Approved files are managed inline (add via file
-  picker → registers with the approved-source registry; remove revokes it).
+- **Sandboxed SQL query workspace** (F36; palette → "SQL workspace…"): query
+  your open documents, approved local files, and an F35-approved SQLite
+  database together with read-only SQL, under CEESVEE's local
+  controlled-execution model — nothing leaves the device, there is no
+  scripting or network surface, and files outside the ones you explicitly
+  approve are never readable. Built on the F35 SafeQueryEngine: approved CSV /
+  JSON / Parquet / Arrow files become queryable tables without a full import
+  (windowed reads over a generic tabular virtual table, so a file is a table
+  without loading it whole), and every source is reached through the
+  authorizer-guarded, read-only connection. Only `SELECT`, `WITH`, `VALUES`
+  and `EXPLAIN` statements run — multi-statement input, DDL/DML (including
+  CTE- or EXPLAIN-wrapped), `ATTACH`/`DETACH`, PRAGMA writes and extension
+  loading are all rejected _before_ execution (statement-level pre-validation
+  layered on the authorizer and a `query_only` connection). Typed named
+  parameters (`:name` — text / integer / decimal / float / boolean / date /
+  datetime / null) are validated up front and always bound through the driver,
+  never spliced into SQL, so a hostile string parameter is inert data. The
+  dialog gives you a schema browser over every source, a monospace editor (no
+  heavyweight editor dependency) with prefix-matched column/table autocomplete,
+  a typed `:param` table that tracks the query and flags bad values before a
+  run, prepare-only validation (errors + output columns), an `EXPLAIN QUERY
+PLAN` tree, and Run with rows-produced progress, a working cancel, and
+  configurable row / byte / time limits enforced during streaming. A document
+  edited mid-query reads its current revision consistently (F35 snapshot
+  semantics) and an approved file rewritten mid-query aborts the query instead
+  of mixing versions. Results stream into a bounded grid you page through with
+  "load more", and can be materialized as a new derived document (editable or
+  indexed by size) or exported directly to CSV. A settings-persisted query
+  history ring (capped, click to reload, never auto-executed) and the project
+  file's `queries` section for saved query definitions (name + sql + params +
+  sources — never results, never auto-run) round out the workspace; approved
+  files are managed inline (add via the file picker to register with the
+  approved-source registry; remove to revoke it).
 - **Parquet & Arrow interoperability** (palette → "Open Parquet/Arrow…" and
   "Export as Parquet/Arrow…"): open and export typed columnar datasets —
   Apache Parquet, Arrow IPC files (Feather v2 is the Arrow IPC file format),

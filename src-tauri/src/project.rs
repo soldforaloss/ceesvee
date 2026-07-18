@@ -6,9 +6,9 @@
 //! sections are typed and registered in [`SECTION_REGISTRY`]. Future features
 //! extend the registry by adding a typed field to [`ProjectSections`], a row
 //! to the registry, and a match arm in [`set_section_typed`] — as the F38
-//! `dictionary` and F40 `annotations` sections do. The still-reserved `queries`
-//! (F36) section is already named, default-empty, and rejected for writes until
-//! its owning feature lands.
+//! `dictionary`, F40 `annotations` and F36 `queries` (saved query
+//! definitions — sql, typed params, source refs; never results, never
+//! auto-run) sections do.
 //!
 //! Hard rules enforced here:
 //!
@@ -180,9 +180,11 @@ pub struct ProjectSections {
     /// only — column IDs and metadata, never cell values).
     #[serde(default)]
     pub dictionary: Vec<SourceDictionary>,
-    /// RESERVED for F36 saved queries: definitions only, never results.
+    /// F36 saved queries: DEFINITIONS ONLY (sql text, typed parameters,
+    /// source references) — never results, and NEVER auto-executed on load
+    /// (running one is always an explicit user action, like recipes).
     #[serde(default)]
-    pub queries: Vec<Value>,
+    pub queries: Vec<crate::sql_workspace::SavedQuery>,
     /// Sections written by future versions, preserved verbatim.
     #[serde(flatten)]
     pub unknown: BTreeMap<String, Value>,
@@ -263,7 +265,7 @@ pub const SECTION_REGISTRY: &[SectionSpec] = &[
     },
     SectionSpec {
         name: "queries",
-        reserved: true,
+        reserved: false,
         owner: "F36",
     },
 ];
@@ -1267,6 +1269,7 @@ fn set_section_typed(sections: &mut ProjectSections, name: &str, value: Value) -
         "rowKeys" => sections.row_keys = serde_json::from_value(value).map_err(shape)?,
         "annotations" => sections.annotations = serde_json::from_value(value).map_err(shape)?,
         "dictionary" => sections.dictionary = serde_json::from_value(value).map_err(shape)?,
+        "queries" => sections.queries = serde_json::from_value(value).map_err(shape)?,
         _ => unreachable!("registry check above covers every arm"),
     }
     Ok(())
@@ -2029,14 +2032,8 @@ mod tests {
     }
 
     #[test]
-    fn reserved_and_unknown_section_writes_are_rejected() {
+    fn unknown_section_writes_are_rejected() {
         let mut sections = ProjectSections::default();
-        // `annotations` is no longer reserved (F40 owns it now); `queries`
-        // (F36) is still reserved and rejects writes.
-        let err = set_section_typed(&mut sections, "queries", serde_json::json!([]))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("reserved"), "queries: {err}");
         let err = set_section_typed(&mut sections, "nope", serde_json::json!([]))
             .unwrap_err()
             .to_string();
@@ -2047,6 +2044,44 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("sources"), "names the section: {err}");
+    }
+
+    #[test]
+    fn saved_queries_section_stores_definitions_without_running_them() {
+        // The `queries` section (F36) is no longer reserved. Definitions are
+        // stored VERBATIM: hostile or garbage SQL loads fine because nothing
+        // here prepares, validates or executes it — running a saved query is
+        // always an explicit user action through the workspace commands
+        // (exactly the recipe model).
+        let mut sections = ProjectSections::default();
+        set_section_typed(
+            &mut sections,
+            "queries",
+            serde_json::json!([{
+                "id": "q1",
+                "name": "hostile",
+                "sql": "DROP TABLE everything; DELETE FROM all_the_things",
+                "params": [{"name": "p", "type": "integer", "value": "1"}],
+                "sources": ["src-1"]
+            }]),
+        )
+        .expect("stored without validation or execution");
+        assert_eq!(sections.queries.len(), 1);
+        assert_eq!(sections.queries[0].name, "hostile");
+
+        // Definitions only: the serialized section passes the no-cell-data
+        // scan (no rows/values keys — results can never be embedded).
+        let value = serde_json::to_value(&sections.queries).unwrap();
+        scan_for_data_keys("queries", &value).expect("no data-bearing keys");
+
+        // And it round-trips through a full save/load.
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = ProjectFile::new_empty();
+        file.sections = sections;
+        let path = dir.path().join("q.ceesveeproj");
+        write_project_file(&path, &file).unwrap();
+        let loaded = load_project_file(&path).unwrap();
+        assert_eq!(loaded.sections.queries, file.sections.queries);
     }
 
     // ----- dirty tracking -----------------------------------------------------
@@ -2451,8 +2486,8 @@ mod tests {
             );
         }
         // layout serializes as null; everything else defaults to empty lists
-        // or objects. The still-reserved `queries` section and the now-active
-        // but empty-by-default `annotations` section are both present-but-empty.
+        // or objects. The now-active but empty-by-default `annotations` and
+        // `queries` (F36) sections are both present-but-empty.
         for empty in ["annotations", "queries"] {
             assert_eq!(map[empty], serde_json::json!([]), "{empty}");
         }

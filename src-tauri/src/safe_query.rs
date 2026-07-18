@@ -42,6 +42,17 @@
 //! authorizer is installed, because `CREATE VIRTUAL TABLE` is DDL that the
 //! guard would deny). Connections are cheap; callers wanting a different
 //! document set open a new one.
+//!
+//! ## Generic tabular virtual tables (F36)
+//!
+//! [`connect_with_sources`] additionally exposes arbitrary
+//! [`TabularSource`]s (module `ceesvee_src`) — the F36 SQL workspace uses it
+//! to make approved CSV/JSON/Parquet/Arrow FILES queryable without a full
+//! import. Reads are windowed (bounded memory) and the source's
+//! [`ContentFingerprint`] is pinned at connect time and re-checked on every
+//! window refill, so a file rewritten mid-query aborts instead of mixing
+//! rows from two versions. Cells surface the tabular missing/`NULL` bit as
+//! SQL `NULL`.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -61,6 +72,7 @@ use rusqlite::{Connection, OpenFlags};
 use crate::error::{AppError, AppResult};
 use crate::job::CancelToken;
 use crate::state::SharedDocument;
+use crate::tabular::{ContentFingerprint, RowCountHint, TabularRow, TabularSource};
 
 /// Documents whose `rows × columns` is at or below this are snapshot-copied
 /// at vtab connect time; larger documents use revision-check-abort (see the
@@ -249,6 +261,23 @@ pub fn connect(
     path: Option<&Path>,
     documents: &[(String, SharedDocument)],
 ) -> AppResult<Connection> {
+    connect_with_sources(approved, path, documents, &[])
+}
+
+/// A thread-safe, owned tabular source exposed as a `ceesvee_src` virtual
+/// table (the F36 approved-file backings).
+pub type SharedTabular = Arc<dyn TabularSource + Send + Sync>;
+
+/// [`connect`], plus arbitrary [`TabularSource`]s exposed as read-only
+/// virtual tables named `alias` (module docs: generic tabular vtabs). Like
+/// document vtabs, the set is fixed for the connection's lifetime and every
+/// vtab lands in the temp schema, created BEFORE the authorizer.
+pub fn connect_with_sources(
+    approved: &ApprovedSources,
+    path: Option<&Path>,
+    documents: &[(String, SharedDocument)],
+    sources: &[(String, SharedTabular)],
+) -> AppResult<Connection> {
     let conn = match path {
         Some(p) => {
             let canonical = approved.check(p)?;
@@ -262,6 +291,13 @@ pub fn connect(
         register_document_module(&conn, Arc::clone(&exposed))?;
         for (alias, doc) in documents {
             expose_document(&conn, &exposed, alias, Arc::clone(doc))?;
+        }
+    }
+    if !sources.is_empty() {
+        let exposed: ExposedSrcs = Arc::default();
+        register_source_module(&conn, Arc::clone(&exposed))?;
+        for (alias, source) in sources {
+            expose_source(&conn, &exposed, alias, Arc::clone(source))?;
         }
     }
     conn.authorizer(Some(authorize))?;
@@ -535,36 +571,14 @@ unsafe impl<'vtab> VTab<'vtab> for DocVTab {
             Strategy::Live { doc, revision }
         };
 
-        // Column names must be unique in a table declaration; disambiguate
-        // duplicates and sanitise control characters without touching the
-        // underlying document.
-        let mut used: Vec<String> = Vec::with_capacity(n_cols);
-        let mut decl = String::from("CREATE TABLE x(");
-        for (i, header) in headers.iter().enumerate() {
-            let base: String = header.chars().filter(|c| *c != '\0').collect();
-            let base = if base.is_empty() {
-                format!("column_{}", i + 1)
-            } else {
-                base
-            };
-            let name = crate::derived::unique_column_name(&used, &base);
-            used.push(name.clone());
-            if i > 0 {
-                decl.push_str(", ");
-            }
-            decl.push('"');
-            decl.push_str(&escape_double_quote(&name));
-            decl.push_str("\" TEXT");
-        }
-        decl.push(')');
-        let decl = CString::new(decl).map_err(|_| module_err("invalid column names"))?;
+        let decl = text_table_decl(&headers)?;
 
         // Not usable from within triggers or views of the outer database:
         // queries must name the document table directly.
         db.config(VTabConfig::DirectOnly)?;
 
         Ok((
-            Cow::Owned(decl),
+            decl,
             DocVTab {
                 base: ffi::sqlite3_vtab::default(),
                 n_cols,
@@ -690,6 +704,247 @@ unsafe impl VTabCursor for DocCursor {
 
 fn module_err(msg: &str) -> rusqlite::Error {
     rusqlite::Error::ModuleError(msg.to_string())
+}
+
+/// Build a `CREATE TABLE` declaration (all-TEXT columns) from raw column
+/// names: control characters stripped, empty names replaced positionally,
+/// duplicates disambiguated — without touching the underlying source.
+fn text_table_decl(names: &[String]) -> rusqlite::Result<Cow<'static, CStr>> {
+    let mut used: Vec<String> = Vec::with_capacity(names.len());
+    let mut decl = String::from("CREATE TABLE x(");
+    for (i, header) in names.iter().enumerate() {
+        let base: String = header.chars().filter(|c| *c != '\0').collect();
+        let base = if base.is_empty() {
+            format!("column_{}", i + 1)
+        } else {
+            base
+        };
+        let name = crate::derived::unique_column_name(&used, &base);
+        used.push(name.clone());
+        if i > 0 {
+            decl.push_str(", ");
+        }
+        decl.push('"');
+        decl.push_str(&escape_double_quote(&name));
+        decl.push_str("\" TEXT");
+    }
+    decl.push(')');
+    CString::new(decl)
+        .map(Cow::Owned)
+        .map_err(|_| module_err("invalid column names"))
+}
+
+// ---------------------------------------------------------------------------
+// The generic tabular-source virtual table (F36)
+// ---------------------------------------------------------------------------
+
+/// Alias → source map handed to the `ceesvee_src` module as aux data.
+type ExposedSrcs = Arc<Mutex<HashMap<String, SharedTabular>>>;
+
+const SRC_MODULE_NAME: &CStr = c"ceesvee_src";
+
+fn register_source_module(conn: &Connection, srcs: ExposedSrcs) -> AppResult<()> {
+    const MODULE: Module<SrcVTab> = Module::read_only_module();
+    conn.create_module(SRC_MODULE_NAME, &MODULE, Some(srcs))?;
+    Ok(())
+}
+
+/// Create the temp-schema virtual table for one exposed tabular source. Must
+/// run BEFORE the authorizer is installed.
+fn expose_source(
+    conn: &Connection,
+    exposed: &ExposedSrcs,
+    alias: &str,
+    source: SharedTabular,
+) -> AppResult<()> {
+    if alias.is_empty() || alias.contains('\0') {
+        return Err(AppError::invalid("invalid source table name"));
+    }
+    exposed
+        .lock()
+        .map_err(|_| AppError::Other("internal state lock error".into()))?
+        .insert(alias.to_string(), source);
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE temp.\"{}\" USING ceesvee_src('{}')",
+        escape_double_quote(alias),
+        alias.replace('\'', "''"),
+    ))?;
+    Ok(())
+}
+
+/// One `ceesvee_src` virtual table (one exposed [`TabularSource`]). Reads
+/// are windowed and never buffer more than [`LIVE_WINDOW`] rows; the
+/// source's fingerprint is pinned at connect time and re-checked on every
+/// window refill so a query never mixes rows from two source versions.
+#[repr(C)]
+pub struct SrcVTab {
+    base: ffi::sqlite3_vtab,
+    n_cols: usize,
+    /// Row-count hint for the planner (`None` when the source has none).
+    row_hint: Option<u64>,
+    source: SharedTabular,
+    pinned: ContentFingerprint,
+}
+
+unsafe impl<'vtab> VTab<'vtab> for SrcVTab {
+    type Aux = ExposedSrcs;
+    type Cursor = SrcCursor;
+
+    fn connect(
+        db: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        _table_name: &[u8],
+        args: &[&[u8]],
+    ) -> rusqlite::Result<(Cow<'static, CStr>, Self)> {
+        let aux = aux.ok_or_else(|| module_err("source registry missing"))?;
+        let raw = args
+            .first()
+            .ok_or_else(|| module_err("usage: ceesvee_src('<alias>')"))?;
+        let alias_arg =
+            std::str::from_utf8(raw).map_err(|_| module_err("source table name must be UTF-8"))?;
+        let alias = dequote(alias_arg.trim());
+        let source = {
+            let map = aux
+                .lock()
+                .map_err(|_| module_err("source registry poisoned"))?;
+            map.get(alias.as_ref())
+                .cloned()
+                .ok_or_else(|| module_err(&format!("no exposed source named '{alias}'")))?
+        };
+
+        let names: Vec<String> = source.columns().into_iter().map(|c| c.name).collect();
+        let decl = text_table_decl(&names)?;
+        let row_hint = match source.row_count() {
+            RowCountHint::Exact(n) | RowCountHint::Estimate(n) => Some(n),
+            RowCountHint::Unknown => None,
+        };
+
+        // Not usable from within triggers or views of the outer database:
+        // queries must name the source table directly.
+        db.config(VTabConfig::DirectOnly)?;
+
+        let pinned = source.fingerprint();
+        Ok((
+            decl,
+            SrcVTab {
+                base: ffi::sqlite3_vtab::default(),
+                n_cols: names.len(),
+                row_hint,
+                source,
+                pinned,
+            },
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
+        // Full scan only; the engine filters. Cost scales with size so the
+        // planner puts large sources on the right side of joins.
+        let n = self.row_hint.unwrap_or(10_000);
+        info.set_estimated_cost(n as f64 * 10.0 + 1.0);
+        info.set_estimated_rows(n.max(1) as i64);
+        Ok(true)
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<SrcCursor> {
+        Ok(SrcCursor {
+            base: ffi::sqlite3_vtab_cursor::default(),
+            source: Arc::clone(&self.source),
+            pinned: self.pinned,
+            pos: 0,
+            buffer: Vec::new(),
+            buffer_start: 0,
+            at_end: true,
+        })
+    }
+}
+
+impl<'vtab> CreateVTab<'vtab> for SrcVTab {
+    const KIND: VTabKind = VTabKind::Default;
+}
+
+/// Cursor over one tabular-source vtab: a sliding window of at most
+/// [`LIVE_WINDOW`] rows.
+#[repr(C)]
+pub struct SrcCursor {
+    base: ffi::sqlite3_vtab_cursor,
+    source: SharedTabular,
+    pinned: ContentFingerprint,
+    pos: usize,
+    buffer: Vec<TabularRow>,
+    buffer_start: usize,
+    at_end: bool,
+}
+
+impl SrcCursor {
+    /// Refill the window so `pos` is buffered, re-checking the pinned
+    /// fingerprint: results must never mix rows from two source versions.
+    /// An empty read marks the end of the scan.
+    fn ensure_buffered(&mut self) -> rusqlite::Result<()> {
+        if self.at_end
+            || (self.pos >= self.buffer_start && self.pos < self.buffer_start + self.buffer.len())
+        {
+            return Ok(());
+        }
+        if self.source.fingerprint() != self.pinned {
+            return Err(module_err(
+                "the source changed while the query was running; run the query again",
+            ));
+        }
+        let window = self
+            .source
+            .read_rows(self.pos as u64, LIVE_WINDOW, None)
+            .map_err(|e| module_err(&e.to_string()))?;
+        self.buffer_start = self.pos;
+        if window.is_empty() {
+            self.buffer.clear();
+            self.at_end = true;
+        } else {
+            self.buffer = window;
+        }
+        Ok(())
+    }
+}
+
+unsafe impl VTabCursor for SrcCursor {
+    fn filter(
+        &mut self,
+        _idx_num: c_int,
+        _idx_str: Option<&str>,
+        _args: &Filters<'_>,
+    ) -> rusqlite::Result<()> {
+        self.pos = 0;
+        self.buffer.clear();
+        self.buffer_start = 0;
+        self.at_end = false;
+        self.ensure_buffered()
+    }
+
+    fn next(&mut self) -> rusqlite::Result<()> {
+        self.pos += 1;
+        self.ensure_buffered()
+    }
+
+    fn eof(&self) -> bool {
+        self.at_end
+    }
+
+    fn column(&self, ctx: &mut Context, i: c_int) -> rusqlite::Result<()> {
+        // A tabular missing/NULL cell (`None`) surfaces as SQL NULL, keeping
+        // the missing-vs-empty distinction the contract carries.
+        let cell = self
+            .buffer
+            .get(self.pos - self.buffer_start)
+            .and_then(|r| r.get(i as usize))
+            .cloned()
+            .flatten();
+        ctx.set_result(&cell)
+    }
+
+    fn rowid(&self) -> rusqlite::Result<i64> {
+        Ok(self.pos as i64 + 1)
+    }
 }
 
 #[cfg(test)]
