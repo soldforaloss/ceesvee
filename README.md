@@ -144,6 +144,17 @@ and faithful on large, real-world delimited files.**
 - **Named views** — save non-destructive combinations of filter, view-only
   sort, hidden/pinned/reordered columns, widths, and wrap per file; views
   survive renames via stable column IDs and restore when you reopen the file.
+- **Conditional highlighting** — decorate cells and rows with prioritized,
+  view-only rules (equals / not-equals, contains, regex, numeric and date
+  ranges, blank / null / invalid, duplicate values, diagnostic issues,
+  cross-column violations, outliers, and changed-since-save) in theme-aware
+  semantic tones that stay readable in light and dark. Each rule targets the
+  cell, its whole row, or selected columns; overlaps resolve by priority into
+  one winning decoration per cell, flattened server-side so only the visible
+  window crosses to the grid and a million-row scroll stays smooth. An
+  "explain" query lists every rule matching a cell in priority order, and
+  highlighting never dirties the document or changes exports. Rules persist in
+  named views and file profiles, and a match report exports to JSON or CSV.
 - **Filter rows** with an advanced query builder — nest AND/OR groups of
   conditions (contains, equals, numeric comparisons, is-empty, regex, and
   more). The status bar shows "N of M rows" with one-click clear; filtering is
