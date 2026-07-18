@@ -598,6 +598,8 @@ describe("annotation persistence: sidecar vs project (F40)", () => {
       tabs: [meta(1)],
       activeId: 1,
       project: null,
+      projectBaseline: null,
+      projectAnnotationsDirty: false,
       annotationsView: annView(0),
       error: null,
     });
@@ -619,6 +621,28 @@ describe("annotation persistence: sidecar vs project (F40)", () => {
     // but the per-source sidecar is never written — the two are exclusive.
     expect(api.annotationsEditRow).toHaveBeenCalled();
     expect(api.annotationsSaveSidecar).not.toHaveBeenCalled();
+  });
+
+  it("marks the project dirty on an edit when a project IS open", async () => {
+    useStore.setState({ project: project() });
+    // A freshly opened/saved project is clean.
+    expect(useStore.getState().isProjectDirty()).toBe(false);
+
+    const ok = await useStore.getState().applyRowMarks([0], { star: true });
+    expect(ok).toBe(true);
+
+    // Project-backed annotations live outside the project snapshot, so the edit
+    // must flip the explicit dirty flag — otherwise quit/close would drop it.
+    expect(api.annotationsSaveSidecar).not.toHaveBeenCalled();
+    expect(useStore.getState().projectAnnotationsDirty).toBe(true);
+    expect(useStore.getState().isProjectDirty()).toBe(true);
+  });
+
+  it("does not mark a project dirty for a sidecar (no-project) edit", async () => {
+    const ok = await useStore.getState().applyRowMarks([0], { star: true });
+    expect(ok).toBe(true);
+    expect(api.annotationsSaveSidecar).toHaveBeenCalled();
+    expect(useStore.getState().projectAnnotationsDirty).toBe(false);
   });
 
   it("hydrates the sidecar when an INDEXED open finishes", async () => {

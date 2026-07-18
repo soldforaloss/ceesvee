@@ -273,8 +273,9 @@ impl AnnotationStore {
     }
 
     /// Set (or clear, with `None`) the key columns used to anchor NEW
-    /// annotations. Existing anchors keep their captured form until re-anchored
-    /// by a rematch that upgrades them — see [`AnnotationStore::reanchor`].
+    /// annotations. Existing anchors keep their captured form; adopting a new
+    /// spec for the EXISTING annotations (resolving them under the old spec
+    /// first) is [`AnnotationStore::set_key_spec_and_reanchor`].
     pub fn set_key_spec(&mut self, key_spec: Option<KeySpec>) {
         let key_spec = key_spec.filter(|k| !k.columns.is_empty());
         if self.key_spec != key_spec {
@@ -369,13 +370,26 @@ impl AnnotationStore {
         record: u64,
         ctx: Option<&JobCtx>,
     ) -> AppResult<RowAnchor> {
+        Self::anchor_at(source, self.key_spec.as_ref(), record, ctx)
+    }
+
+    /// Capture an anchor for `record` under an EXPLICIT key spec (rather than
+    /// `self.key_spec`), so a re-anchor can pin matched rows under a spec that
+    /// is not yet committed to the store — see
+    /// [`AnnotationStore::set_key_spec_and_reanchor`].
+    fn anchor_at(
+        source: &dyn TabularSource,
+        key_spec: Option<&KeySpec>,
+        record: u64,
+        ctx: Option<&JobCtx>,
+    ) -> AppResult<RowAnchor> {
         let row = source
             .read_rows(record, 1, ctx)?
             .into_iter()
             .next()
             .ok_or_else(|| AppError::invalid("row is out of range"))?;
         let content_hash = Some(row_content_hash_hex(&row));
-        let identity = match &self.key_spec {
+        let identity = match key_spec {
             Some(spec) => {
                 let positions = Self::key_positions(&source.columns(), spec)?;
                 RowIdentity::Key {
@@ -547,21 +561,43 @@ impl AnnotationStore {
         Ok(orphans.len())
     }
 
-    /// Re-capture every MATCHED entry's anchor against the current source under
-    /// the current key spec — the way a newly-set key spec is adopted by
-    /// existing annotations. Ambiguous / orphaned entries keep their anchor so
-    /// the review list still explains them.
-    pub fn reanchor(&mut self, source: &dyn TabularSource, ctx: Option<&JobCtx>) -> AppResult<()> {
+    /// Change the key spec AND re-anchor every currently-MATCHED annotation so
+    /// it keeps pointing at the same row under the new mechanism.
+    ///
+    /// The existing entries are resolved against the source FIRST, under the
+    /// CURRENT spec: a key anchor can only be resolved by the spec that produced
+    /// it, so replacing (or clearing) the spec before resolving would orphan
+    /// every keyed annotation or, worse, match an old composite value against an
+    /// unrelated column and silently reattach the note to the wrong row. Each
+    /// matched row's replacement anchor is then captured under the NEW spec
+    /// (computed up front, so an invalid new spec fails before any mutation).
+    /// Ambiguous / orphaned entries keep their old anchor and stay in the review
+    /// list — an uncertain row is NEVER silently re-anchored.
+    pub fn set_key_spec_and_reanchor(
+        &mut self,
+        source: &dyn TabularSource,
+        key_spec: Option<KeySpec>,
+        ctx: Option<&JobCtx>,
+    ) -> AppResult<()> {
+        let new_spec = key_spec.filter(|k| !k.columns.is_empty());
+        // Resolve under the CURRENT spec, before it changes.
         let resolution = self.rematch(source, ctx)?;
+        // Capture each matched entry's replacement anchor under the NEW spec up
+        // front: a missing key column errors here, before self is mutated.
         let mut updates: Vec<(u64, RowAnchor)> = Vec::new();
         for (handle, res) in &resolution.by_handle {
             if res.status == MatchStatus::Matched {
                 if let Some(record) = res.record {
-                    updates.push((*handle, self.capture_anchor(source, record, ctx)?));
+                    updates.push((
+                        *handle,
+                        Self::anchor_at(source, new_spec.as_ref(), record, ctx)?,
+                    ));
                 }
             }
         }
-        let mut changed = false;
+        // Commit: adopt the new spec, then swap in the recomputed anchors.
+        let mut changed = self.key_spec != new_spec;
+        self.key_spec = new_spec;
         for (handle, anchor) in updates {
             if let Some(entry) = self.rows.get_mut(&handle) {
                 if entry.anchor != anchor {
@@ -1490,6 +1526,19 @@ impl AnnotationRegistry {
         f(guard.entry(doc_id).or_default())
     }
 
+    /// Clone the store for `doc_id` WITHOUT creating one on miss. Returns `None`
+    /// when the document has no annotation store (e.g. it was just closed and
+    /// its entry removed). Callers must treat a miss as "nothing to persist" —
+    /// resurrecting an empty store here would let a fire-and-forget sidecar save
+    /// that races a tab close DELETE the existing notes file.
+    pub fn clone_existing(&self, doc_id: u64) -> AppResult<Option<AnnotationStore>> {
+        let guard = self
+            .0
+            .lock()
+            .map_err(|_| AppError::Other("internal annotation lock error".into()))?;
+        Ok(guard.get(&doc_id).cloned())
+    }
+
     /// Replace the store for `doc_id`.
     pub fn set(&self, doc_id: u64, store: AnnotationStore) -> AppResult<()> {
         let mut guard = self
@@ -1643,6 +1692,104 @@ mod tests {
         let gone = source(&[("1", "Ada"), ("3", "Cy")]);
         let report = store.rematch_report(&gone, None).unwrap();
         assert_eq!(report.orphaned.len(), 1);
+    }
+
+    // ----- changing the key spec re-anchors existing annotations (P1) ------
+
+    #[test]
+    fn set_key_spec_and_reanchor_clearing_keeps_annotations_matched() {
+        // Keyed by c0, star Bob (key "2"). Clearing the spec must re-anchor Bob
+        // to a RECORD anchor on the SAME row, not orphan the note. (The old
+        // two-step set_key_spec-then-reanchor resolved the leftover key anchor
+        // under the now-empty spec and orphaned every keyed annotation.)
+        let mut store = AnnotationStore::default();
+        store.set_key_spec(Some(key_spec(&["c0"])));
+        let s = source(&[("1", "Ada"), ("2", "Bob"), ("3", "Cy")]);
+        store.edit_row_marks(&s, 1, &marks_star(), None).unwrap();
+        assert_eq!(store.rows.values().next().unwrap().anchor.kind(), "key");
+
+        store.set_key_spec_and_reanchor(&s, None, None).unwrap();
+
+        let view = store.view(&s, 1, None).unwrap();
+        assert_eq!(view.matched, 1, "the note stays on its row after clearing");
+        assert_eq!(view.orphaned, 0);
+        assert_eq!(view.entries[0].record, Some(1));
+        assert_eq!(view.entries[0].anchor_kind, "record");
+        assert!(view.entries[0].star);
+    }
+
+    #[test]
+    fn set_key_spec_and_reanchor_switching_columns_follows_new_key() {
+        // Keyed by c0 (id): star Bob (key "2"). Switch the key to c1 (name): the
+        // note stays matched and now follows the NAME, not the id.
+        let mut store = AnnotationStore::default();
+        store.set_key_spec(Some(key_spec(&["c0"])));
+        let s = source(&[("1", "Ada"), ("2", "Bob")]);
+        store.edit_row_marks(&s, 1, &marks_star(), None).unwrap();
+
+        store
+            .set_key_spec_and_reanchor(&s, Some(key_spec(&["c1"])), None)
+            .unwrap();
+        let view = store.view(&s, 1, None).unwrap();
+        assert_eq!(view.matched, 1);
+        assert_eq!(view.entries[0].record, Some(1));
+        assert_eq!(view.entries[0].anchor_kind, "key");
+
+        // Change Bob's id but keep the name, and reorder: the note follows the
+        // NAME key to its new row — proof it re-anchored to c1, not c0.
+        let changed = source(&[("9", "Bob"), ("1", "Ada")]);
+        let view = store.view(&changed, 1, None).unwrap();
+        assert_eq!(view.matched, 1);
+        assert_eq!(view.entries[0].record, Some(0));
+    }
+
+    #[test]
+    fn set_key_spec_and_reanchor_upgrades_record_anchors_to_key() {
+        // No spec: star Bob as a RECORD anchor. Setting a key spec upgrades the
+        // matched note to a KEY anchor on the same row.
+        let mut store = AnnotationStore::default();
+        let s = source(&[("1", "Ada"), ("2", "Bob")]);
+        store.edit_row_marks(&s, 1, &marks_star(), None).unwrap();
+        assert_eq!(store.rows.values().next().unwrap().anchor.kind(), "record");
+
+        store
+            .set_key_spec_and_reanchor(&s, Some(key_spec(&["c0"])), None)
+            .unwrap();
+        assert_eq!(store.rows.values().next().unwrap().anchor.kind(), "key");
+
+        // Reorder: the key "2" follows Bob to record 2.
+        let reordered = source(&[("1", "Ada"), ("9", "z"), ("2", "Bob")]);
+        let view = store.view(&reordered, 1, None).unwrap();
+        assert_eq!(view.matched, 1);
+        assert_eq!(view.entries[0].record, Some(2));
+    }
+
+    #[test]
+    fn set_key_spec_and_reanchor_never_reattaches_uncertain_rows() {
+        // Keyed by c0, star Bob (key "2"). Against a source where key "2" is
+        // duplicated the note is AMBIGUOUS under the old spec; switching the key
+        // spec must NEVER silently pin it to one of the duplicates — it stays
+        // out of the matched set (surfaced in the review list), never lost or
+        // moved. This is the F40 "never attach to an uncertain row" invariant.
+        let mut store = AnnotationStore::default();
+        store.set_key_spec(Some(key_spec(&["c0"])));
+        let s = source(&[("1", "Ada"), ("2", "Bob")]);
+        store.edit_row_marks(&s, 1, &marks_star(), None).unwrap();
+
+        let dup = source(&[("2", "P"), ("2", "Q")]);
+        store
+            .set_key_spec_and_reanchor(&dup, Some(key_spec(&["c1"])), None)
+            .unwrap();
+
+        let report = store.rematch_report(&dup, None).unwrap();
+        assert_eq!(
+            report.matched, 0,
+            "an ambiguous note is never auto-anchored"
+        );
+        assert!(
+            store.rows.values().next().unwrap().star,
+            "the note survives for review",
+        );
     }
 
     #[test]
@@ -1984,5 +2131,78 @@ mod tests {
         // A pure rematch/view never bumps the revision.
         store.view(&s, 1, None).unwrap();
         assert_eq!(store.revision(), r1);
+    }
+
+    #[test]
+    fn clone_existing_does_not_resurrect_a_closed_store() {
+        let reg = AnnotationRegistry::default();
+        // Miss: returns None and creates NO phantom entry — so a fire-and-forget
+        // sidecar save that races a tab close is skipped, never deleting the
+        // existing notes file.
+        assert!(reg.clone_existing(7).unwrap().is_none());
+        assert!(
+            reg.0.lock().unwrap().is_empty(),
+            "a miss must not resurrect an empty store",
+        );
+        // Present: returns a clone of the real store.
+        reg.with(7, |s| s.set_author(Some("ada".into()))).unwrap();
+        let cloned = reg.clone_existing(7).unwrap().expect("store present");
+        assert_eq!(cloned.author(), Some("ada"));
+    }
+
+    #[test]
+    fn tag_to_existing_strict_column_is_rejected_by_validation() {
+        use crate::document::Document;
+        use crate::parse::{parse, ParseSettings};
+        use crate::schema::{ColumnSchema, LogicalType, ValidationMode};
+        use crate::tabular::DocumentSource;
+
+        // A strict INTEGER column "n" (plus a free-text "label").
+        let parsed = parse(
+            "n,label\n1,a\n2,b\n3,c\n".as_bytes(),
+            &ParseSettings::default(),
+        )
+        .unwrap();
+        let mut doc = Document::from_parsed(1, None, parsed, true);
+        let n_id = doc.column_ids()[0].clone();
+        let n_name = doc.headers()[0].clone();
+        let mut schema = ColumnSchema::new(n_id, n_name, LogicalType::Integer);
+        schema.validation_mode = ValidationMode::Strict;
+        doc.set_column_schema(schema);
+
+        // Tag row 1 with "review".
+        let mut store = AnnotationStore::default();
+        {
+            let src = DocumentSource::new(&doc);
+            store
+                .edit_row_marks(
+                    &src,
+                    1,
+                    &RowMarkPatch {
+                        add_tags: vec!["review".into()],
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        // The writes apply_tag_to_column would push into the strict column 0.
+        let writes = {
+            let src = DocumentSource::new(&doc);
+            store.tag_to_column_writes(&src, "review", None).unwrap()
+        };
+        assert_eq!(writes, vec![(1u64, "review".to_string())]);
+        let changes: Vec<(usize, usize, String)> = writes
+            .into_iter()
+            .map(|(r, v)| (r as usize, 0, v))
+            .collect();
+
+        // The validated path (what apply_tag_to_column now routes through)
+        // REJECTS the whole batch — a raw doc.set_cells would have silently
+        // committed "review" into an integer column.
+        let before = doc.rows()[1][0].clone();
+        let err = crate::schema_ops::apply_validated_cells(&mut doc, changes).unwrap_err();
+        assert!(err.to_string().contains("invalid value for column"));
+        assert_eq!(doc.rows()[1][0], before, "the model was never touched");
     }
 }

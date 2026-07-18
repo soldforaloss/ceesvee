@@ -2136,8 +2136,10 @@ pub fn annotations_set_key_spec(
     edit_annotations(&state, &annotations, doc_id, |doc, store| {
         store.check_revision(expected_annotations_revision)?;
         let source = DocumentSource::new(doc);
-        store.set_key_spec(key_spec);
-        store.reanchor(&source, None)?;
+        // Re-anchor the existing annotations under the new spec, resolving them
+        // under the OLD spec first so keyed notes are not orphaned or silently
+        // reattached to the wrong row.
+        store.set_key_spec_and_reanchor(&source, key_spec, None)?;
         store.view(&source, doc.revision(), None)
     })
 }
@@ -2371,7 +2373,12 @@ pub fn apply_tag_to_column(
                 .into_iter()
                 .map(|(record, value)| (record as usize, column, value))
                 .collect();
-            doc.set_cells(changes)?;
+            // Route through the F31 validation path, exactly like an ordinary
+            // cell edit: a strict integer/date/boolean target rejects the whole
+            // batch instead of committing tag text it would otherwise refuse;
+            // an advisory column applies and records issues. Same undo shape as
+            // a direct set_cells.
+            schema_ops::apply_validated_cells(&mut doc, changes)?;
         }
     }
     Ok(doc.meta())
@@ -2451,7 +2458,12 @@ pub fn annotations_save_sidecar(
     source_path: String,
     annotations: State<'_, AnnotationRegistry>,
 ) -> AppResult<()> {
-    let store = annotations.try_with(doc_id, |store| Ok(store.clone()))?;
+    // A fire-and-forget save can race a tab close that already removed the
+    // registry entry. Do NOT resurrect an empty store on a miss — that would
+    // delete the existing notes file. No store means nothing to persist.
+    let Some(store) = annotations.clone_existing(doc_id)? else {
+        return Ok(());
+    };
     annotations::save_sidecar(Path::new(&source_path), &store)
 }
 

@@ -1158,6 +1158,15 @@ interface Store {
   project: ProjectMeta | null;
   /** UI snapshot captured at the last save/open, for dirty derivation. */
   projectBaseline: ProjectSnapshot | null;
+  /**
+   * Whether project-backed annotations changed since the last project save/open.
+   * Annotations are not part of the {@link ProjectSnapshot} (they live in the
+   * backend registry and are captured into the project's `annotations` section
+   * on save), so an annotation edit is tracked with this explicit flag to keep
+   * `isProjectDirty()` honest — otherwise adding a note in a project would leave
+   * the project falsely clean and quit/discard would drop it.
+   */
+  projectAnnotationsDirty: boolean;
   /** The open-dialog preview awaiting per-source resolutions, if any. */
   projectOpen: ProjectOpenPreview | null;
   /** Per-source choices in the open dialog, by source id. */
@@ -1712,15 +1721,19 @@ export const useStore = create<Store>((set, get) => {
    * The two backing stores are mutually exclusive per the spec's migration
    * rule: when a PROJECT is open the annotations live in the project's
    * `annotations` section (captured into the ProjectStore on the next project
-   * save, exactly like tabs/layout/views — never in the sidecar), so this is a
-   * no-op. With no project open the durable store is the source's
-   * `.ceesvee-notes.json` sidecar; an empty store deletes it (the backend
-   * handles that). A path-less document (new/derived) has nowhere to write, so
-   * this is a no-op there too. Write failures are swallowed — they surface on
-   * the next explicit save/export instead of interrupting an annotation edit.
+   * save, exactly like tabs/layout/views — never in the sidecar), so instead of
+   * writing a sidecar we mark the project dirty, so quit/close prompts to save
+   * the edit rather than dropping it. With no project open the durable store is
+   * the source's `.ceesvee-notes.json` sidecar; an empty store deletes it (the
+   * backend handles that). A path-less document (new/derived) has nowhere to
+   * write, so this is a no-op there too. Write failures are swallowed — they
+   * surface on the next explicit save/export instead of interrupting an edit.
    */
   const persistAnnotationSidecar = (docId: number, path: string | null) => {
-    if (get().project) return;
+    if (get().project) {
+      if (!get().projectAnnotationsDirty) set({ projectAnnotationsDirty: true });
+      return;
+    }
     if (!path) return;
     void api.annotationsSaveSidecar(docId, path).catch(() => undefined);
   };
@@ -1893,8 +1906,7 @@ export const useStore = create<Store>((set, get) => {
    * that would replace it (new / open). Returns whether to proceed.
    */
   const guardDiscardProject = async (): Promise<boolean> => {
-    const s = get();
-    if (!s.project || !deriveProjectDirty(s.projectBaseline, currentProjectSnapshot())) return true;
+    if (!get().isProjectDirty()) return true;
     return ask("Discard unsaved changes to the current project?", {
       title: "Discard project changes",
       kind: "warning",
@@ -2031,6 +2043,7 @@ export const useStore = create<Store>((set, get) => {
     set({
       project: plan.meta,
       projectBaseline: currentProjectSnapshot(),
+      projectAnnotationsDirty: false,
       projectWarnings: gatingWarnings(plan.entries),
       projectOpen: null,
       projectOpenChoices: {},
@@ -2111,6 +2124,7 @@ export const useStore = create<Store>((set, get) => {
     quitPromptOpen: false,
     project: null,
     projectBaseline: null,
+    projectAnnotationsDirty: false,
     projectOpen: null,
     projectOpenChoices: {},
     projectWarnings: [],
@@ -4889,6 +4903,7 @@ export const useStore = create<Store>((set, get) => {
     isProjectDirty: () => {
       const s = get();
       if (!s.project) return false;
+      if (s.projectAnnotationsDirty) return true;
       return deriveProjectDirty(s.projectBaseline, currentProjectSnapshot());
     },
 
@@ -4899,6 +4914,7 @@ export const useStore = create<Store>((set, get) => {
         set({
           project: meta,
           projectBaseline: currentProjectSnapshot(),
+          projectAnnotationsDirty: false,
           projectWarnings: [],
           projectOpen: null,
           projectOpenChoices: {},
@@ -4977,7 +4993,11 @@ export const useStore = create<Store>((set, get) => {
         } else {
           meta = await api.projectSave();
         }
-        set({ project: meta, projectBaseline: currentProjectSnapshot() });
+        set({
+          project: meta,
+          projectBaseline: currentProjectSnapshot(),
+          projectAnnotationsDirty: false,
+        });
         return true;
       } catch (e) {
         set({ error: String(e) });
@@ -5011,6 +5031,7 @@ export const useStore = create<Store>((set, get) => {
       set({
         project: null,
         projectBaseline: null,
+        projectAnnotationsDirty: false,
         projectWarnings: [],
         projectClosePromptOpen: false,
         projectOpen: null,
@@ -5514,13 +5535,14 @@ export function useActiveMeta(): DocumentMeta | null {
 
 /**
  * Whether the open project has unsaved changes (F37). Derived reactively from
- * the open documents, active tab, panel layout and each document's active named
- * view versus the snapshot captured at the last save/open, so the dirty dot
- * updates without event bookkeeping.
+ * the open documents, active tab, panel layout, each document's active named
+ * view and the annotations-dirty flag versus the snapshot captured at the last
+ * save/open, so the dirty dot updates without event bookkeeping.
  */
 export function useProjectDirty(): boolean {
   return useStore((s) => {
     if (s.project == null) return false;
+    if (s.projectAnnotationsDirty) return true;
     const activeViews: Record<number, string | null> = {};
     for (const t of s.tabs) {
       activeViews[t.id] =
