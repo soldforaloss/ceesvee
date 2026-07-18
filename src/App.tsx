@@ -27,6 +27,7 @@ import { ExternalChangeDialog } from "./components/ExternalChangeDialog";
 import { FilterDialog } from "./components/FilterDialog";
 import { FindBar } from "./components/FindBar";
 import { FollowBar } from "./components/FollowBar";
+import { FormView } from "./components/FormView";
 import { ViewsDialog } from "./components/ViewsDialog";
 import { ViewWarningBar } from "./components/ViewWarningBar";
 import { Grid } from "./components/Grid";
@@ -294,6 +295,7 @@ export default function App() {
         {changesOpen && meta && <ChangesPanel />}
         {annotationsPanelOpen && meta && <AnnotationsPanel />}
         {meta && <ColumnExplorerPanel />}
+        {meta && <FormView />}
       </main>
 
       <StatusBar />
