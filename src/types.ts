@@ -2307,6 +2307,9 @@ export interface ProjectSections {
   sources?: ProjectSource[];
   tabs?: ProjectTabsSection;
   layout?: ProjectLayoutSection | null;
+  /** F36 saved query definitions (sql + typed params + source refs). Never
+   * results, never auto-run — loading a project stores them verbatim. */
+  queries?: SavedQuery[];
   [section: string]: unknown;
 }
 
@@ -2986,4 +2989,150 @@ export interface DbExportResult {
   rowsWritten: number;
   /** Rows skipped by the "skip" conflict policy. */
   rowsSkipped: number;
+}
+
+// ---------------------------------------------------------------------------
+// Sandboxed SQL query workspace (F36)
+// ---------------------------------------------------------------------------
+
+/** The value types the typed parameter editor offers. Mirrors the Rust enum;
+ * values are always BOUND (never interpolated) by the engine. */
+export type SqlParamType =
+  | "text"
+  | "integer"
+  | "decimal"
+  | "float"
+  | "boolean"
+  | "date"
+  | "datetime"
+  | "null";
+
+/** One typed named parameter (`:name`, without the leading colon). `null`-typed
+ * params ignore `value`; every other type is validated before binding. */
+export interface SqlParam {
+  name: string;
+  type: SqlParamType;
+  value?: string | null;
+}
+
+/** Per-run execution caps; omitted fields use the engine defaults and are
+ * clamped to hard caps. */
+export interface SqlLimits {
+  maxRows?: number;
+  maxBytes?: number;
+  timeLimitMs?: number;
+}
+
+/** One open document exposed as a table. */
+export interface SqlDocRef {
+  docId: number;
+  /** Optional alias override; sanitized and de-duplicated either way. */
+  alias?: string | null;
+}
+
+/** The sources a query (or the schema browser) composes. */
+export interface SqlSourceSelection {
+  documents: SqlDocRef[];
+  /** Registered approved-file aliases. */
+  files: string[];
+  /** Path of an approved SQLite database (at most one). */
+  database?: string | null;
+}
+
+/** One run/validate/explain request. */
+export interface SqlRunRequest {
+  sql: string;
+  params: SqlParam[];
+  sources: SqlSourceSelection;
+  limits: SqlLimits;
+}
+
+/** One column of a schema-browser table entry. */
+export interface SqlColumnInfo {
+  name: string;
+  /** Logical type label for display ("text", "integer", …). */
+  declType: string;
+}
+
+/** One queryable table for the schema browser / autocomplete. */
+export interface SqlTableInfo {
+  /** The name to use in SQL. */
+  alias: string;
+  /** Human label (file / table name). */
+  label: string;
+  /** "document" | "csv" | "json" | "parquet" | "arrow" | "table" | "view". */
+  kind: string;
+  columns: SqlColumnInfo[];
+  columnsTruncated: boolean;
+  rowCount?: number | null;
+  /** Backing file path, for registered files. */
+  path?: string | null;
+}
+
+/** Bounded schema-browser / autocomplete payload for a selection. */
+export interface SqlSchemaDto {
+  documents: SqlTableInfo[];
+  files: SqlTableInfo[];
+  database: SqlTableInfo[];
+  databaseTruncated: boolean;
+}
+
+/** Prepare-only dry-run outcome. */
+export interface SqlValidation {
+  ok: boolean;
+  error?: string | null;
+  /** Output columns, when the statement prepares. */
+  columns: string[];
+  /** Named parameters the statement uses (without the colon). */
+  parameters: string[];
+}
+
+/** One node of the EXPLAIN QUERY PLAN tree. */
+export interface SqlPlanNode {
+  id: number;
+  detail: string;
+  children: SqlPlanNode[];
+}
+
+/** Summary of a run: the stored spool's id plus its first bounded window. */
+export interface SqlRunSummary {
+  resultId: number;
+  columns: string[];
+  /** First window of rows (`null` = SQL NULL). */
+  rows: (string | null)[][];
+  rowCount: number;
+  truncated: boolean;
+  byteCount: number;
+  elapsedMs: number;
+}
+
+/** One window of a stored result. */
+export interface SqlResultWindow {
+  start: number;
+  rows: (string | null)[][];
+  total: number;
+  truncated: boolean;
+}
+
+/** One persisted history entry (data only — never auto-executed). */
+export interface SqlHistoryEntry {
+  sql: string;
+  params: SqlParam[];
+  /** Aliases / paths of the sources the query ran against. */
+  sources: string[];
+  ranAtMs: number;
+  /** "done" | "failed" | "cancelled". */
+  status: string;
+  rowCount?: number | null;
+  error?: string | null;
+}
+
+/** A saved query definition in the project `queries` section: definitions only
+ * (sql + typed params + source refs), never results, never auto-run. */
+export interface SavedQuery {
+  id: string;
+  name: string;
+  sql: string;
+  params: SqlParam[];
+  sources: string[];
 }
