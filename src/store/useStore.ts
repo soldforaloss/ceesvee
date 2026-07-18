@@ -119,8 +119,10 @@ import type {
   TagDef,
   TagToColumnPreview,
   TagToColumnTarget,
+  RecordLayout,
 } from "../types";
 import type { GatingWarning } from "../lib/project";
+import { clampRecord, type RecordDraft } from "../lib/recordForm";
 
 export type ThemePref = "light" | "dark" | "system";
 
@@ -388,7 +390,35 @@ export interface DocumentUiState {
   viewSortKeys: SortKey[];
   /** F12: dismissible missing-column warning from the last view apply. */
   viewWarning: string | null;
+  /** F41: per-document record-form position, draft and layout. */
+  record: RecordUiState;
 }
+
+/**
+ * The per-document record-form state (F41): which record is shown, the unsaved
+ * field draft, and the persisted layout. Snapshotted/restored with the rest of
+ * the document UI state on a tab switch, so a draft or grouping survives it.
+ */
+export interface RecordUiState {
+  /** Current visible (display) row shown in the form. */
+  row: number;
+  /** Drafted raw values keyed by grid column position (empty = clean). */
+  draft: RecordDraft;
+  /** Document revision the current draft was started against (null = clean).
+   * A refetch at a different revision discards the draft (the row may have
+   * remapped under a changed filter), so an edit never lands on a moved row. */
+  draftRevision: number | null;
+  /** Persisted per-document form layout (null = automatic, schema order). */
+  layout: RecordLayout | null;
+}
+
+/** A fresh, clean record-form state (fresh objects — never shared). */
+const initialRecordUi = (): RecordUiState => ({
+  row: 0,
+  draft: {},
+  draftRevision: null,
+  layout: null,
+});
 
 /** A matched profile suggestion awaiting the user's decision. */
 export interface ProfileSuggestion {
@@ -704,6 +734,26 @@ interface Store {
   viewSortKeys: SortKey[];
   /** F12: dismissible missing-column warning from the last view apply. */
   viewWarning: string | null;
+  /** F41: the ACTIVE document's record-form position, draft and layout. */
+  record: RecordUiState;
+  /** Whether the record-form side panel is open (F41). */
+  recordFormOpen: boolean;
+  /** Open/close the record-form panel (one side panel is shown at a time). */
+  setRecordFormOpen: (open: boolean) => void;
+  /** Move the form to a visible record; resets the draft (a draft can't move). */
+  setRecordRow: (row: number) => void;
+  /** Set one field's drafted raw value (seeds the draft revision on first edit). */
+  setRecordDraftField: (col: number, value: string) => void;
+  /** Discard the whole record draft. */
+  clearRecordDraft: () => void;
+  /** Commit a record draft as ONE set_cells batch; clears the draft on success. */
+  saveRecordDraft: (cells: [number, number, string][]) => Promise<boolean>;
+  /** Replace the ACTIVE document's record-form layout (null = automatic). */
+  setRecordLayout: (layout: RecordLayout | null) => void;
+  /** Scroll the grid to a field's column on the current record's row (F41). */
+  jumpToRecordColumn: (col: number) => void;
+  /** Persist the F41 auto-save-on-navigate preference with the app settings. */
+  setAutoSaveRecordOnNavigate: (enabled: boolean) => Promise<void>;
   /** F12: one-shot auto-fit request consumed by the grid. */
   autoFitRequest: { cols: number[] | "all"; nonce: number } | null;
   /** Saved UI state of every non-active document, keyed by document id. */
@@ -1365,6 +1415,7 @@ export const useStore = create<Store>((set, get) => {
     activeViewId: null,
     viewSortKeys: [],
     viewWarning: null,
+    record: initialRecordUi(),
   });
 
   /**
@@ -1401,6 +1452,7 @@ export const useStore = create<Store>((set, get) => {
         activeViewId: s.activeViewId,
         viewSortKeys: s.viewSortKeys,
         viewWarning: s.viewWarning,
+        record: s.record,
       };
     }
     const next = (id != null ? uiStates[id] : undefined) ?? defaultUiState();
@@ -1423,6 +1475,7 @@ export const useStore = create<Store>((set, get) => {
       activeViewId: next.activeViewId,
       viewSortKeys: next.viewSortKeys,
       viewWarning: next.viewWarning,
+      record: next.record,
       autoFitRequest: null,
       summaries: null,
       summariesDocId: null,
@@ -2068,6 +2121,8 @@ export const useStore = create<Store>((set, get) => {
     activeViewId: null,
     viewSortKeys: [],
     viewWarning: null,
+    record: initialRecordUi(),
+    recordFormOpen: false,
     autoFitRequest: null,
     uiStates: {},
     summaries: null,
@@ -4030,6 +4085,7 @@ export const useStore = create<Store>((set, get) => {
         changesOpen: open ? false : s.changesOpen,
         explorer: open ? { ...s.explorer, open: false } : s.explorer,
         annotationsPanelOpen: open ? false : s.annotationsPanelOpen,
+        recordFormOpen: open ? false : s.recordFormOpen,
       })),
 
     setChangesOpen: (open) =>
@@ -4038,7 +4094,94 @@ export const useStore = create<Store>((set, get) => {
         diagnosticsOpen: open ? false : s.diagnosticsOpen,
         explorer: open ? { ...s.explorer, open: false } : s.explorer,
         annotationsPanelOpen: open ? false : s.annotationsPanelOpen,
+        recordFormOpen: open ? false : s.recordFormOpen,
       })),
+
+    // ----- record form (F41) ------------------------------------------------
+
+    setRecordFormOpen: (open) =>
+      set((s) => {
+        const meta = s.tabs.find((t) => t.id === s.activeId);
+        // Clamp the remembered record into the current visible range on open,
+        // so a filter applied since it was last shown can't strand the form.
+        const row = clampRecord(s.record.row, meta?.rowCount ?? 0) ?? 0;
+        // If the row had to move, its draft no longer belongs to the shown
+        // record — drop it; an unchanged row keeps its draft across a reopen.
+        const record = !open
+          ? s.record
+          : row === s.record.row
+            ? { ...s.record, row }
+            : { ...s.record, row, draft: {}, draftRevision: null };
+        return {
+          recordFormOpen: open,
+          record,
+          // One side panel at a time.
+          changesOpen: open ? false : s.changesOpen,
+          diagnosticsOpen: open ? false : s.diagnosticsOpen,
+          explorer: open ? { ...s.explorer, open: false } : s.explorer,
+        };
+      }),
+
+    setRecordRow: (row) =>
+      set((s) => ({
+        // Moving to another record always starts clean — a draft belongs to the
+        // record it was made on; the caller resolves it (save/discard) first.
+        record: { ...s.record, row, draft: {}, draftRevision: null },
+      })),
+
+    setRecordDraftField: (col, value) =>
+      set((s) => ({
+        record: {
+          ...s.record,
+          draft: { ...s.record.draft, [col]: value },
+          // Pin the draft to the revision it began at, so a later refetch at a
+          // different revision can safely discard it (the row may have moved).
+          draftRevision: s.record.draftRevision ?? activeMeta()?.revision ?? null,
+        },
+      })),
+
+    clearRecordDraft: () =>
+      set((s) => ({ record: { ...s.record, draft: {}, draftRevision: null } })),
+
+    saveRecordDraft: async (cells) => {
+      const id = get().activeId;
+      if (id == null || cells.length === 0) return false;
+      try {
+        // One batched, F31-validated commit → exactly one undo step for the
+        // whole record. A strict-invalid batch is rejected here (the UI gates
+        // Save on the pre-check, so this is defence in depth).
+        const meta = await api.setCells(id, cells);
+        reloadDoc(meta);
+        set((s) => ({ record: { ...s.record, draft: {}, draftRevision: null } }));
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    setRecordLayout: (layout) => set((s) => ({ record: { ...s.record, layout } })),
+
+    jumpToRecordColumn: (col) => {
+      // The record row is a DISPLAY coordinate already (fetch_record used
+      // display coords), so — unlike a diagnostics jump — the row view must NOT
+      // be reset; the grid maps the physical column to its display position.
+      jumpNonce += 1;
+      set((s) => ({ jumpTarget: { row: s.record.row, col, nonce: jumpNonce } }));
+    },
+
+    setAutoSaveRecordOnNavigate: async (enabled) => {
+      const settings: AppSettings = {
+        ...(get().settings ?? { version: 1, profiles: [] }),
+        autoSaveRecordOnNavigate: enabled,
+      };
+      set({ settings });
+      try {
+        await api.setSettings(settings);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
 
     runDiagnosticsScan: async () => {
       const meta = activeMeta();
@@ -5399,6 +5542,7 @@ export const useStore = create<Store>((set, get) => {
         explorer: { ...s.explorer, open },
         // The side area shows one panel at a time.
         diagnosticsOpen: open ? false : s.diagnosticsOpen,
+        recordFormOpen: open ? false : s.recordFormOpen,
       }));
       if (open) void get().refreshExplorerProfile();
     },

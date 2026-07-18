@@ -1309,6 +1309,12 @@ export interface AppSettings {
   recoveryEnabled?: boolean;
   /** F16: journals older than this many days are swept at startup. */
   recoveryRetentionDays?: number;
+  /**
+   * F41: when navigating between records with unsaved field edits, save the
+   * draft automatically instead of prompting. A strict-invalid draft still
+   * prompts (it cannot be committed). Defaults to off (prompt).
+   */
+  autoSaveRecordOnNavigate?: boolean;
 }
 
 /** One recoverable session found at startup (F16). */
@@ -1500,6 +1506,127 @@ export interface SchemaIssue {
   reason: string;
   /** Document revision AFTER the edit was applied. */
   revision: number;
+}
+
+// ----- record form view (F41) ----------------------------------------------
+
+/**
+ * Five-way classification of a stored cell under the declared schema (mirrors
+ * Rust `record::CellClass`). `missing` = absent from a ragged short row;
+ * `nullToken` = a configured null token; `empty` = blank and not a token;
+ * `valid` = well-formed under the type (or plain text with no schema);
+ * `invalid` = present but does not parse as the declared type.
+ */
+export type CellClass = "missing" | "nullToken" | "empty" | "valid" | "invalid";
+
+/**
+ * One field of the record form (mirrors Rust `record::RecordField`): the stored
+ * cell joined with the schema, dictionary and semantic metadata the form needs
+ * to label, validate and act on it. Optional fields are omitted by the backend
+ * when unset (and `nullTokens` / `issues` when empty).
+ */
+export interface RecordField {
+  /** Grid (physical) column position — the jump-to-grid target and the
+   * coordinate a draft edit is committed at. */
+  col: number;
+  columnId: string;
+  /** Technical header — the source-of-truth field name. */
+  header: string;
+  /** Stored cell text, verbatim (what an edit replaces). */
+  raw: string;
+  /** F31 display-formatted rendering; equals `raw` whenever no display pattern
+   * applies or the cell is not a valid typed value, so raw and display never
+   * disagree about the stored value. */
+  display: string;
+  class: CellClass;
+  invalidReason?: string;
+  logicalType?: LogicalType;
+  nullable?: boolean;
+  /** Configured null tokens (empty unless the schema declares them). Drives the
+   * null-vs-blank control — only offered when this list is non-empty. */
+  nullTokens?: string[];
+  validationMode?: ValidationMode;
+  /** Whether the STORED value satisfies the declared type (true when no schema).
+   * Can be false when the schema was tightened after the data landed. */
+  valid: boolean;
+  reason?: string;
+  /** Joined data-dictionary entry (F38), by column ID. */
+  dictionary?: DictionaryField;
+  /** Detected semantic badge (F26) from the last cached scan, best-effort. */
+  semantic?: SemanticType;
+  semanticConfidence?: number;
+  /** Recorded advisory schema issues for THIS cell (F31), oldest first. */
+  issues?: SchemaIssue[];
+}
+
+/** The complete record-form view for one visible row (mirrors `RecordView`). */
+export interface RecordView {
+  /** The visible (display) row index requested. */
+  displayRow: number;
+  /** The absolute (unfiltered) row the fields were read from. */
+  absRow: number;
+  /** Visible row count at fetch time — the bound for go-to-record and nav. */
+  visibleLen: number;
+  /** Read-only form: an indexed or follow-mode document accepts no edits. */
+  readOnly: boolean;
+  /** Document revision the fields were read at (guards a stale draft save). */
+  revision: number;
+  schemaRevision: number;
+  dictionaryRevision: number;
+  fields: RecordField[];
+}
+
+/** One proposed field edit in a record draft (mirrors `record::DraftField`). */
+export interface DraftField {
+  col: number;
+  value: string;
+}
+
+/** The verdict on one drafted field (mirrors `record::DraftFieldVerdict`). */
+export interface DraftFieldVerdict {
+  col: number;
+  columnId?: string;
+  valid: boolean;
+  reason?: string;
+  /** The column's validation mode; absent = no schema (anything goes). */
+  mode?: ValidationMode;
+  /** Whether THIS field's violation would BLOCK the commit (invalid + strict). */
+  blocks: boolean;
+}
+
+/** The verdict on a whole record draft (mirrors `record::DraftValidation`). */
+export interface DraftValidation {
+  fields: DraftFieldVerdict[];
+  /** Any strict column carries an invalid value: the batch would be rejected. */
+  strictBlocks: boolean;
+  /** How many advisory columns would record an issue on save. */
+  advisoryWarnings: number;
+  revision: number;
+}
+
+/** Record-form density (F41 layout). */
+export type RecordDensity = "comfortable" | "compact";
+
+/** A user-defined field group in the record-form layout (F41). */
+export interface RecordFieldGroup {
+  /** Stable client-generated id. */
+  id: string;
+  name: string;
+  /** Stable column IDs assigned to this group, in order. */
+  columnIds: string[];
+}
+
+/**
+ * The persisted per-document record-form layout (F41). `null` = automatic
+ * (schema order, comfortable density, nothing hidden). Kept in the per-document
+ * UI state like F08/F12 layout so it survives tab switches.
+ */
+export interface RecordLayout {
+  density: RecordDensity;
+  /** Stable column IDs hidden from the form. */
+  hiddenColumnIds: string[];
+  /** User-defined groups; fields in no group render in a default section. */
+  groups: RecordFieldGroup[];
 }
 
 // ----- JSON / JSON Lines interoperability (F33) -----------------------------

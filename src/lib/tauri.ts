@@ -116,6 +116,9 @@ import type {
   MergeMatchBy,
   MergePlan,
   MergeResolution,
+  RecordView,
+  DraftField,
+  DraftValidation,
 } from "../types";
 
 export const openFile = (path: string, options?: OpenOptions) =>
@@ -576,6 +579,27 @@ export const getSchemaIssues = (docId: number) =>
 
 /** Clear the recorded advisory-validation issues (F31). */
 export const clearSchemaIssues = (docId: number) => invoke<void>("clear_schema_issues", { docId });
+
+/**
+ * Assemble the F41 record-form view for ONE visible row (display coordinates,
+ * so filters and the view sort are honoured): per field the raw + display text,
+ * classification, stored-value validity, and joined schema/dictionary/semantic
+ * metadata. Bounded — exactly one row is read, even on an indexed document.
+ */
+export const fetchRecord = (docId: number, row: number) =>
+  invoke<RecordView>("fetch_record", { docId, row });
+
+/**
+ * Pre-check a whole record draft (the changed fields of one row) BEFORE commit:
+ * per-field verdicts plus whether a strict column blocks the batch. Pure —
+ * records nothing, so it cannot double-count advisory issues (F41).
+ */
+export const validateRecordDraft = (docId: number, edits: DraftField[]) =>
+  invoke<DraftValidation>("validate_record_draft", { docId, edits });
+
+/** The recorded advisory schema issues for ONE visible row (display coords, F41). */
+export const getRecordIssues = (docId: number, row: number) =>
+  invoke<SchemaIssue[]>("get_record_issues", { docId, row });
 
 /**
  * Start a bounded invalid-value scan of one column as a cancellable job (F31).
