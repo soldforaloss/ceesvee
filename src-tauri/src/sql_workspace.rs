@@ -95,6 +95,10 @@ const CSV_MEMORY_BUDGET: u64 = 64 * 1024 * 1024;
 const PROGRESS_STEP_OPS: std::ffi::c_int = 4_000;
 /// Cancellation check cadence in row loops.
 const CANCEL_EVERY: usize = 1024;
+/// Upper bound on EXPLAIN QUERY PLAN nodes collected. The planner's own
+/// compile-time limits already bound plan size, but the tree is shipped to the
+/// front end, so cap it like every other schema payload (defence in depth).
+const EXPLAIN_MAX_NODES: usize = 20_000;
 /// History ring capacity (most recent first).
 pub const SQL_HISTORY_CAP: usize = 100;
 
@@ -1124,11 +1128,16 @@ pub(crate) fn validate_query(conn: &Connection, sql: &str) -> SqlValidation {
     }
 }
 
-/// `EXPLAIN QUERY PLAN` for a pre-validated statement, as a tree.
+/// `EXPLAIN QUERY PLAN` for a pre-validated statement, as a tree. Bounded like
+/// every other steppable path in the module: a progress handler polls both the
+/// deadline and job cancellation, node collection is capped, and the handler
+/// is always cleared before returning so the connection stays reusable.
 pub(crate) fn explain_plan(
     conn: &Connection,
     sql: &str,
     params: &[SqlParam],
+    limits: &ResolvedLimits,
+    ctx: Option<&JobCtx>,
 ) -> AppResult<Vec<SqlPlanNode>> {
     check_statement_kind(sql)?;
     if leading_keyword(sql)? == "EXPLAIN" {
@@ -1136,6 +1145,40 @@ pub(crate) fn explain_plan(
             "the statement is already an EXPLAIN; run it directly instead",
         ));
     }
+    let deadline = Instant::now() + limits.time_limit;
+    let token: Option<CancelToken> = ctx.map(JobCtx::cancel_token);
+    {
+        let token = token.clone();
+        conn.progress_handler(
+            PROGRESS_STEP_OPS,
+            Some(move || {
+                token.as_ref().is_some_and(CancelToken::is_cancelled) || Instant::now() >= deadline
+            }),
+        )?;
+    }
+    let result = explain_plan_collect(conn, sql, params, limits, ctx, deadline);
+    let _ = safe_query::clear_cancel_handler(conn);
+    match result {
+        // A progress-handler abort surfaces as Cancelled; when the job was
+        // NOT cancelled it was the deadline that fired.
+        Err(AppError::Cancelled)
+            if !token.as_ref().is_some_and(CancelToken::is_cancelled)
+                && Instant::now() >= deadline =>
+        {
+            Err(time_limit_error(limits.time_limit))
+        }
+        other => other,
+    }
+}
+
+fn explain_plan_collect(
+    conn: &Connection,
+    sql: &str,
+    params: &[SqlParam],
+    limits: &ResolvedLimits,
+    ctx: Option<&JobCtx>,
+    deadline: Instant,
+) -> AppResult<Vec<SqlPlanNode>> {
     // The authorizer vets the inner statement while the wrapped form
     // prepares, so DML cannot hide behind the wrapper; multi-statement input
     // still fails at prepare.
@@ -1150,6 +1193,15 @@ pub(crate) fn explain_plan(
     let mut flat: Vec<(i64, i64, String)> = Vec::new();
     let mut rows = stmt.raw_query();
     while let Some(row) = rows.next()? {
+        if flat.len() >= EXPLAIN_MAX_NODES {
+            break;
+        }
+        if let Some(ctx) = ctx {
+            ctx.check()?;
+        }
+        if Instant::now() >= deadline {
+            return Err(time_limit_error(limits.time_limit));
+        }
         let id: i64 = row.get(0)?;
         let parent: i64 = row.get(1)?;
         let detail: String = row.get(3)?;
@@ -1256,10 +1308,19 @@ pub(crate) struct AssembledSources {
 /// (file aliases are reserved first; document aliases dedupe against them
 /// in list order), and the optional database path (checked against the
 /// approved registry at connect).
+///
+/// Document/file vtabs land in the temp schema, which SQLite resolves BEFORE
+/// the main (database) schema for an unqualified name — so a source alias
+/// equal to a real table/view in the selected database would silently shadow
+/// it. When `strict_db_collision` is set (the executing paths — run, validate,
+/// explain) such a clash is refused with a clear error; the schema browser
+/// passes `false` so it can still enumerate every source.
 pub(crate) fn assemble_sources(
     state: &Mutex<AppState>,
     workspace: &SqlWorkspace,
+    approved: &ApprovedSources,
     selection: &SqlSourceSelection,
+    strict_db_collision: bool,
 ) -> AppResult<AssembledSources> {
     let files = workspace.resolve_files(&selection.files)?;
     let mut taken: Vec<String> = files.iter().map(|(a, _)| a.clone()).collect();
@@ -1301,11 +1362,68 @@ pub(crate) fn assemble_sources(
         docs.push((alias, handle));
     }
     let database = selection.database.as_ref().map(PathBuf::from);
+    if strict_db_collision {
+        if let Some(db_path) = &database {
+            let db_names = db_table_names(approved, db_path)?;
+            let aliases = docs
+                .iter()
+                .map(|(a, _)| a.as_str())
+                .chain(files.iter().map(|(a, _)| a.as_str()));
+            check_db_alias_collisions(aliases, &db_names)?;
+        }
+    }
     Ok(AssembledSources {
         docs,
         files,
         database,
     })
+}
+
+/// Top-level table/view names of an approved database, lowercased for the
+/// case-insensitive comparison SQLite applies to ASCII identifiers.
+fn db_table_names(
+    approved: &ApprovedSources,
+    path: &Path,
+) -> AppResult<std::collections::HashSet<String>> {
+    let canonical = approved.check(path)?;
+    let conn = safe_query::open_guarded(&canonical)?;
+    let mut names = std::collections::HashSet::new();
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_schema WHERE type IN ('table','view') \
+         AND name NOT LIKE 'sqlite_%'",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(0)?;
+        names.insert(name.to_ascii_lowercase());
+    }
+    Ok(names)
+}
+
+/// Refuse the query if any source alias collides (case-insensitively) with a
+/// selected-database table/view name: an unqualified reference would resolve to
+/// the temp-schema vtab, silently reading the file/document instead of the
+/// database table.
+fn check_db_alias_collisions<'a>(
+    aliases: impl Iterator<Item = &'a str>,
+    db_names: &std::collections::HashSet<String>,
+) -> AppResult<()> {
+    let mut clashes: Vec<String> = aliases
+        .filter(|a| db_names.contains(&a.to_ascii_lowercase()))
+        .map(str::to_string)
+        .collect();
+    if clashes.is_empty() {
+        return Ok(());
+    }
+    clashes.sort();
+    clashes.dedup();
+    Err(AppError::invalid(format!(
+        "these source names also name tables in the selected database: {}. \
+         An unqualified reference would read the file/document instead of the \
+         database table — rename the source, unselect the database, or \
+         schema-qualify the database table as main.<name>.",
+        clashes.join(", ")
+    )))
 }
 
 /// Bounded table info for one open document.
@@ -1467,7 +1585,7 @@ pub async fn sql_schema(
         let state = app.state::<Mutex<AppState>>();
         let workspace = app.state::<SqlWorkspace>();
         let approved = app.state::<ApprovedSources>();
-        let assembled = assemble_sources(&state, &workspace, &selection)?;
+        let assembled = assemble_sources(&state, &workspace, &approved, &selection, false)?;
         let mut documents = Vec::with_capacity(assembled.docs.len());
         for (alias, handle) in &assembled.docs {
             let guard = handle
@@ -1502,23 +1620,24 @@ pub async fn sql_validate(
         let state = app.state::<Mutex<AppState>>();
         let workspace = app.state::<SqlWorkspace>();
         let approved = app.state::<ApprovedSources>();
-        let validation =
-            match assemble_sources(&state, &workspace, &request.sources).and_then(|a| {
-                safe_query::connect_with_sources(
-                    &approved,
-                    a.database.as_deref(),
-                    &a.docs,
-                    &a.files,
-                )
-            }) {
-                Ok(conn) => validate_query(&conn, &request.sql),
-                Err(e) => SqlValidation {
-                    ok: false,
-                    error: Some(e.to_string()),
-                    columns: Vec::new(),
-                    parameters: Vec::new(),
-                },
-            };
+        let validation = match assemble_sources(
+            &state,
+            &workspace,
+            &approved,
+            &request.sources,
+            true,
+        )
+        .and_then(|a| {
+            safe_query::connect_with_sources(&approved, a.database.as_deref(), &a.docs, &a.files)
+        }) {
+            Ok(conn) => validate_query(&conn, &request.sql),
+            Err(e) => SqlValidation {
+                ok: false,
+                error: Some(e.to_string()),
+                columns: Vec::new(),
+                parameters: Vec::new(),
+            },
+        };
         Ok(validation)
     })
     .await
@@ -1526,23 +1645,27 @@ pub async fn sql_validate(
 }
 
 /// `EXPLAIN QUERY PLAN` tree for a statement (pre-validated; parameters
-/// bound so the plan reflects real bindings).
+/// bound so the plan reflects real bindings). Runs as a cancellable job with
+/// the same resolved time limit as a real run, so a pathological plan can be
+/// aborted from the UI instead of pinning a blocking-pool thread.
 #[tauri::command]
 pub async fn sql_explain(
     request: SqlRunRequest,
     app: tauri::AppHandle,
+    jobs: State<'_, JobRegistry>,
 ) -> AppResult<Vec<SqlPlanNode>> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let ctx = jobs.begin_for_app(&app, "sqlExplain", None);
+    crate::job::run_blocking(ctx, move |ctx| {
         let state = app.state::<Mutex<AppState>>();
         let workspace = app.state::<SqlWorkspace>();
         let approved = app.state::<ApprovedSources>();
-        let a = assemble_sources(&state, &workspace, &request.sources)?;
+        let a = assemble_sources(&state, &workspace, &approved, &request.sources, true)?;
         let conn =
             safe_query::connect_with_sources(&approved, a.database.as_deref(), &a.docs, &a.files)?;
-        explain_plan(&conn, &request.sql, &request.params)
+        let limits = request.limits.resolve();
+        explain_plan(&conn, &request.sql, &request.params, &limits, Some(ctx))
     })
     .await
-    .map_err(blocking_err)?
 }
 
 /// Run one statement as a cancellable job. The bounded result spool is
@@ -1559,7 +1682,7 @@ pub async fn sql_run(
         let state = app.state::<Mutex<AppState>>();
         let workspace = app.state::<SqlWorkspace>();
         let approved = app.state::<ApprovedSources>();
-        let assembled = assemble_sources(&state, &workspace, &request.sources)?;
+        let assembled = assemble_sources(&state, &workspace, &approved, &request.sources, true)?;
 
         let mut history_sources: Vec<String> =
             assembled.docs.iter().map(|(a, _)| a.clone()).collect();
@@ -2508,15 +2631,48 @@ mod tests {
             &conn,
             "SELECT * FROM items i JOIN d ON d.id = i.id WHERE i.id > :min",
             &[param("min", SqlParamType::Integer, Some("0"))],
+            &limits(),
+            None,
         )
         .unwrap();
         assert!(!plan.is_empty(), "a join plan has nodes");
         let all: String = format!("{plan:?}");
         assert!(all.contains("SCAN") || all.contains("SEARCH"), "{all}");
 
-        assert!(explain_plan(&conn, "EXPLAIN SELECT 1", &[]).is_err());
-        assert!(explain_plan(&conn, "DELETE FROM items", &[]).is_err());
-        assert!(explain_plan(&conn, "SELECT 1; SELECT 2", &[]).is_err());
+        assert!(explain_plan(&conn, "EXPLAIN SELECT 1", &[], &limits(), None).is_err());
+        assert!(explain_plan(&conn, "DELETE FROM items", &[], &limits(), None).is_err());
+        assert!(explain_plan(&conn, "SELECT 1; SELECT 2", &[], &limits(), None).is_err());
+    }
+
+    #[test]
+    fn explain_is_cancellable_and_time_limited_and_releases_its_handler() {
+        let approved = ApprovedSources::default();
+        let d = doc("id,label\n1,one\n");
+        let conn = connect_with_sources(&approved, None, &[("d".into(), d)], &[]).unwrap();
+
+        // Cancellation: a pre-cancelled job aborts the plan step.
+        let registry = JobRegistry::default();
+        let ctx = registry.begin("test", None, |_| {});
+        registry.cancel(ctx.id);
+        let cancelled = explain_plan(&conn, "SELECT * FROM d", &[], &limits(), Some(&ctx));
+        assert!(matches!(cancelled, Err(AppError::Cancelled)));
+
+        // An already-expired deadline surfaces the time-limit error, not a
+        // silent full plan.
+        let expired = ResolvedLimits {
+            max_rows: usize::MAX,
+            max_bytes: u64::MAX,
+            time_limit: Duration::from_nanos(0),
+        };
+        let err = explain_plan(&conn, "SELECT * FROM d", &[], &expired, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("time limit"), "{err}");
+
+        // The progress handler was cleared after each call: the same
+        // connection still explains normally (no leaked interrupt handler).
+        let plan = explain_plan(&conn, "SELECT * FROM d", &[], &limits(), None).unwrap();
+        assert!(!plan.is_empty());
     }
 
     // ----- history -----------------------------------------------------------
@@ -2577,6 +2733,94 @@ mod tests {
         assert_eq!(info.kind, "document");
         assert_eq!(info.row_count, Some(1));
         assert_eq!(info.columns[0].decl_type, "text");
+    }
+
+    // ----- source-name collisions with a selected database -------------------
+
+    #[test]
+    fn temp_vtab_would_shadow_a_same_named_db_table() {
+        // Evidence the collision guard is load-bearing: a temp-schema vtab
+        // named like a real database table shadows it for an unqualified
+        // reference (SQLite resolves temp before main), so without the guard a
+        // query silently reads the document/file instead of the table.
+        let dir = tempfile::tempdir().unwrap();
+        let (approved, path) = test_db(dir.path()); // real table `items` (3 rows)
+        let d = doc("id,name,price\n99,DOCVALUE,0\n"); // exposed AS `items`
+        let conn =
+            connect_with_sources(&approved, Some(&path), &[("items".into(), d)], &[]).unwrap();
+
+        // Unqualified `items` resolves to the temp doc vtab, NOT the db table.
+        let out = run(&conn, "SELECT name FROM items").unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0][0].as_deref(), Some("DOCVALUE"));
+        // main-qualification (the guard's suggested escape hatch) reaches the
+        // real database table.
+        let out = run(&conn, "SELECT COUNT(*) FROM main.items").unwrap();
+        assert_eq!(out.rows[0][0].as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn selected_source_shadowing_a_db_table_is_refused_in_strict_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let (approved, db) = test_db(dir.path()); // db has table `items`
+
+        // Register an approved file whose alias sanitizes to `items`.
+        let file = dir.path().join("items.csv");
+        std::fs::write(&file, "x\n1\n").unwrap();
+        approved.approve(&file).unwrap();
+        let workspace = SqlWorkspace::default();
+        let (canonical, kind, backing) =
+            open_backing(&approved, &file, None, cache.path(), None).unwrap();
+        assert_eq!(
+            workspace.register(canonical, kind, backing).unwrap().alias,
+            "items"
+        );
+
+        let state = Mutex::new(AppState::default());
+        let db_str = db.to_string_lossy().to_string();
+        let clash = SqlSourceSelection {
+            documents: vec![],
+            files: vec!["items".into()],
+            database: Some(db_str.clone()),
+        };
+
+        // Strict (run / validate / explain): the clash is refused, clearly.
+        // (`.err()` rather than `.unwrap_err()` — AssembledSources holds a
+        // trait object and is not Debug.)
+        let err = assemble_sources(&state, &workspace, &approved, &clash, true)
+            .err()
+            .expect("a name clash must be refused")
+            .to_string();
+        assert!(
+            err.contains("items") && err.contains("selected database"),
+            "{err}"
+        );
+
+        // Lenient (schema browser): still assembles so every source is listed.
+        assert!(assemble_sources(&state, &workspace, &approved, &clash, false).is_ok());
+
+        // No database selected → no clash possible even in strict mode.
+        let no_db = SqlSourceSelection {
+            documents: vec![],
+            files: vec!["items".into()],
+            database: None,
+        };
+        assert!(assemble_sources(&state, &workspace, &approved, &no_db, true).is_ok());
+
+        // A non-colliding database table name is fine in strict mode too.
+        let other = dir.path().join("widgets.csv");
+        std::fs::write(&other, "x\n1\n").unwrap();
+        approved.approve(&other).unwrap();
+        let (c2, k2, b2) = open_backing(&approved, &other, None, cache.path(), None).unwrap();
+        let a2 = workspace.register(c2, k2, b2).unwrap().alias;
+        assert_eq!(a2, "widgets");
+        let ok = SqlSourceSelection {
+            documents: vec![],
+            files: vec!["widgets".into()],
+            database: Some(db_str),
+        };
+        assert!(assemble_sources(&state, &workspace, &approved, &ok, true).is_ok());
     }
 
     // ----- saved queries (project section payload) ---------------------------

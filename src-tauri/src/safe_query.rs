@@ -90,6 +90,14 @@ const LIVE_WINDOW: usize = 1024;
 const PROGRESS_STEP_OPS: c_int = 4_000;
 /// How long a guarded connection waits on a locked database before failing.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Ceiling on any single string/BLOB SQLite will construct on a guarded
+/// connection (SQLITE_LIMIT_LENGTH). Without it one hostile scalar
+/// (`zeroblob(9e8)`, `printf('%.*c', 9e8, 'x')`, `hex(randomblob(...))`, …)
+/// can force SQLite to materialise a value up to its ~1 GB compiled ceiling
+/// before any caller-side row/byte budget can react — a real OOM vector on
+/// the 6 GB target. Capped, SQLite raises `SQLITE_TOOBIG` at construction
+/// instead. Sized to the per-run hard byte cap the workspace enforces.
+const MAX_VALUE_BYTES: c_int = 256 * 1024 * 1024;
 
 /// Default result caps for [`run_select`]: generous enough for a full F36
 /// result grid, small enough that a runaway cross join cannot exhaust memory.
@@ -286,6 +294,7 @@ pub fn connect_with_sources(
         None => Connection::open_in_memory()?,
     };
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    cap_value_size(&conn);
     if !documents.is_empty() {
         let exposed: ExposedDocs = Arc::default();
         register_document_module(&conn, Arc::clone(&exposed))?;
@@ -310,6 +319,7 @@ pub fn connect_with_sources(
 pub(crate) fn open_guarded(canonical: &Path) -> AppResult<Connection> {
     let conn = open_readonly_approved(canonical)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    cap_value_size(&conn);
     conn.authorizer(Some(authorize))?;
     Ok(conn)
 }
@@ -321,6 +331,19 @@ fn open_readonly_approved(canonical: &Path) -> AppResult<Connection> {
         canonical,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?)
+}
+
+/// Lower `conn`'s `SQLITE_LIMIT_LENGTH` to [`MAX_VALUE_BYTES`] so SQLite
+/// itself refuses to build any single string/BLOB larger than the documented
+/// hard cap, instead of the app discovering an oversized value only after it
+/// has already been materialised in memory.
+fn cap_value_size(conn: &Connection) {
+    // SAFETY: `handle()` yields the live `sqlite3` pointer owned by `conn`,
+    // valid for the duration of this call; `sqlite3_limit` is a pure
+    // per-connection setter with no aliasing or lifetime concerns.
+    unsafe {
+        ffi::sqlite3_limit(conn.handle(), ffi::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES);
+    }
 }
 
 /// Poll `token` every few thousand SQLite VM steps; a cancelled token aborts
@@ -1341,6 +1364,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(joined, 2);
+    }
+
+    #[test]
+    fn oversized_single_value_is_refused_before_materialising() {
+        // One scalar far larger than MAX_VALUE_BYTES: SQLite refuses to build
+        // it (SQLITE_TOOBIG) rather than allocating hundreds of MB, so no
+        // oversized value ever reaches value_to_text or the byte budget.
+        let approved = ApprovedSources::default();
+        let conn = connect(&approved, None, &[]).unwrap();
+        let err = run_select(
+            &conn,
+            "SELECT zeroblob(300000000)",
+            &[],
+            QueryLimits::default(),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.to_ascii_lowercase().contains("too big") || err.contains("database error"),
+            "expected an oversize refusal, got: {err}"
+        );
+        // A value comfortably under the cap is unaffected.
+        let out = run_select(
+            &conn,
+            "SELECT length(zeroblob(4096))",
+            &[],
+            QueryLimits::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.rows[0][0].as_deref(), Some("4096"));
     }
 
     #[test]
