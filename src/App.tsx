@@ -42,6 +42,8 @@ import { JsonExportDialog } from "./components/JsonExportDialog";
 import { JsonImportDialog } from "./components/JsonImportDialog";
 import { ColumnarExportDialog } from "./components/ColumnarExportDialog";
 import { ParquetInspectDialog } from "./components/ParquetInspectDialog";
+import { ExcelExportDialog } from "./components/ExcelExportDialog";
+import { ExcelOpenDialog } from "./components/ExcelOpenDialog";
 import { ProfilesDialog } from "./components/ProfilesDialog";
 import { ProfileSuggestionBar } from "./components/ProfileSuggestionBar";
 import { OpenModeDialog } from "./components/OpenModeDialog";
@@ -89,6 +91,7 @@ export default function App() {
   const setModal = useStore((s) => s.setModal);
   const jsonImportPath = useStore((s) => s.jsonImport?.path ?? null);
   const columnarOpenPath = useStore((s) => s.columnarOpen?.path ?? null);
+  const excelImportPath = useStore((s) => s.excelImport?.path ?? null);
   const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
   const changesOpen = useStore((s) => s.changesOpen);
   const annotationsPanelOpen = useStore((s) => s.annotationsPanelOpen);
@@ -349,6 +352,8 @@ export default function App() {
       {activeModal === "columnarExport" && <ColumnarExportDialog onClose={() => setModal(null)} />}
       {jsonImportPath && <JsonImportDialog key={jsonImportPath} />}
       {columnarOpenPath && <ParquetInspectDialog key={columnarOpenPath} />}
+      {activeModal === "excelExport" && <ExcelExportDialog onClose={() => setModal(null)} />}
+      {excelImportPath && <ExcelOpenDialog key={excelImportPath} />}
       <CommandPalette />
       <CellEditorDialog />
       <NoteEditorDialog />

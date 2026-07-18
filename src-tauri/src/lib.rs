@@ -33,6 +33,11 @@ mod document;
 mod dto;
 mod encoding;
 mod error;
+/// Public like [`job`]: the F34 Excel `.xlsx` interop engine (workbook
+/// inspection, the import engine with merged/formula/date-system policies, and
+/// the multi-sheet typed export) consumed by the F34 command surface and the
+/// test harness.
+pub mod excel;
 mod export;
 mod export_scope;
 mod filter;
@@ -179,6 +184,8 @@ pub fn run() {
         .manage(crate::project::ProjectStore::default())
         .manage(crate::annotations::AnnotationRegistry::default())
         .manage(crate::highlight::HighlightStore::default())
+        .manage(crate::excel::ExcelInspectCache::default())
+        .manage(crate::excel::ExcelPreviewCache::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -383,6 +390,12 @@ pub fn run() {
             commands::highlight_explain,
             commands::highlight_counts,
             commands::start_highlight_report,
+            commands::excel_inspect,
+            commands::get_excel_inspect,
+            commands::excel_import_preview,
+            commands::get_excel_import_preview,
+            commands::excel_import_apply,
+            commands::excel_export,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

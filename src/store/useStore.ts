@@ -128,6 +128,11 @@ import type {
   DraftField,
   HighlightRule,
   HighlightReportFormat,
+  ExcelImportOptions,
+  ExcelImportPreview,
+  ExcelExportOptions,
+  ExcelWorkbookInfo,
+  ExcelSheetExport,
 } from "../types";
 import type { GatingWarning } from "../lib/project";
 import { clampRecord, type RecordDraft } from "../lib/recordForm";
@@ -176,6 +181,7 @@ export type ModalName =
   | "dictionary"
   | "jsonExport"
   | "columnarExport"
+  | "excelExport"
   | "sampling"
   | "tagToColumn"
   | "annotationExport"
@@ -186,6 +192,7 @@ const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
   { name: "JSON (F33)", extensions: ["json", "jsonl", "ndjson"] },
   { name: "Columnar (F32)", extensions: ["parquet", "arrow", "feather", "ipc", "arrows"] },
+  { name: "Excel (F34)", extensions: ["xlsx"] },
   { name: "Compressed (F17)", extensions: ["gz", "zip"] },
   { name: "All files", extensions: ["*"] },
 ];
@@ -197,6 +204,9 @@ const COLUMNAR_FILE_FILTERS = [
   { name: "Arrow IPC stream", extensions: ["arrows", "ipc"] },
   { name: "All files", extensions: ["*"] },
 ];
+
+/** File filter for the Excel `.xlsx` open/export dialogs (F34). */
+const EXCEL_FILE_FILTERS = [{ name: "Excel workbook", extensions: ["xlsx"] }];
 
 /** File filters for a JSON / JSON Lines export target (F33). */
 const JSON_FILE_FILTERS = [
@@ -588,7 +598,7 @@ export interface DeriveState {
   jobId: number;
   /** The id the NEW document will register under. */
   docId: number;
-  kind: "append" | "join" | "groupBy" | "reshape" | "jsonImport";
+  kind: "append" | "join" | "groupBy" | "reshape" | "jsonImport" | "excelImport";
   processed: number;
   total: number | null;
   message: string | null;
@@ -637,6 +647,32 @@ export interface ColumnarExportState {
   running: boolean;
   report: ColumnarExportReport | null;
   error: string | null;
+}
+
+/**
+ * Excel `.xlsx` import flow state (F34). Non-null while the open chooser is on
+ * screen. Two scans back it: a one-shot workbook inspection (the chooser tree)
+ * and a per-source import preview that re-runs as the selected source / options
+ * change. Both run through the job registry (kind "scan"); the apply step reuses
+ * the shared `derive` slot (kind "excelImport"), so the finished document lands
+ * via the same pipeline as every other producer.
+ */
+export interface ExcelImportState {
+  path: string;
+  fileName: string;
+  /** Workbook inspection (the chooser); null until the inspect job finishes. */
+  workbook: ExcelWorkbookInfo | null;
+  /** In-flight inspection job id; null when idle. */
+  inspectJobId: number | null;
+  inspectError: string | null;
+  /** The options the current `preview` was scanned under. */
+  options: ExcelImportOptions | null;
+  preview: ExcelImportPreview | null;
+  /** In-flight preview scan job id; null when idle. */
+  previewJobId: number | null;
+  previewProcessed: number;
+  previewTotal: number | null;
+  previewError: string | null;
 }
 
 /** A running sampling/partitioning job (F48). Unlike a derive job it can emit
@@ -945,6 +981,8 @@ interface Store {
   columnarOpen: ColumnarOpenState | null;
   /** Result of the most recent Parquet / Arrow export (F32). */
   columnarExportResult: ColumnarExportState;
+  /** Excel `.xlsx` import flow (F34); non-null while the open chooser is open. */
+  excelImport: ExcelImportState | null;
   /** Running sampling/partitioning job (F48), if any. */
   sample: SampleState | null;
   /** Error from the last sampling job, for the dialog that started it. */
@@ -1397,6 +1435,26 @@ interface Store {
   runColumnarExport: (options: ColumnarExportOptions, scope: ExportScope) => Promise<void>;
   /** Reset the columnar export result (dialog closed / reopened). */
   clearColumnarExport: () => void;
+
+  // Excel .xlsx interoperability (F34)
+  /** Prompt for an `.xlsx` file and route it into the open chooser. */
+  openExcelDialog: () => Promise<void>;
+  /** Open the Excel chooser for a file and run the workbook inspection. */
+  openExcelImport: (path: string) => Promise<void>;
+  /** (Re)run the import preview for a chosen source/options (supersedes any in-flight). */
+  runExcelPreview: (options: ExcelImportOptions) => Promise<void>;
+  /** Cancel the running import preview, if any. */
+  cancelExcelPreview: () => Promise<void>;
+  /** Import the chosen source into a NEW document (reuses the shared derive slot). */
+  applyExcelImport: (options: ExcelImportOptions) => Promise<void>;
+  /** Close the Excel chooser, cancelling any in-flight inspection/preview. */
+  dismissExcelImport: () => void;
+  /** Prompt for a path and export the given sheet set to an `.xlsx` workbook (F34). */
+  exportExcel: (
+    sheets: ExcelSheetExport[],
+    options: ExcelExportOptions,
+    suggestedName: string,
+  ) => Promise<void>;
 
   // data-cleaning transforms (F06)
   /**
@@ -2300,6 +2358,7 @@ export const useStore = create<Store>((set, get) => {
     jsonImport: null,
     columnarOpen: null,
     columnarExportResult: { running: false, report: null, error: null },
+    excelImport: null,
     sample: null,
     sampleError: null,
     samplingInitialMode: "sampling",
@@ -2734,6 +2793,11 @@ export const useStore = create<Store>((set, get) => {
       if (typeof selected === "string") await get().openPath(selected);
     },
 
+    openExcelDialog: async () => {
+      const selected = await openFileDialog({ multiple: false, filters: EXCEL_FILE_FILTERS });
+      if (typeof selected === "string") await get().openPath(selected);
+    },
+
     openPath: async (path) => {
       const existing = get().tabs.find((t) => t.path === path);
       if (existing) {
@@ -2772,6 +2836,12 @@ export const useStore = create<Store>((set, get) => {
       // schema, open-indexed vs convert-editable choice).
       if (isColumnarPath(path)) {
         await get().openColumnarInspect(path);
+        return;
+      }
+      // F34: Excel workbooks route through the open chooser (sheet/table/range
+      // selection + import options), never the CSV open path.
+      if (lower.endsWith(".xlsx")) {
+        await get().openExcelImport(path);
         return;
       }
       set({ busy: true, error: null });
@@ -4677,14 +4747,27 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
-      // F33: JSON import preview scan progress (guarded by our own job id so a
-      // stray "scan"-kind job from elsewhere never touches this state).
+      // F33/F34: JSON and Excel import scans share the "scan" job kind, so match
+      // on our own in-flight job ids (a stray "scan" job never touches state).
       if (progress.kind === "scan") {
-        const st = get().jsonImport;
-        if (!st || st.scanJobId !== progress.jobId) return;
-        set({
-          jsonImport: { ...st, scanProcessed: progress.processed, scanTotal: progress.total },
-        });
+        const js = get().jsonImport;
+        if (js && js.scanJobId === progress.jobId) {
+          set({
+            jsonImport: { ...js, scanProcessed: progress.processed, scanTotal: progress.total },
+          });
+          return;
+        }
+        const xl = get().excelImport;
+        if (xl && (xl.previewJobId === progress.jobId || xl.inspectJobId === progress.jobId)) {
+          set({
+            excelImport: {
+              ...xl,
+              previewProcessed: progress.processed,
+              previewTotal: progress.total,
+            },
+          });
+          return;
+        }
         return;
       }
 
@@ -4970,9 +5053,10 @@ export const useStore = create<Store>((set, get) => {
           // The job registered the NEW document; add its tab and focus it.
           const meta = await api.getMeta(derive.docId);
           set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] }));
-          // F33: a successful JSON import closes its dialog (the document is
-          // now open); a failure above leaves it open to show the error.
+          // F33/F34: a successful JSON/Excel import closes its dialog (the
+          // document is now open); a failure above leaves it open to show why.
           if (derive.kind === "jsonImport") set({ jsonImport: null });
+          if (derive.kind === "excelImport") set({ excelImport: null });
         } catch (e) {
           set({ deriveError: String(e) });
         }
@@ -5712,6 +5796,69 @@ export const useStore = create<Store>((set, get) => {
       }
     },
 
+    // ----- Excel .xlsx interoperability (F34) --------------------------------------
+
+    openExcelImport: async (path) => {
+      const fileName = path.split(/[\\/]/).pop() ?? path;
+      set({
+        excelImport: {
+          path,
+          fileName,
+          workbook: null,
+          inspectJobId: null,
+          inspectError: null,
+          options: null,
+          preview: null,
+          previewJobId: null,
+          previewProcessed: 0,
+          previewTotal: null,
+          previewError: null,
+        },
+      });
+      // Inspect the workbook (the chooser tree). The dialog drives the per-source
+      // preview once this lands and it has picked a default source.
+      try {
+        const jobId = await api.excelInspect(path);
+        if (get().excelImport?.path !== path) return; // dialog closed meanwhile
+        set((s) =>
+          s.excelImport ? { excelImport: { ...s.excelImport, inspectJobId: jobId } } : {},
+        );
+        const finished = await awaitJob(jobId);
+        if (get().excelImport?.path !== path) return;
+        if (finished.status === "done") {
+          const workbook = await api.getExcelInspect(jobId);
+          set((s) =>
+            s.excelImport
+              ? { excelImport: { ...s.excelImport, workbook, inspectJobId: null } }
+              : {},
+          );
+        } else if (finished.status === "failed") {
+          set((s) =>
+            s.excelImport
+              ? {
+                  excelImport: {
+                    ...s.excelImport,
+                    inspectJobId: null,
+                    inspectError: finished.error ?? "could not read the workbook",
+                  },
+                }
+              : {},
+          );
+        } else {
+          set((s) =>
+            s.excelImport ? { excelImport: { ...s.excelImport, inspectJobId: null } } : {},
+          );
+        }
+      } catch (e) {
+        if (get().excelImport?.path !== path) return;
+        set((s) =>
+          s.excelImport
+            ? { excelImport: { ...s.excelImport, inspectJobId: null, inspectError: String(e) } }
+            : {},
+        );
+      }
+    },
+
     dismissColumnarInspect: () => set({ columnarOpen: null }),
 
     columnarOpenIndexed: async (options) => {
@@ -5813,6 +5960,122 @@ export const useStore = create<Store>((set, get) => {
 
     clearColumnarExport: () =>
       set({ columnarExportResult: { running: false, report: null, error: null } }),
+
+    runExcelPreview: async (options) => {
+      const st = get().excelImport;
+      if (!st) return;
+      // Supersede any in-flight preview: cancel it and reset progress.
+      if (st.previewJobId != null) void api.cancelJob(st.previewJobId).catch(() => undefined);
+      set((s) =>
+        s.excelImport
+          ? {
+              excelImport: {
+                ...s.excelImport,
+                previewJobId: null,
+                previewProcessed: 0,
+                previewTotal: null,
+                previewError: null,
+              },
+            }
+          : {},
+      );
+      try {
+        const jobId = await api.excelImportPreview(st.path, options);
+        if (get().excelImport?.path !== st.path) return;
+        set((s) =>
+          s.excelImport ? { excelImport: { ...s.excelImport, previewJobId: jobId } } : {},
+        );
+        const finished = await awaitJob(jobId);
+        // A newer preview may have superseded this one.
+        if (get().excelImport?.previewJobId !== jobId) return;
+        if (finished.status === "done") {
+          const preview = await api.getExcelImportPreview(jobId);
+          set((s) =>
+            s.excelImport
+              ? {
+                  excelImport: {
+                    ...s.excelImport,
+                    previewJobId: null,
+                    preview,
+                    options,
+                    previewError: null,
+                  },
+                }
+              : {},
+          );
+        } else if (finished.status === "failed") {
+          set((s) =>
+            s.excelImport
+              ? {
+                  excelImport: {
+                    ...s.excelImport,
+                    previewJobId: null,
+                    previewError: finished.error ?? "preview failed",
+                  },
+                }
+              : {},
+          );
+        } else {
+          set((s) =>
+            s.excelImport ? { excelImport: { ...s.excelImport, previewJobId: null } } : {},
+          );
+        }
+      } catch (e) {
+        if (get().excelImport?.path !== st.path) return;
+        set((s) =>
+          s.excelImport
+            ? { excelImport: { ...s.excelImport, previewJobId: null, previewError: String(e) } }
+            : {},
+        );
+      }
+    },
+
+    cancelExcelPreview: async () => {
+      const jobId = get().excelImport?.previewJobId;
+      if (jobId != null) await api.cancelJob(jobId).catch(() => undefined);
+    },
+
+    applyExcelImport: async (options) => {
+      const st = get().excelImport;
+      // One derive slot at a time (shared with append/join/group/reshape/json).
+      if (!st || get().derive) return;
+      set({ deriveError: null });
+      try {
+        const started = await api.excelImportApply(st.path, options);
+        get().trackDerive(started.jobId, started.docId, "excelImport");
+        pushRecent(st.path);
+      } catch (e) {
+        set({ deriveError: String(e) });
+      }
+    },
+
+    dismissExcelImport: () => {
+      const st = get().excelImport;
+      if (st?.inspectJobId != null) void api.cancelJob(st.inspectJobId).catch(() => undefined);
+      if (st?.previewJobId != null) void api.cancelJob(st.previewJobId).catch(() => undefined);
+      set({ excelImport: null });
+    },
+
+    exportExcel: async (sheets, options, suggestedName) => {
+      if (sheets.length === 0) return;
+      const chosen = await saveFileDialog({
+        defaultPath: suggestedName,
+        filters: EXCEL_FILE_FILTERS,
+      });
+      if (!chosen) return;
+      try {
+        // plan_export() runs BEFORE the job spawns — revisions, sheet names and
+        // Excel's row/column limits reject the invoke synchronously, so an
+        // over-limit export never begins writing. We surface that rejection here.
+        const jobId = await api.excelExport(sheets, chosen, options);
+        const finished = await awaitJob(jobId);
+        if (finished.status === "failed") {
+          set({ error: finished.error ?? "Excel export failed" });
+        }
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
 
     // ----- compare (F09) -----------------------------------------------------------
 
