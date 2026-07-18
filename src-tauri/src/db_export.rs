@@ -996,6 +996,12 @@ pub(crate) fn run_export(
     let mut conn = Connection::open_with_flags(path, flags)
         .map_err(|e| AppError::invalid(format!("cannot open database for writing: {e}")))?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    // SQLite's per-connection default is foreign_keys = OFF, so without this a
+    // child row referencing a missing parent would be COMMITTED instead of
+    // failing. Enable enforcement here — before BEGIN, because the pragma is a
+    // no-op inside a transaction — so an FK violation aborts and rolls the
+    // whole write back exactly like the NOT NULL / CHECK / UNIQUE constraints.
+    conn.pragma_update(None, "foreign_keys", true)?;
     if existed {
         // Fail with a clear message before BEGIN when the file is not SQLite.
         conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| {
@@ -1197,6 +1203,21 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE items(id INTEGER PRIMARY KEY, qty INTEGER NOT NULL, note TEXT);
              INSERT INTO items VALUES (1, 10, 'existing');",
+        )
+        .unwrap();
+        path
+    }
+
+    /// A database whose `children` table has a FOREIGN KEY onto `parents`
+    /// (only parent id 1 exists).
+    fn fk_db(dir: &Path) -> PathBuf {
+        let path = dir.join("fk.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE parents(id INTEGER PRIMARY KEY);
+             INSERT INTO parents VALUES (1);
+             CREATE TABLE children(id INTEGER PRIMARY KEY,
+                                   parent_id INTEGER REFERENCES parents(id));",
         )
         .unwrap();
         path
@@ -1650,6 +1671,40 @@ mod tests {
             before,
             "a non-uniqueness violation rolls the whole skip export back"
         );
+    }
+
+    #[test]
+    fn append_enforces_foreign_keys_and_rolls_back_dangling_child() {
+        // Foreign-key enforcement is OFF by default per SQLite connection: the
+        // export connection must turn it ON so a child row pointing at a
+        // missing parent aborts and rolls back like every other constraint,
+        // instead of committing a dangling reference.
+        let dir = tempfile::tempdir().unwrap();
+        let path = fk_db(dir.path());
+        let before = std::fs::read(&path).unwrap();
+
+        // parent_id = 999 has no matching parent row.
+        let handle = shared_doc("id,parent_id\n10,999\n", &[]);
+        let mut spec = spec_for(&path, "children", "append");
+        let err = export(&handle, &spec).unwrap_err();
+        assert!(err.to_string().contains("constraint"), "{err}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "an FK violation leaves the database byte-identical"
+        );
+
+        // "skip" must NOT swallow it — an FK violation is not a duplicate.
+        spec.conflict_policy = "skip".into();
+        assert!(export(&handle, &spec).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // A child referencing the EXISTING parent (id 1) is written normally.
+        let ok = shared_doc("id,parent_id\n11,1\n", &[]);
+        let result = export(&ok, &spec_for(&path, "children", "append")).unwrap();
+        assert_eq!(result.rows_written, 1);
+        let rows = table_rows(&path, "children", "id");
+        assert_eq!(rows, vec![vec![Some("11".into()), Some("1".into())]]);
     }
 
     // ----- replace ----------------------------------------------------------
