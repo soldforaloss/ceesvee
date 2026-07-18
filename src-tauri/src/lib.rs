@@ -432,6 +432,9 @@ pub fn run() {
             db_export::db_export_preview,
             db_export::start_db_export,
             db_export::db_export_report,
+            commands::compute_facets,
+            commands::apply_facets,
+            commands::convert_facets_to_filter,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

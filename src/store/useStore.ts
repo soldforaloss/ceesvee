@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { ask, open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
+import { writeText as writeClipboard } from "@tauri-apps/plugin-clipboard-manager";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import * as api from "../lib/tauri";
@@ -18,6 +19,23 @@ import {
   type ColumnLayout,
 } from "../lib/viewProjection";
 import { hydrateFilter, snapshotView, uniqueViewName, upsertView } from "../lib/views";
+import {
+  addFacet as addFacetToConfig,
+  anyFacetActive,
+  clearSelection,
+  createFacetSpec,
+  describeDropped,
+  facetClipboardText,
+  moveFacet,
+  removeFacet as removeFacetFromConfig,
+  setMode,
+  setRange,
+  summarizeConversion,
+  toggleMode,
+  toggleValue,
+  updateFacet,
+  updateSelection,
+} from "../lib/facets";
 import { annotationExportName } from "../lib/annotations";
 import { currentOpenOptions, fingerprintKey } from "../lib/reopen";
 import { defaultImportOptions } from "../lib/jsonImport";
@@ -144,6 +162,11 @@ import type {
   DbRefreshStatus,
   DbExportPreview,
   DbExportResult,
+  FacetConfig,
+  FacetResultSet,
+  FacetSpec,
+  FacetKind,
+  FacetMode,
 } from "../types";
 import type { GatingWarning } from "../lib/project";
 import { clampRecord, type RecordDraft } from "../lib/recordForm";
@@ -158,6 +181,9 @@ const MAX_RECENT = 10;
 let statsTimer: ReturnType<typeof setTimeout> | null = null;
 // Debounce timer for the (backend-computed) per-column summaries.
 let summariesTimer: ReturnType<typeof setTimeout> | null = null;
+// Debounce timer for the (backend-computed) facet counts + row view (F39), so a
+// burst of value toggles coalesces into one apply+compute round-trip.
+let facetsTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** Find-match cap for indexed read-only documents (F10). */
 export const INDEXED_FIND_LIMIT = 5000;
@@ -880,6 +906,37 @@ const initialExplorer: ExplorerState = {
   error: null,
 };
 
+/**
+ * Multi-facet exploration panel state (F39), for the ACTIVE document. `config`
+ * is the set of facet panels and their selections; `results` are the last
+ * computed cross-filtered counts. Faceting is non-destructive — nothing here
+ * ever dirties the document — but an active selection DOES drive the grid row
+ * view (`applied`), exactly like a filter. Config is per-document (columns are
+ * referenced by stable ID), so it resets on tab switch while the panel stays
+ * open. `dedupContext` remembers the last duplicate-scan spec so a duplicate
+ * status facet can resolve without re-prompting.
+ */
+export interface FacetsUiState {
+  open: boolean;
+  config: FacetConfig;
+  results: FacetResultSet | null;
+  loading: boolean;
+  error: string | null;
+  /** Whether the current selection is driving the grid row view. */
+  applied: boolean;
+  dedupContext: { spec: DedupSpec; scope: ExportScope } | null;
+}
+
+const initialFacets: FacetsUiState = {
+  open: false,
+  config: { facets: [] },
+  results: null,
+  loading: false,
+  error: null,
+  applied: false,
+  dedupContext: null,
+};
+
 const initialFilter: FilterState = {
   open: false,
   spec: {
@@ -998,6 +1055,8 @@ interface Store {
   profileValidation: ProfileValidation | null;
   /** Column-explorer panel state (F05). */
   explorer: ExplorerState;
+  /** Multi-facet exploration panel state (F39). */
+  facets: FacetsUiState;
   /** Duplicate-finder state (F07). */
   dedup: DedupState;
   /** Compare state (F09). */
@@ -1625,6 +1684,31 @@ interface Store {
   applyValueFilter: (value: string, mode: "only" | "exclude" | "and") => Promise<void>;
   applyRangeFilter: (min: string | null, max: string | null) => Promise<void>;
 
+  // multi-facet exploration (F39)
+  setFacetsOpen: (open: boolean) => void;
+  /** Replace the whole facet configuration (e.g. restoring a saved view). */
+  setFacetConfig: (config: FacetConfig) => void;
+  /** Add a facet panel for a column (or a status facet). */
+  addFacet: (kind: FacetKind, columnId?: string | null, semantic?: SemanticType | null) => void;
+  removeFacet: (id: string) => void;
+  /** Mutate one facet's spec (pin / collapse / width / search / top-n / bins). */
+  patchFacet: (id: string, patch: Partial<FacetSpec>) => void;
+  /** Toggle one categorical value inside a facet's OR set. */
+  toggleFacetValue: (id: string, key: string) => void;
+  setFacetMode: (id: string, mode: FacetMode) => void;
+  toggleFacetMode: (id: string) => void;
+  setFacetRange: (id: string, min: string | null, max: string | null) => void;
+  clearFacet: (id: string) => void;
+  /** Clear every facet's selection (keeps the panels). */
+  clearAllFacets: () => void;
+  reorderFacet: (from: number, to: number) => void;
+  /** Recompute counts + drive the grid row view from the current selection. */
+  syncFacets: () => Promise<void>;
+  /** Copy a facet's values+counts to the clipboard (TSV). */
+  copyFacet: (id: string) => Promise<void>;
+  /** Convert the active facets to a filter and open the FilterDialog on it. */
+  convertFacetsToFilter: () => Promise<void>;
+
   // file profiles (F08)
   saveProfiles: (profiles: FileProfile[]) => Promise<void>;
   /** Apply a profile via the previewed reopen flow (safe for dirty docs). */
@@ -1801,6 +1885,9 @@ export const useStore = create<Store>((set, get) => {
         total: null,
         error: null,
       },
+      // F39: the facet config is per-document (columns by stable ID); keep the
+      // panel open across switches but drop the previous doc's facets/results.
+      facets: { ...initialFacets, open: s.facets.open },
       dedup: initialDedup,
       // Cluster reports are per-document; never let one leak across tabs.
       cluster: initialCluster,
@@ -2008,6 +2095,14 @@ export const useStore = create<Store>((set, get) => {
       set({ error: String(e) });
     }
 
+    // F39: restore the view's facet configuration (or clear it when the view
+    // has none). Faceting is view-only: it never dirties the document. The
+    // config resolves against the CURRENT columns by stable ID; a facet whose
+    // column no longer exists renders unresolved (never silently applied).
+    const restoredFacets: FacetConfig = view.facets
+      ? { facets: view.facets.facets.map((f) => ({ ...f })) }
+      : { facets: [] };
+
     set((s) => ({
       columnLayout: layoutIsTrivial(layout) ? null : layout,
       wrapText: view.wrapText,
@@ -2019,12 +2114,18 @@ export const useStore = create<Store>((set, get) => {
       viewSortKeys: appliedSort,
       highlight: { ...initialHighlight, rules: highlightRules, loaded: true },
       highlightVersion: s.highlightVersion + 1,
+      facets: { ...s.facets, config: restoredFacets },
       viewWarning:
         missing.length > 0
           ? `This view references ${missing.length} column${missing.length === 1 ? "" : "s"} that no longer exist (deleted or from an older file layout). The rest of the view was applied; the view itself is unchanged.`
           : null,
     }));
     void get().loadHighlightCounts();
+    // Apply the restored facets' row view + counts (only when the panel is open,
+    // or when a selection is active so the grid reflects the saved view).
+    if (restoredFacets.facets.length > 0 || get().facets.applied) {
+      void get().syncFacets();
+    }
 
     if (persistLast && meta.path) {
       await persistViews(meta, (views) => views, view.id).catch(() => undefined);
@@ -2070,6 +2171,21 @@ export const useStore = create<Store>((set, get) => {
     } catch {
       /* ignore */
     }
+  };
+
+  /**
+   * Replace the facet config (F39) and schedule a debounced recompute that both
+   * refreshes the cross-filtered counts and drives the grid row view. Setting
+   * the config is synchronous (the cards react immediately); the backend round
+   * trip is coalesced so rapid toggling stays responsive.
+   */
+  const applyFacetConfig = (config: FacetConfig) => {
+    set((s) => ({ facets: { ...s.facets, config } }));
+    if (facetsTimer !== null) clearTimeout(facetsTimer);
+    facetsTimer = setTimeout(() => {
+      facetsTimer = null;
+      void get().syncFacets();
+    }, 120);
   };
 
   /** Run a structural mutation against the active doc with error handling. */
@@ -2519,6 +2635,7 @@ export const useStore = create<Store>((set, get) => {
     profileSuggestion: null,
     profileValidation: null,
     explorer: initialExplorer,
+    facets: initialFacets,
     dedup: initialDedup,
     compare: initialCompare,
 
@@ -2732,6 +2849,7 @@ export const useStore = create<Store>((set, get) => {
         columnWidths: s.columnWidths,
         wrapText: s.wrapText,
         highlightRules: s.highlight.rules,
+        facets: s.facets.config,
       });
       try {
         await persistViews(meta, (views) => upsertView(views, view), view.id);
@@ -2759,6 +2877,7 @@ export const useStore = create<Store>((set, get) => {
         columnWidths: s.columnWidths,
         wrapText: s.wrapText,
         highlightRules: s.highlight.rules,
+        facets: s.facets.config,
       });
       try {
         await persistViews(meta, (views) => upsertView(views, view), viewId);
@@ -4079,6 +4198,7 @@ export const useStore = create<Store>((set, get) => {
         diagnosticsOpen: open ? false : s.diagnosticsOpen,
         changesOpen: open ? false : s.changesOpen,
         explorer: open ? { ...s.explorer, open: false } : s.explorer,
+        facets: open ? { ...s.facets, open: false } : s.facets,
         // One side panel at a time — the record form (F41) shares the rail.
         recordFormOpen: open ? false : s.recordFormOpen,
       }));
@@ -4598,6 +4718,7 @@ export const useStore = create<Store>((set, get) => {
         // The side area shows one panel at a time.
         changesOpen: open ? false : s.changesOpen,
         explorer: open ? { ...s.explorer, open: false } : s.explorer,
+        facets: open ? { ...s.facets, open: false } : s.facets,
         annotationsPanelOpen: open ? false : s.annotationsPanelOpen,
         recordFormOpen: open ? false : s.recordFormOpen,
       })),
@@ -4607,6 +4728,7 @@ export const useStore = create<Store>((set, get) => {
         changesOpen: open,
         diagnosticsOpen: open ? false : s.diagnosticsOpen,
         explorer: open ? { ...s.explorer, open: false } : s.explorer,
+        facets: open ? { ...s.facets, open: false } : s.facets,
         annotationsPanelOpen: open ? false : s.annotationsPanelOpen,
         recordFormOpen: open ? false : s.recordFormOpen,
       })),
@@ -4633,6 +4755,7 @@ export const useStore = create<Store>((set, get) => {
           changesOpen: open ? false : s.changesOpen,
           diagnosticsOpen: open ? false : s.diagnosticsOpen,
           explorer: open ? { ...s.explorer, open: false } : s.explorer,
+          facets: open ? { ...s.facets, open: false } : s.facets,
           annotationsPanelOpen: open ? false : s.annotationsPanelOpen,
         };
       }),
@@ -6683,6 +6806,9 @@ export const useStore = create<Store>((set, get) => {
         const jobId = await api.startDuplicateScan(meta.id, spec, scope, meta.revision);
         set((s) => ({
           dedup: { ...s.dedup, scanJobId: jobId, processed: 0, total: null, error: null },
+          // F39: remember the spec/scope so a duplicate-status facet resolves
+          // against the same grouping without re-prompting.
+          facets: { ...s.facets, dedupContext: { spec, scope } },
         }));
         consumeEarlyFinish(jobId);
       } catch (e) {
@@ -6776,6 +6902,7 @@ export const useStore = create<Store>((set, get) => {
         // The side area shows one panel at a time.
         diagnosticsOpen: open ? false : s.diagnosticsOpen,
         recordFormOpen: open ? false : s.recordFormOpen,
+        facets: open ? { ...s.facets, open: false } : s.facets,
       }));
       if (open) void get().refreshExplorerProfile();
     },
@@ -6839,6 +6966,140 @@ export const useStore = create<Store>((set, get) => {
       set((s) => ({ filter: { ...s.filter, spec } }));
       await mutate((id) => api.setFilter(id, spec));
       void get().refreshExplorerProfile();
+    },
+
+    // ----- multi-facet exploration (F39) ---------------------------------------
+
+    setFacetsOpen: (open) => {
+      set((s) => ({
+        facets: { ...s.facets, open },
+        // The side rail shows one panel at a time.
+        explorer: open ? { ...s.explorer, open: false } : s.explorer,
+        diagnosticsOpen: open ? false : s.diagnosticsOpen,
+        changesOpen: open ? false : s.changesOpen,
+        annotationsPanelOpen: open ? false : s.annotationsPanelOpen,
+        recordFormOpen: open ? false : s.recordFormOpen,
+      }));
+      if (open) void get().syncFacets();
+    },
+
+    setFacetConfig: (config) => applyFacetConfig(config),
+
+    addFacet: (kind, columnId, semantic) =>
+      applyFacetConfig(
+        addFacetToConfig(get().facets.config, createFacetSpec(kind, columnId, semantic)),
+      ),
+
+    removeFacet: (id) => applyFacetConfig(removeFacetFromConfig(get().facets.config, id)),
+
+    patchFacet: (id, patch) => {
+      // Layout-only tweaks (pin/collapse/width) never need a backend round trip;
+      // display tuning (search/topN/bins) does, since it changes the buckets.
+      const next = updateFacet(get().facets.config, id, (f) => ({ ...f, ...patch }));
+      const recompute =
+        "search" in patch || "topN" in patch || "bins" in patch || "semantic" in patch;
+      if (recompute) applyFacetConfig(next);
+      else set((s) => ({ facets: { ...s.facets, config: next } }));
+    },
+
+    toggleFacetValue: (id, key) =>
+      applyFacetConfig(updateSelection(get().facets.config, id, (sel) => toggleValue(sel, key))),
+
+    setFacetMode: (id, mode) =>
+      applyFacetConfig(updateSelection(get().facets.config, id, (sel) => setMode(sel, mode))),
+
+    toggleFacetMode: (id) =>
+      applyFacetConfig(updateSelection(get().facets.config, id, (sel) => toggleMode(sel))),
+
+    setFacetRange: (id, min, max) =>
+      applyFacetConfig(updateSelection(get().facets.config, id, (sel) => setRange(sel, min, max))),
+
+    clearFacet: (id) =>
+      applyFacetConfig(updateSelection(get().facets.config, id, (sel) => clearSelection(sel))),
+
+    clearAllFacets: () =>
+      applyFacetConfig({
+        facets: get().facets.config.facets.map((f) => ({
+          ...f,
+          selection: clearSelection(f.selection),
+        })),
+      }),
+
+    reorderFacet: (from, to) => applyFacetConfig(moveFacet(get().facets.config, from, to)),
+
+    syncFacets: async () => {
+      const meta = activeMeta();
+      const { facets } = get();
+      // Not gated on the panel being open: restoring a saved view must apply the
+      // facet row view even while the panel is collapsed. Callers that only care
+      // when the panel is visible guard at their own call site.
+      if (!meta) return;
+      const { config, dedupContext } = facets;
+      const dedup = dedupContext?.spec ?? null;
+      const dedupScope = dedupContext?.scope ?? null;
+      const active = anyFacetActive(config);
+      set((s) => ({ facets: { ...s.facets, loading: true, error: null } }));
+      try {
+        // 1. Drive the grid row view — but only touch the filter when a facet is
+        //    (or was) active, so merely opening the empty panel never clears a
+        //    filter applied by other means. A view op: bumps the revision, never
+        //    dirties, never enters undo.
+        let working = meta;
+        if (active || facets.applied) {
+          const applied = await api.applyFacets(meta.id, config, meta.revision, dedup, dedupScope);
+          reloadDoc(applied);
+          working = applied;
+        }
+        // 2. Cross-filtered counts against the (possibly bumped) revision.
+        const results = await api.computeFacets(
+          working.id,
+          config,
+          working.revision,
+          dedup,
+          dedupScope,
+        );
+        if (get().activeId !== meta.id) return; // active doc changed underneath us
+        set((s) => ({
+          facets: { ...s.facets, results, applied: active, loading: false, error: null },
+        }));
+      } catch (e) {
+        set((s) => ({ facets: { ...s.facets, loading: false, error: String(e) } }));
+      }
+    },
+
+    copyFacet: async (id) => {
+      const result = get().facets.results?.facets.find((f) => f.id === id);
+      if (!result) return;
+      await writeClipboard(facetClipboardText(result)).catch(() => undefined);
+    },
+
+    convertFacetsToFilter: async () => {
+      const meta = activeMeta();
+      const { config } = get().facets;
+      if (!meta) return;
+      try {
+        const conversion = await api.convertFacetsToFilter(meta.id, config);
+        const summary = summarizeConversion(conversion);
+        if (summary.empty) {
+          set({
+            error:
+              summary.dropped.length > 0
+                ? `No facet could be converted to a filter. ${describeDropped(summary.dropped)}`
+                : "There are no active facets to convert.",
+          });
+          return;
+        }
+        // Surface the built filter in the existing FilterDialog for review/edit.
+        const hydrated = hydrateFilter(conversion.filter);
+        const spec: FilterGroup = { ...hydrated, type: "group", id: hydrated.id ?? "root" };
+        set((s) => ({
+          filter: { ...s.filter, spec },
+          activeModal: "filter",
+          error: summary.dropped.length > 0 ? describeDropped(summary.dropped) : s.error,
+        }));
+      } catch (e) {
+        set({ error: String(e) });
+      }
     },
 
     // ----- file profiles (F08) -------------------------------------------------

@@ -87,6 +87,26 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   files the user explicitly opened. _SQLite only this cycle — DuckDB support is
   deliberately out of scope (its bundled C++ library cannot be built on the
   low-memory MinGW development machine)._
+- **Multi-facet exploration** (F39; toolbar → "Facets", palette → "Toggle
+  facets"): explore several dimensions at once, beyond the single-column
+  explorer. Add facet panels for any column — value counts (top-N with a search
+  box for high-cardinality columns), a numeric or date histogram with a range
+  selection, true/false, blank/null-token/invalid/value nullability, or a
+  semantic type — plus row-level status facets: diagnostics, validation
+  (cross-column rules and advisory schema issues), duplicate group membership,
+  and bookmarked/flagged/tagged. Several facets are active at once: the grid row
+  view is the AND across panels and the OR (with a per-facet include/exclude
+  toggle) among the selected values inside one, and every facet's counts are
+  recomputed against the population filtered by all the _other_ facets — classic
+  faceted search — so the counts always reflect the current cross-filter.
+  Reorder, pin, collapse, or remove panels; copy a facet's values and counts to
+  the clipboard; save the facet configuration inside a named view (restored with
+  the view); and convert the active facets to the standard filter builder in one
+  step (a one-way conversion; facets with no filter equivalent are reported).
+  Counts on a very large indexed document may be estimated from a leading sample
+  (marked as such); the applied row filter is always exact. Faceting is
+  non-destructive — it never dirties the document — and integrates with the
+  existing row-view pipeline, so visible-row export respects the facet filter.
 - **Row bookmarks, tags & notes** (F40): mark and annotate records without
   touching the source data. Star or flag a row, apply multiple named tags
   (a per-document tag namespace with usage counts), and attach a row note or

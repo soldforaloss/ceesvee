@@ -1413,6 +1413,121 @@ export interface NamedView {
   wrapText: boolean;
   /** F42: conditional-highlighting rules saved with this view (view-only). */
   highlightRules?: HighlightRule[];
+  /** F39: multi-facet exploration configuration saved with this view. */
+  facets?: FacetConfig | null;
+}
+
+// ----- multi-facet exploration (F39) ----------------------------------------
+
+/** The ten facet dimensions. Mirrors `facets::FacetKind`. */
+export type FacetKind =
+  | "text"
+  | "number"
+  | "date"
+  | "boolean"
+  | "nullability"
+  | "semantic"
+  | "diagnostics"
+  | "validation"
+  | "duplicate"
+  | "annotation";
+
+/** Whether selected values keep (include) or remove (exclude) matching rows. */
+export type FacetMode = "include" | "exclude";
+
+/** A continuous inclusive range for number / date facets (bounds as strings so
+ * they parse under the column's declared schema, like a filter range). */
+export interface FacetRange {
+  min?: string | null;
+  max?: string | null;
+}
+
+/** One facet's active selection: OR among `values`, plus an optional `range`. */
+export interface FacetSelection {
+  mode: FacetMode;
+  values: string[];
+  range: FacetRange;
+}
+
+/** One facet panel's full specification (slice + selection + display + layout).
+ * The array order is the panel order; layout fields round-trip in a saved view. */
+export interface FacetSpec {
+  id: string;
+  kind: FacetKind;
+  columnId?: string | null;
+  semantic?: SemanticType | null;
+  selection: FacetSelection;
+  topN?: number | null;
+  search?: string | null;
+  bins?: number | null;
+  pinned: boolean;
+  collapsed: boolean;
+  width?: number | null;
+}
+
+/** The saved multi-facet configuration (extends a named F12 view). */
+export interface FacetConfig {
+  facets: FacetSpec[];
+}
+
+/** One computed bucket: a selectable value/category with its cross-filtered count. */
+export interface FacetBucket {
+  key: string;
+  label: string;
+  count: number;
+  selected: boolean;
+  /** Numeric/date histogram bins carry their edges (timestamps for dates). */
+  lo?: number;
+  hi?: number;
+}
+
+/** Observed extent and current selection of a number / date facet. */
+export interface RangeInfo {
+  min: string | null;
+  max: string | null;
+  selectedMin: string | null;
+  selectedMax: string | null;
+}
+
+/** One facet's computed result: its bounded buckets plus metadata. */
+export interface FacetResult {
+  id: string;
+  kind: FacetKind;
+  columnId?: string;
+  mode: FacetMode;
+  active: boolean;
+  /** Column/inputs could not be resolved (missing column / no cached data). */
+  unresolved: boolean;
+  /** Counts estimated from a sample (large indexed document). */
+  sampled: boolean;
+  /** Text facet only: distinct-value map hit its memory cap. */
+  truncated: boolean;
+  /** Text facet only: distinct values observed. */
+  distinct?: number;
+  buckets: FacetBucket[];
+  range?: RangeInfo;
+}
+
+/** The full result of a facet computation over one document. */
+export interface FacetResultSet {
+  revision: number;
+  matchedRows: number;
+  totalRows: number;
+  scannedRows: number;
+  sampled: boolean;
+  facets: FacetResult[];
+}
+
+/** A facet that had no faithful column-filter equivalent during conversion. */
+export interface DroppedFacet {
+  id: string;
+  reason: string;
+}
+
+/** Result of the one-way facets → filter-builder conversion. */
+export interface FacetConversion {
+  filter: FilterGroup;
+  dropped: DroppedFacet[];
 }
 
 /** The persisted settings document (versioned JSON in app-data). */

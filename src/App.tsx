@@ -26,6 +26,7 @@ import { EmptyState } from "./components/EmptyState";
 import { EncodingIssuesDialog } from "./components/EncodingIssuesDialog";
 import { ExportDialog } from "./components/ExportDialog";
 import { ExternalChangeDialog } from "./components/ExternalChangeDialog";
+import { FacetsPanel } from "./components/FacetsPanel";
 import { FilterDialog } from "./components/FilterDialog";
 import { FindBar } from "./components/FindBar";
 import { FollowBar } from "./components/FollowBar";
@@ -306,6 +307,7 @@ export default function App() {
         {changesOpen && meta && <ChangesPanel />}
         {annotationsPanelOpen && meta && <AnnotationsPanel />}
         {meta && <ColumnExplorerPanel />}
+        {meta && <FacetsPanel />}
         {meta && <FormView />}
       </main>
 
