@@ -44,6 +44,11 @@ and faithful on large, real-world delimited files.**
   bounded memory, then **Convert to editable** when you need to change cells.
 - Open **compressed files** — `.csv.gz` and `.zip` archives (with an entry
   chooser) — and export back to gzip. Decompression-bomb guards included.
+- **Open JSON / JSON Lines** — import an array of objects, an array of
+  arrays, NDJSON, or a record array at a JSON Pointer, with a preview that
+  detects the shape, infers columns, counts missing vs explicit-null cells,
+  and lets you flatten, preserve, join, or explode nested objects and
+  arrays. JSON Lines opens read-only with bounded memory.
 - Auto-detect the **delimiter** (comma, tab, semicolon, pipe) with a manual /
   custom override — plus an **advanced import** for preambles, comment
   lines, custom quoting/escaping, multi-row headers, and footers.
@@ -80,6 +85,10 @@ and faithful on large, real-world delimited files.**
   selected rows / columns, or a cell range; optionally split the output by row
   count, approximate file size, or a column's values (one file per group),
   with an optional JSON manifest recording row counts and SHA-256 hashes.
+- **Export as JSON** — write any export scope as an array of objects, an
+  array of arrays, or JSON Lines; typed columns emit real numbers and
+  booleans, nested objects rebuild from dotted-path columns, and duplicate
+  output paths are rejected before writing.
 
 **Reliability**
 

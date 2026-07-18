@@ -8,6 +8,32 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **JSON & JSON Lines interoperability** (palette → "Open JSON…" and
+  "Export as JSON…"): open structured JSON without pre-converting to CSV —
+  an array of objects, an array of arrays, JSON Lines / NDJSON, or an
+  object holding a record array at a JSON Pointer (candidate paths are
+  auto-detected, or type your own). The import preview reports the detected
+  shape, the inferred per-column type, projected rows and columns,
+  nested-object and array-valued fields, and exact present / explicit-null /
+  missing counts — and a MISSING property stays distinct from an explicit
+  `null` end to end, through editing and back out on export. Choose how
+  nested objects map (flatten to dotted-path columns, preserve as compact
+  JSON, or ignore selected paths) and how arrays map (preserve as JSON, join
+  primitives with a separator, explode into one row per element, or reject);
+  exploding two array fields at once requires an explicit cartesian-or-zip
+  choice. JSON Lines opens with bounded memory and can back a read-only
+  indexed document like a large CSV, and the column union across records is
+  deterministic (first-seen order, then alphabetical for keys that appear
+  later). Export any scope the CSV exporter supports as an array of objects,
+  an array of arrays, or JSON Lines: columns with a declared schema emit real
+  JSON numbers, booleans, and re-inflated JSON (null tokens become `null`),
+  nested objects rebuild from dotted-path columns, and duplicate or
+  conflicting output paths are rejected before a byte is written. Invalid
+  JSON is reported with its byte offset, line, column, and surrounding
+  context and never leaves a partially opened document; every import and
+  export runs as a cancellable job with progress, and imported files land
+  through the same pipeline as a CSV open (tabs, dirty tracking,
+  diagnostics). Exported JSON is always UTF-8 and reparses cleanly.
 - **Explicit schemas and typed columns** (palette → "Edit schema…", or a
   column header's menu): declare an explicit logical type per column —
   text, integer, decimal, float, boolean, date, datetime, UUID, or JSON —
