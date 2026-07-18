@@ -2904,13 +2904,17 @@ pub async fn start_highlight_report(
     }
     let rules = store.list_rules(doc_id)?;
     let actx = analysis_context(doc_id, &diagnostics_cache, &crossval_cache, &outlier_cache);
-    let ctx = jobs.begin_for_app(&app, "highlightReport", Some(doc_id));
+    // Register under the shared "export" kind so the running report is tracked
+    // in `fileJobs` and gets the StatusBar progress + Cancel control (and its
+    // cancel request actually reaches the row loop below via `ctx`).
+    let ctx = jobs.begin_for_app(&app, "export", Some(doc_id));
     let job_id = ctx.id;
     tauri::async_runtime::spawn(async move {
-        let _ = crate::job::run_blocking(ctx, move |_ctx| {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
             let doc = handle.read().map_err(poisoned)?;
             doc.check_revision(expected_revision)?;
-            let report: MatchReport = crate::highlight::build_report(rules, &doc, &actx, &scope)?;
+            let report: MatchReport =
+                crate::highlight::build_report(rules, &doc, &actx, &scope, Some(ctx))?;
             let bytes = crate::highlight::serialize_report(&report, format)?;
             save_mod::atomic_write(Path::new(&path), BackupPolicy::None, |f| {
                 use std::io::Write;

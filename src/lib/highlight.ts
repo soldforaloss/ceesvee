@@ -407,3 +407,64 @@ export function withDecoration(
 ): HighlightDecoration {
   return { ...decoration, ...patch };
 }
+
+// ----- debounced draft persistence ------------------------------------------
+
+/** A debounced writer for the in-progress rule edit. The dialog persists a
+ *  draft on a short debounce for a live grid preview, but a pending write must
+ *  never be lost when the user switches rules or closes the dialog inside the
+ *  debounce window — {@link DraftPersister.flush} commits it synchronously. */
+export interface DraftPersister<T> {
+  /** (Re)schedule a debounced persist of `draft`, replacing any pending one. */
+  schedule(draft: T): void;
+  /** Persist the latest scheduled draft immediately, if one is still pending. */
+  flush(): void;
+  /** Drop the pending draft without persisting it (e.g. its rule was deleted). */
+  cancel(): void;
+}
+
+/**
+ * A debounced draft writer that never silently drops a pending edit.
+ *
+ * `schedule` (re)arms a timer; when it fires — or when `flush` is called first,
+ * on rule-switch or dialog-close — the latest scheduled draft is written iff
+ * `shouldPersist` still accepts it (re-evaluated at write time against current
+ * state, so an edit reverted back to its stored value, or made invalid, is a
+ * no-op). `cancel` discards the pending draft outright.
+ */
+export function createDraftPersister<T>(opts: {
+  delayMs: number;
+  persist: (draft: T) => void;
+  shouldPersist: (draft: T) => boolean;
+}): DraftPersister<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let pending: { draft: T } | null = null;
+
+  const clearTimer = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  const write = () => {
+    clearTimer();
+    if (pending === null) return;
+    const { draft } = pending;
+    pending = null;
+    if (opts.shouldPersist(draft)) opts.persist(draft);
+  };
+
+  return {
+    schedule(draft) {
+      pending = { draft };
+      clearTimer();
+      timer = setTimeout(write, opts.delayMs);
+    },
+    flush: write,
+    cancel() {
+      clearTimer();
+      pending = null;
+    },
+  };
+}

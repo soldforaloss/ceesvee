@@ -53,6 +53,7 @@ use crate::diagnostics::DiagnosticsReport;
 use crate::document::Document;
 use crate::dto::ExportScope;
 use crate::error::{AppError, AppResult};
+use crate::job::JobCtx;
 use crate::outlier::CachedOutlier;
 use crate::schema::{self, CellState, ColumnSchema, LogicalType};
 
@@ -1411,11 +1412,17 @@ impl DocState {
 
     /// Build a complete match report over `scope` (absolute coordinates). One
     /// entry per matched (cell, rule) pair, winning flag set on the top rule.
+    ///
+    /// When a [`JobCtx`] is supplied (the export command wraps this in a job),
+    /// each scanned row advances it — streaming throttled progress AND observing
+    /// cooperative cancellation. A `jobs.cancel` request aborts the scan with
+    /// [`AppError::Cancelled`] instead of running to completion.
     pub fn report(
         &mut self,
         doc: &Document,
         actx: &AnalysisContext,
         scope: &ExportScope,
+        ctx: Option<&JobCtx>,
     ) -> AppResult<MatchReport> {
         self.ensure_cached(doc, actx)?;
         let volatile = self.volatile_matches(doc, actx)?;
@@ -1424,8 +1431,16 @@ impl DocState {
         let n_cols = doc.n_cols();
 
         let scope_rows = crate::export_scope::resolve_scope(doc, scope)?.rows;
+        if let Some(ctx) = ctx {
+            ctx.set_total(scope_rows.len() as u64);
+        }
         let mut entries = Vec::new();
         for abs in scope_rows {
+            // The report scans scope_rows × columns × rules; checkpoint once per
+            // row so a large report stays cancellable and reports progress.
+            if let Some(ctx) = ctx {
+                ctx.advance(1)?;
+            }
             for col in 0..n_cols {
                 let mut winning = true;
                 for &entry_idx in &order {
@@ -1489,10 +1504,11 @@ pub fn build_report(
     doc: &Document,
     actx: &AnalysisContext,
     scope: &ExportScope,
+    ctx: Option<&JobCtx>,
 ) -> AppResult<MatchReport> {
     let mut state = DocState::default();
     state.set_rules(rules)?;
-    state.report(doc, actx, scope)
+    state.report(doc, actx, scope, ctx)
 }
 
 /// Serialize a match report to the requested format.
@@ -1646,7 +1662,7 @@ impl HighlightStore {
         actx: &AnalysisContext,
         scope: &ExportScope,
     ) -> AppResult<MatchReport> {
-        self.with_state(doc_id, |s| s.report(doc, actx, scope))?
+        self.with_state(doc_id, |s| s.report(doc, actx, scope, None))?
     }
 
     /// Per-rule live match counts (rule id → count), in store order.
@@ -2322,6 +2338,65 @@ mod tests {
                 .is_some_and(|l| l.starts_with("0,0,") && l.contains(",r,r,")),
             "expected one data row referencing rule r, got: {csv}"
         );
+    }
+
+    #[test]
+    fn report_job_reports_progress_and_honors_cancellation() {
+        use crate::job::{JobEvent, JobRegistry};
+        use std::sync::{Arc, Mutex};
+
+        let d = doc("a,b\nx,1\ny,2\nz,3");
+        let c0 = col_id(&d, 0);
+        let rules = || {
+            vec![rule(
+                "r",
+                HighlightCondition::Equals {
+                    column_id: Some(c0.clone()),
+                    value: "x".into(),
+                    case_sensitive: false,
+                },
+                HighlightTarget::Cell,
+            )]
+        };
+        let registry = JobRegistry::default();
+
+        // A live (uncancelled) job produces the same entries as the un-jobbed
+        // path and sizes the job's progress bar to the scanned row count via
+        // set_total (per-row advances are throttled, so their emitted count is
+        // timing-dependent and not asserted here — the cancellation half below
+        // proves the row loop actually calls advance).
+        let events: Arc<Mutex<Vec<JobEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let ctx = registry.begin("export", None, move |e| sink.lock().unwrap().push(e));
+        let ok = build_report(
+            rules(),
+            &d,
+            &AnalysisContext::default(),
+            &ExportScope::All,
+            Some(&ctx),
+        )
+        .unwrap();
+        assert_eq!(ok.entries.len(), 1);
+        let reported_total = events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, JobEvent::Progress(p) if p.total == Some(3)));
+        assert!(reported_total, "set_total reports the three scanned rows");
+
+        // Cancelling before the scan runs: the row loop observes it on the very
+        // first row and aborts instead of running to completion.
+        let ctx = registry.begin("export", None, |_| {});
+        assert!(registry.cancel(ctx.id));
+        let err = build_report(
+            rules(),
+            &d,
+            &AnalysisContext::default(),
+            &ExportScope::All,
+            Some(&ctx),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Cancelled));
     }
 
     // ----- validation -----------------------------------------------------

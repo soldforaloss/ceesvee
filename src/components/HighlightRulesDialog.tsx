@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   CONDITION_GROUPS,
@@ -11,6 +11,7 @@ import {
   conditionColumnId,
   conditionReserved,
   conditionSupportsColumn,
+  createDraftPersister,
   defaultCondition,
   describeCondition,
   describeTarget,
@@ -20,6 +21,7 @@ import {
   validateHighlightRule,
   withDecoration,
   type ConditionKind,
+  type DraftPersister,
 } from "../lib/highlight";
 import { useActiveMeta, useStore } from "../store/useStore";
 import type {
@@ -80,24 +82,48 @@ export function HighlightRulesDialog({ onClose }: { onClose: () => void }) {
   const ordered = useMemo(() => orderRulesByPriority(rules), [rules]);
   const draftError = draft ? validateHighlightRule(draft) : null;
 
-  // Persist a valid, changed draft after a short debounce → live grid preview.
-  // Invalid drafts show their error inline and are never stored.
+  // A valid, changed draft is persisted after a short debounce → live grid
+  // preview. Invalid drafts show their error inline and are never stored. The
+  // persister is flushed before the draft can be discarded — on rule-switch
+  // (select), on replace (add/duplicate) and on dialog-close (handleClose + the
+  // unmount effect) — so an edit made inside the debounce window is never lost.
+  const persisterRef = useRef<DraftPersister<HighlightRule> | null>(null);
+  if (persisterRef.current === null) {
+    persisterRef.current = createDraftPersister<HighlightRule>({
+      delayMs: 350,
+      persist: (rule) => void useStore.getState().upsertHighlightRule(rule),
+      shouldPersist: (rule) => {
+        if (validateHighlightRule(rule)) return false;
+        const stored = useStore.getState().highlight.rules.find((r) => r.id === rule.id);
+        return !(stored && JSON.stringify(stored) === JSON.stringify(rule));
+      },
+    });
+  }
+  const persister = persisterRef.current;
+
   useEffect(() => {
-    if (!draft || validateHighlightRule(draft)) return;
-    const stored = useStore.getState().highlight.rules.find((r) => r.id === draft.id);
-    if (stored && JSON.stringify(stored) === JSON.stringify(draft)) return;
-    const t = setTimeout(() => void useStore.getState().upsertHighlightRule(draft), 350);
-    return () => clearTimeout(t);
-  }, [draft]);
+    if (draft) persister.schedule(draft);
+  }, [draft, persister]);
+
+  // Escape / backdrop / X all unmount this dialog; flush any pending edit so a
+  // close inside the debounce window still persists it.
+  useEffect(() => () => persister.flush(), [persister]);
 
   if (!meta) return null;
 
+  const handleClose = () => {
+    persister.flush();
+    onClose();
+  };
+
   const select = (id: string) => {
+    persister.flush();
     setSelectedId(id);
     setDraft(rules.find((r) => r.id === id) ?? null);
   };
 
   const addRule = () => {
+    persister.flush();
     const rule = newHighlightRule(rules);
     setSelectedId(rule.id);
     setDraft(rule);
@@ -105,6 +131,7 @@ export function HighlightRulesDialog({ onClose }: { onClose: () => void }) {
   };
 
   const duplicate = (rule: HighlightRule) => {
+    persister.flush();
     const copy = { ...newHighlightRule(rules), name: rule.name ? `${rule.name} copy` : "" };
     copy.condition = { ...rule.condition };
     copy.target =
@@ -118,6 +145,9 @@ export function HighlightRulesDialog({ onClose }: { onClose: () => void }) {
   };
 
   const remove = (id: string) => {
+    // The deleted rule is the selected draft; drop its pending edit rather than
+    // flushing it (which would resurrect the row we're about to remove).
+    persister.cancel();
     void deleteRule(id);
     if (selectedId === id) {
       const next = ordered.find((r) => r.id !== id);
@@ -164,7 +194,7 @@ export function HighlightRulesDialog({ onClose }: { onClose: () => void }) {
   return (
     <Modal
       title="Conditional highlighting"
-      onClose={onClose}
+      onClose={handleClose}
       size="2xl"
       footer={
         <>
@@ -195,7 +225,7 @@ export function HighlightRulesDialog({ onClose }: { onClose: () => void }) {
             </button>
           </div>
           <button
-            onClick={onClose}
+            onClick={handleClose}
             className="rounded px-3 py-1.5 text-sm text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
           >
             Close

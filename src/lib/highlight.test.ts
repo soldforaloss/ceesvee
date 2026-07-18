@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   CONDITION_LABELS,
@@ -7,6 +7,7 @@ import {
   conditionColumnId,
   conditionReserved,
   conditionSupportsColumn,
+  createDraftPersister,
   defaultCondition,
   describeCondition,
   highlightAccent,
@@ -223,5 +224,90 @@ describe("newHighlightRule", () => {
 
   it("gives each new rule a distinct id", () => {
     expect(newHighlightRule([]).id).not.toEqual(newHighlightRule([]).id);
+  });
+});
+
+// The dialog persists an in-progress rule edit on a short debounce, but a
+// pending write must survive a rule-switch or dialog-close inside that window
+// (F42 self-review finding: a discarded edit was silently lost). These pin the
+// flush/cancel guarantees the dialog relies on so no valid edit is dropped.
+describe("createDraftPersister", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const setup = (shouldPersist: (d: string) => boolean = () => true) => {
+    const persisted: string[] = [];
+    const p = createDraftPersister<string>({
+      delayMs: 350,
+      persist: (d) => persisted.push(d),
+      shouldPersist,
+    });
+    return { p, persisted };
+  };
+
+  it("persists after the debounce delay", () => {
+    const { p, persisted } = setup();
+    p.schedule("a");
+    vi.advanceTimersByTime(349);
+    expect(persisted).toEqual([]);
+    vi.advanceTimersByTime(1);
+    expect(persisted).toEqual(["a"]);
+  });
+
+  it("flush persists the pending draft immediately and only once", () => {
+    const { p, persisted } = setup();
+    p.schedule("a");
+    p.flush();
+    expect(persisted).toEqual(["a"]);
+    // The armed timer must not fire a second, duplicate write.
+    vi.advanceTimersByTime(1000);
+    expect(persisted).toEqual(["a"]);
+  });
+
+  it("flush with nothing pending is a no-op", () => {
+    const { p, persisted } = setup();
+    p.flush();
+    vi.advanceTimersByTime(1000);
+    expect(persisted).toEqual([]);
+  });
+
+  it("cancel drops the pending draft so it is never written", () => {
+    const { p, persisted } = setup();
+    p.schedule("a");
+    p.cancel();
+    vi.advanceTimersByTime(1000);
+    p.flush();
+    expect(persisted).toEqual([]);
+  });
+
+  it("re-scheduling replaces the pending draft (latest wins)", () => {
+    const { p, persisted } = setup();
+    p.schedule("a");
+    p.schedule("b");
+    p.flush();
+    expect(persisted).toEqual(["b"]);
+  });
+
+  it("does not persist a draft rejected by shouldPersist", () => {
+    const { p, persisted } = setup((d) => d !== "unchanged");
+    p.schedule("unchanged");
+    p.flush();
+    vi.advanceTimersByTime(1000);
+    expect(persisted).toEqual([]);
+  });
+
+  it("re-evaluates shouldPersist at write time, not schedule time", () => {
+    let accept = false;
+    const persisted: string[] = [];
+    const p = createDraftPersister<string>({
+      delayMs: 350,
+      persist: (d) => persisted.push(d),
+      shouldPersist: () => accept,
+    });
+    p.schedule("a");
+    // Becomes persistable only after scheduling; the timer honours it.
+    accept = true;
+    vi.advanceTimersByTime(350);
+    expect(persisted).toEqual(["a"]);
   });
 });
