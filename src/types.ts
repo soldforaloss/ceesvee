@@ -1868,6 +1868,113 @@ export interface JsonExportOptions {
   backup: BackupPolicy;
 }
 
+// ----- Parquet / Arrow interop (F32) ----------------------------------------
+
+/**
+ * The three supported columnar container formats (mirrors Rust
+ * `ColumnarFormat`). `arrowFile` is Apache Arrow IPC file, a.k.a. Feather v2 —
+ * the same container; surface that alias in UI copy.
+ */
+export type ColumnarFormat = "parquet" | "arrowFile" | "arrowStream";
+
+/**
+ * What to do with a nested field the flat text contract cannot carry directly
+ * (list, map, …) — mirrors Rust `ComplexPolicy`. `explode` is editable-open
+ * only and permits at most one list column per open.
+ */
+export type ComplexPolicy = "preserveJson" | "explode" | "reject";
+
+/** Options for inspect / open-indexed / open-editable (mirrors Rust
+ * `ColumnarOpenOptions`). All fields are optional; the backend defaults apply. */
+export interface ColumnarOpenOptions {
+  /** Default policy for every complex field. */
+  complexPolicy?: ComplexPolicy;
+  /** Per-field overrides, keyed by the flattened path-based column name. */
+  fieldPolicies?: Record<string, ComplexPolicy>;
+  /** Decoded-block LRU budget override in bytes (0 = backend default). */
+  cacheBudgetBytes?: number;
+}
+
+/** One column as reported by `columnar_inspect` (mirrors Rust
+ * `InspectedColumn`). */
+export interface InspectedColumn {
+  /** Flattened path-based name (struct segments escaped and dot-joined). */
+  name: string;
+  /** The arrow type for display (`Int64`, `Timestamp(µs, Europe/Berlin)`, …). */
+  arrowType: string;
+  /** The F31 logical type the column maps to. */
+  logicalType: LogicalType;
+  nullable: boolean;
+  /** Preserved IANA timezone for zoned timestamp columns. */
+  timeZone?: string;
+  /** Whether the column came out of a nested field (struct flattening or a
+   * complex-field policy). */
+  nested: boolean;
+}
+
+/** Everything the open dialog needs BEFORE opening a columnar file (mirrors
+ * Rust `ColumnarInspection`). */
+export interface ColumnarInspection {
+  /** Wire format name: `parquet` / `arrowFile` / `arrowStream`. */
+  format: ColumnarFormat;
+  rowCount: number;
+  /** Parquet row groups / Arrow record batches. */
+  chunkCount: number;
+  /** Distinct parquet compression codecs; absent for Arrow IPC. */
+  compression?: string;
+  /** Columns under the DEFAULT policies (complex fields preserved as JSON). */
+  columns: InspectedColumn[];
+  /** Flattened paths of complex fields that take a `ComplexPolicy`. */
+  complexFields: string[];
+  /** Rough bytes the fully editable in-memory document would need. */
+  estimatedMemory: number;
+  /** Whether opening editable should require an explicit choice. */
+  needsDecision: boolean;
+  fileSize: number;
+}
+
+/** Parquet compression codec choice (mirrors Rust `ColumnarCompression`).
+ * Applies to Parquet only; Arrow IPC output is always uncompressed. */
+export type ColumnarCompression = "uncompressed" | "snappy" | "zstd";
+
+/** Options for a columnar export (mirrors Rust `ColumnarExportOptions`). */
+export interface ColumnarExportOptions {
+  /** Output container: Parquet, Arrow IPC file (Feather v2) or stream. */
+  format: ColumnarFormat;
+  /** Parquet compression codec (ignored for the Arrow IPC formats). */
+  compression: ColumnarCompression;
+  /** Emit typed arrow columns for columns with a declared F31 schema;
+   * `false` writes every column as Utf8 text. */
+  typed: boolean;
+  /** Parquet only: max rows per row group (0 = writer default). Smaller
+   * groups give the read side's statistics pruning more to skip. */
+  rowGroupRows: number;
+  /** Backup policy for the previous destination file. */
+  backup: BackupPolicy;
+}
+
+/** Per-column invalid-cell total on a finished export (mirrors Rust
+ * `ColumnWarning`). */
+export interface ColumnWarning {
+  name: string;
+  /** Cells written as NULL because they could not be represented under the
+   * declared schema / chosen arrow type. */
+  invalidCells: number;
+}
+
+/** What a finished columnar export produced (mirrors Rust
+ * `ColumnarExportReport`). */
+export interface ColumnarExportReport {
+  format: ColumnarFormat;
+  rows: number;
+  columns: number;
+  bytes: number;
+  /** Total cells exported as NULL with a warning. */
+  invalidCells: number;
+  /** Per-column breakdown (only columns with at least one warning). */
+  columnWarnings: ColumnWarning[];
+}
+
 // ----- project workspaces (F37) ---------------------------------------------
 
 /** Header state of the open project, for the project bar (F37). */

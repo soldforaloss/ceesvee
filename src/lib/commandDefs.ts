@@ -73,6 +73,14 @@ function staticCommands(): AppCommand[] {
       run: () => void state().openJsonDialog(),
     },
     {
+      id: "file.openColumnar",
+      title: "Open Parquet/Arrow…",
+      keywords: ["parquet", "arrow", "feather", "ipc", "columnar", "import", "typed"],
+      category: "File",
+      allowInEditable: true,
+      run: () => void state().openColumnarDialog(),
+    },
+    {
       id: "file.save",
       title: "Save",
       keywords: ["write", "persist"],
@@ -107,6 +115,14 @@ function staticCommands(): AppCommand[] {
       category: "Export",
       unavailableReason: needsDoc,
       run: () => openModal("jsonExport"),
+    },
+    {
+      id: "file.exportColumnar",
+      title: "Export as Parquet/Arrow…",
+      keywords: ["parquet", "arrow", "feather", "ipc", "columnar", "typed", "snappy", "zstd"],
+      category: "Export",
+      unavailableReason: needsDoc,
+      run: () => openModal("columnarExport"),
     },
     {
       id: "file.closeTab",

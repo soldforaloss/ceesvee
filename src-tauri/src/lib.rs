@@ -11,6 +11,11 @@ mod append;
 mod archive;
 mod clipboard;
 mod cluster;
+/// F32 Parquet/Arrow write side: scoped typed exports (declared F31 logical
+/// types → arrow types, invalid cells → null + counted warning) to Parquet
+/// and Arrow IPC through the atomic-save pipeline. Public like
+/// [`parquet_arrow`] so the test harness exercises the round trip directly.
+pub mod columnar_export;
 mod commands;
 mod compare;
 mod crossval;
@@ -55,6 +60,12 @@ mod json_export;
 /// JSON export stage.
 pub mod json_import;
 mod outlier;
+/// Public like [`job`]: the F32 Parquet/Arrow read engine (format detection,
+/// inspection, the indexed read-only columnar backing with typed-text
+/// conversion and row-group statistics pruning, nested-field policies, and
+/// editable materialisation) consumed by the F32 command surface, the export
+/// stage and the test harness.
+pub mod parquet_arrow;
 mod parse;
 mod paste;
 mod pii;
@@ -164,6 +175,7 @@ pub fn run() {
         .manage(crate::pii::PiiCache::default())
         .manage(crate::follow::FollowRegistry::default())
         .manage(crate::json_import::JsonImportPreviewCache::default())
+        .manage(crate::columnar_export::ColumnarExportReportCache::default())
         .manage(crate::project::ProjectStore::default())
         .manage(crate::annotations::AnnotationRegistry::default())
         .manage(crate::highlight::HighlightStore::default())
@@ -261,6 +273,11 @@ pub fn run() {
             commands::get_json_import_preview,
             commands::json_import_apply,
             commands::json_export,
+            commands::columnar_inspect,
+            commands::columnar_open_indexed,
+            commands::columnar_open_editable,
+            commands::columnar_export,
+            commands::get_columnar_export_report,
             commands::get_settings,
             commands::set_settings,
             commands::validate_profile,

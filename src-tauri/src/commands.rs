@@ -20,6 +20,9 @@ use crate::append::{self, AppendCache, AppendInput, AppendOptions, AppendPreview
 use crate::archive::{self, ArchiveCache, ZipEntryInfo};
 use crate::clipboard::{self, CopyFormat};
 use crate::cluster::{self, ClusterCache, ClusterReport, ClusterSpec};
+use crate::columnar_export::{
+    ColumnarExportOptions, ColumnarExportReport, ColumnarExportReportCache,
+};
 use crate::compare::{self, CompareCache, CompareInfo, ComparePage, CompareSpec, DiffStatus};
 use crate::crossval::{self, CrossRule, CrossValCache, CrossValReport};
 use crate::dedup::{self, DedupCache, DedupSpec, DuplicateKeepStrategy, DuplicateReport};
@@ -51,6 +54,7 @@ use crate::json_import::{JsonImportOptions, JsonImportPreview, JsonImportPreview
 use crate::outlier::{
     self, CachedOutlier, OutlierAction, OutlierActionPreview, OutlierCache, OutlierSpec,
 };
+use crate::parquet_arrow::{ColumnarInspection, ColumnarOpenOptions};
 use crate::parse::{parse, ParseSettings, ParsedFile};
 use crate::paste::{self, PasteOptions, PastePreview};
 use crate::pii::{self, CachedPii, PiiCache, PiiSpec, RedactionAction, RedactionPreview};
@@ -498,7 +502,17 @@ pub async fn start_convert_to_editable(
             return Err(AppError::invalid("document is already editable"));
         }
         if !force {
-            if let Some(path) = doc.path.as_deref() {
+            // F32 columnar documents carry their own open-time estimate (the
+            // CSV sampler cannot read a binary parquet/arrow file).
+            if let Some(columnar) = doc.columnar_handle() {
+                if columnar.convert_needs_decision() {
+                    return Err(AppError::invalid(format!(
+                        "the estimated in-memory size is about {} MB, which may exhaust memory — \
+                         export a slice instead, or convert anyway",
+                        columnar.editable_estimate() / (1024 * 1024)
+                    )));
+                }
+            } else if let Some(path) = doc.path.as_deref() {
                 let est = index::estimate(path)?;
                 if est.needs_decision {
                     return Err(AppError::invalid(format!(
@@ -517,26 +531,41 @@ pub async fn start_convert_to_editable(
         let _ = crate::job::run_blocking(ctx, move |ctx| {
             // Stream the rows out under a read lock (reads stay available),
             // then commit under a brief write lock, revision-guarded.
-            let (rows, revision) = {
+            let (rows, schemas, revision) = {
                 let doc = handle.read().map_err(poisoned)?;
                 if doc.is_editable() {
                     return Err(AppError::invalid("document is already editable"));
                 }
-                let n = doc.n_rows();
-                ctx.set_total(n as u64);
-                let mut rows: Vec<Vec<String>> = Vec::with_capacity(n);
-                let mut pending = 0u64;
-                doc.visit_rows(0..n, &mut |_, row| {
-                    rows.push(row.to_vec());
-                    pending += 1;
-                    if pending >= 4096 {
-                        ctx.advance(pending)?;
-                        pending = 0;
+                // F32 columnar documents convert through the Option plane so
+                // NULL stays distinct from the empty string: each
+                // null-containing column gets a collision-free null token
+                // recorded in its schema.
+                if let Some(columnar) = doc.columnar_handle() {
+                    let plan = crate::parquet_arrow::plan_editable(columnar, Some(ctx))?;
+                    let mut schemas = plan.schemas;
+                    for (i, schema) in schemas.iter_mut().enumerate() {
+                        if let Some(id) = doc.column_ids().get(i) {
+                            schema.column_id = id.clone();
+                        }
                     }
-                    Ok(true)
-                })?;
-                ctx.advance(pending)?;
-                (rows, doc.revision())
+                    (plan.rows, Some(schemas), doc.revision())
+                } else {
+                    let n = doc.n_rows();
+                    ctx.set_total(n as u64);
+                    let mut rows: Vec<Vec<String>> = Vec::with_capacity(n);
+                    let mut pending = 0u64;
+                    doc.visit_rows(0..n, &mut |_, row| {
+                        rows.push(row.to_vec());
+                        pending += 1;
+                        if pending >= 4096 {
+                            ctx.advance(pending)?;
+                            pending = 0;
+                        }
+                        Ok(true)
+                    })?;
+                    ctx.advance(pending)?;
+                    (rows, None, doc.revision())
+                }
             };
             ctx.check()?; // last cancellation point before the commit
 
@@ -545,6 +574,19 @@ pub async fn start_convert_to_editable(
             // materialised rows would no longer match.
             doc.check_revision(revision)?;
             doc.make_editable(rows)?;
+            if let Some(schemas) = schemas {
+                for schema in schemas {
+                    doc.set_column_schema(schema);
+                }
+                // F32: the editable rows no longer mirror the binary
+                // parquet/arrow file — cut the path so a subsequent Save can
+                // never write CSV bytes over the columnar source. The
+                // document continues as an unsaved derived table (Save asks
+                // for a new destination; closing warns).
+                doc.path = None;
+                doc.set_fingerprint(None);
+                doc.mark_derived_unsaved();
+            }
             Ok(())
         })
         .await;
@@ -568,6 +610,13 @@ pub async fn start_reindex(
         if doc.is_editable() {
             return Err(AppError::invalid(
                 "only indexed documents reload by re-indexing",
+            ));
+        }
+        // The CSV indexer cannot read a binary columnar file; F32 documents
+        // reload by reopening the file through the columnar open flow.
+        if doc.columnar_handle().is_some() {
+            return Err(AppError::invalid(
+                "Parquet/Arrow documents reload by reopening the file",
             ));
         }
         let path = doc
@@ -4774,4 +4823,202 @@ pub async fn json_export(
         .await;
     });
     Ok(job_id)
+}
+
+// ----- Parquet / Arrow interop (F32) -------------------------------------------
+
+/// Inspect a Parquet / Arrow IPC file BEFORE any open: container format
+/// (Feather v2 IS the Arrow IPC file format — say so in UI copy), row and
+/// row-group/batch counts, columns mapped to the F31 logical types,
+/// compression codecs, nested (complex) fields, and the editable-memory
+/// estimate with its decision flag.
+#[tauri::command]
+pub async fn columnar_inspect(path: String) -> AppResult<ColumnarInspection> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::parquet_arrow::inspect(Path::new(&path), None)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Open a Parquet / Arrow file as an indexed READ-ONLY document: windowed
+/// columnar reads behind the same grid/filter/export machinery as an F10
+/// indexed CSV, with convert-to-editable available later
+/// (`start_convert_to_editable` handles columnar documents). Runs under the
+/// F10 job kind ("openIndexed") so the front end's existing completion path
+/// adds the tab; the document registers under the returned doc id when the
+/// job finishes. Explode policies are rejected here — they change the row
+/// count, which an indexed backing cannot represent; use
+/// `columnar_open_editable`. Creates no on-disk caches, so cancellation
+/// leaves nothing behind.
+#[tauri::command]
+pub async fn columnar_open_indexed(
+    path: String,
+    options: Option<ColumnarOpenOptions>,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<IndexedOpenStart> {
+    let options = options.unwrap_or_default();
+    let doc_id = lock(&state)?.alloc_id();
+    let ctx = jobs.begin_for_app(&app, "openIndexed", Some(doc_id));
+    let job_id = ctx.id;
+    let app_for_job = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            use tauri::Manager;
+            let source = PathBuf::from(&path);
+            let fingerprint = util::stat_fingerprint(&source);
+            let file = crate::parquet_arrow::open_indexed(&source, &options, Some(ctx))?;
+            let mut doc = Document::from_columnar(doc_id, Some(source), file);
+            doc.set_fingerprint(fingerprint);
+            let registry = app_for_job.state::<Mutex<AppState>>();
+            registry
+                .lock()
+                .map_err(|_| AppError::Other("internal state lock error".into()))?
+                .insert(doc);
+            Ok(())
+        })
+        .await;
+    });
+    Ok(IndexedOpenStart { job_id, doc_id })
+}
+
+/// Open a Parquet / Arrow file straight into a fully editable in-memory
+/// document, honouring EVERY complex-field policy including exploding one
+/// list column into rows. Re-runs the memory estimate first; pass `force`
+/// after an explicit user decision. NULLs stay distinct from empty strings
+/// via collision-free per-column null tokens recorded on the generated
+/// schemas. The document opens UNSAVED with no path: its rows no longer
+/// mirror the binary columnar file, and Save must never write CSV bytes
+/// over a .parquet/.arrow source.
+#[tauri::command]
+pub async fn columnar_open_editable(
+    path: String,
+    options: Option<ColumnarOpenOptions>,
+    force: bool,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<IndexedOpenStart> {
+    let options = options.unwrap_or_default();
+    if !force {
+        let probe = path.clone();
+        let inspection = tauri::async_runtime::spawn_blocking(move || {
+            crate::parquet_arrow::inspect(Path::new(&probe), None)
+        })
+        .await
+        .map_err(|e| AppError::Other(format!("background task failed: {e}")))??;
+        if inspection.needs_decision {
+            return Err(AppError::invalid(format!(
+                "the estimated in-memory size is about {} MB, which may exhaust memory — \
+                 open read-only (indexed) instead, or open editable anyway",
+                inspection.estimated_memory / (1024 * 1024)
+            )));
+        }
+    }
+    let doc_id = lock(&state)?.alloc_id();
+    let ctx = jobs.begin_for_app(&app, "openIndexed", Some(doc_id));
+    let job_id = ctx.id;
+    let app_for_job = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            use tauri::Manager;
+            let table =
+                crate::parquet_arrow::open_editable_rows(Path::new(&path), &options, Some(ctx))?;
+            let n_cols = table.headers.len();
+            let mut records = Vec::with_capacity(table.rows.len() + 1);
+            records.push(table.headers);
+            records.extend(table.rows);
+            let parsed = ParsedFile {
+                records,
+                n_cols,
+                delimiter: b',',
+                encoding: encoding_rs::UTF_8,
+                had_bom: false,
+                uses_crlf: false,
+                import: crate::parse::ImportInfo::default(),
+            };
+            let mut doc = Document::from_parsed(doc_id, None, parsed, true);
+            for (i, mut schema) in table.schemas.into_iter().enumerate() {
+                if let Some(id) = doc.column_ids().get(i) {
+                    schema.column_id = id.clone();
+                }
+                doc.set_column_schema(schema);
+            }
+            doc.mark_derived_unsaved();
+            let registry = app_for_job.state::<Mutex<AppState>>();
+            registry
+                .lock()
+                .map_err(|_| AppError::Other("internal state lock error".into()))?
+                .insert(doc);
+            Ok(())
+        })
+        .await;
+    });
+    Ok(IndexedOpenStart { job_id, doc_id })
+}
+
+/// Start a scoped, typed export to Parquet (uncompressed/Snappy/Zstd) or
+/// Arrow IPC file/stream as a cancellable job (kind "export"). Typing rules,
+/// null semantics and the invalid-cell policy (null + counted warning) are
+/// documented on [`crate::columnar_export`]. The scope resolves and the
+/// revision is checked BEFORE the job spawns (and re-checked inside it);
+/// everything streams through the atomic-save pipeline, so failure or
+/// cancellation removes the staging file and never touches an existing
+/// destination. Fetch the outcome (rows, bytes, per-column warning counts)
+/// with `get_columnar_export_report` after the `job-finished` event.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn columnar_export(
+    doc_id: u64,
+    path: String,
+    options: ColumnarExportOptions,
+    scope: ExportScope,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    reports: State<'_, ColumnarExportReportCache>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        // Fail fast: a stale snapshot or an invalid scope rejects the
+        // invoke, not a background job.
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+        export_scope::resolve_scope(&doc, &scope)?;
+    }
+
+    let sink = reports.share();
+    let ctx = jobs.begin_for_app(&app, "export", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            let report = crate::columnar_export::run(
+                &doc,
+                Path::new(&path),
+                &options,
+                &scope,
+                expected_revision,
+                ctx,
+            )?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(job_id, report);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// The report of a finished columnar export, by its job id.
+#[tauri::command]
+pub fn get_columnar_export_report(
+    job_id: u64,
+    reports: State<'_, ColumnarExportReportCache>,
+) -> Option<ColumnarExportReport> {
+    reports.get(job_id)
 }

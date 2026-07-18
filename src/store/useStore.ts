@@ -22,6 +22,11 @@ import { annotationExportName } from "../lib/annotations";
 import { currentOpenOptions, fingerprintKey } from "../lib/reopen";
 import { defaultImportOptions } from "../lib/jsonImport";
 import { suggestJsonFileName } from "../lib/jsonExport";
+import {
+  defaultColumnarOpenOptions,
+  isColumnarPath,
+  suggestColumnarFileName,
+} from "../lib/columnar";
 import { isLegacyEncoding } from "../lib/save";
 import {
   availableOnlyChoices,
@@ -37,6 +42,7 @@ import {
   panelsFromLayout,
   pathKey,
   projectSnapshot,
+  restoreOpenRoute,
   type PanelLayout,
   type ProjectSnapshot,
   type SourceAnnotationsSection,
@@ -57,6 +63,10 @@ import type {
   JsonExportOptions,
   JsonImportOptions,
   JsonImportPreview,
+  ColumnarInspection,
+  ColumnarOpenOptions,
+  ColumnarExportOptions,
+  ColumnarExportReport,
   FileProfile,
   FilterGroup,
   FindMatch,
@@ -170,6 +180,7 @@ export type ModalName =
   | "schema"
   | "dictionary"
   | "jsonExport"
+  | "columnarExport"
   | "sampling"
   | "tagToColumn"
   | "annotationExport"
@@ -179,7 +190,16 @@ export type ModalName =
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
   { name: "JSON (F33)", extensions: ["json", "jsonl", "ndjson"] },
+  { name: "Columnar (F32)", extensions: ["parquet", "arrow", "feather", "ipc", "arrows"] },
   { name: "Compressed (F17)", extensions: ["gz", "zip"] },
+  { name: "All files", extensions: ["*"] },
+];
+
+/** File filters for a Parquet / Arrow export target (F32). */
+const COLUMNAR_FILE_FILTERS = [
+  { name: "Apache Parquet", extensions: ["parquet"] },
+  { name: "Arrow IPC file (Feather v2)", extensions: ["arrow", "feather"] },
+  { name: "Arrow IPC stream", extensions: ["arrows", "ipc"] },
   { name: "All files", extensions: ["*"] },
 ];
 
@@ -473,6 +493,9 @@ export interface IndexingState {
   /** Bytes scanned (open/reindex/extract) or rows materialised (convert). */
   processed: number;
   total: number | null;
+  /** Unit of `processed`/`total` for progress display. CSV opens scan bytes;
+   * columnar (F32) opens count rows. Absent = bytes. */
+  unit?: "bytes" | "rows";
   /** Extraction bookkeeping (F17). */
   archiveToken?: number;
   archiveEntry?: string | null;
@@ -593,6 +616,32 @@ export interface JsonImportState {
   scanTotal: number | null;
   preview: JsonImportPreview | null;
   scanError: string | null;
+}
+
+/**
+ * Parquet / Arrow open flow state (F32). Non-null while the inspect dialog is
+ * open. The inspection is fetched once (metadata only); the actual open then
+ * runs as an "openIndexed" job whose completion adds the tab through the shared
+ * indexing pipeline, so this slice clears the moment an open starts.
+ */
+export interface ColumnarOpenState {
+  path: string;
+  fileName: string;
+  /** The pre-open inspection, or null while it is still loading. */
+  inspection: ColumnarInspection | null;
+  loading: boolean;
+  error: string | null;
+}
+
+/**
+ * Result of the most recent Parquet / Arrow export (F32). Drives the export
+ * dialog's running/done phases; `report` carries the per-column invalid-cell
+ * counts the typed-export warning surface shows.
+ */
+export interface ColumnarExportState {
+  running: boolean;
+  report: ColumnarExportReport | null;
+  error: string | null;
 }
 
 /** A running sampling/partitioning job (F48). Unlike a derive job it can emit
@@ -897,6 +946,10 @@ interface Store {
   deriveError: string | null;
   /** JSON / JSON Lines import flow (F33); non-null while its dialog is open. */
   jsonImport: JsonImportState | null;
+  /** Parquet / Arrow inspect+open flow (F32); non-null while its dialog is open. */
+  columnarOpen: ColumnarOpenState | null;
+  /** Result of the most recent Parquet / Arrow export (F32). */
+  columnarExportResult: ColumnarExportState;
   /** Running sampling/partitioning job (F48), if any. */
   sample: SampleState | null;
   /** Error from the last sampling job, for the dialog that started it. */
@@ -1014,6 +1067,8 @@ interface Store {
   openDialog: () => Promise<void>;
   /** File picker filtered to JSON / JSON Lines, routed through the open flow. */
   openJsonDialog: () => Promise<void>;
+  /** File picker filtered to Parquet / Arrow, routed through the open flow (F32). */
+  openColumnarDialog: () => Promise<void>;
   openPath: (path: string) => Promise<void>;
   newDoc: () => Promise<void>;
   closeTab: (id: number) => Promise<void>;
@@ -1332,6 +1387,25 @@ interface Store {
   dismissJsonImport: () => void;
   /** Prompt for a path and export the active document as JSON (F33). */
   exportJson: (options: JsonExportOptions, scope: ExportScope) => Promise<void>;
+
+  // Parquet / Arrow interop (F32)
+  /** Inspect a columnar file and open the inspect dialog. */
+  openColumnarInspect: (path: string) => Promise<void>;
+  /** Restore a columnar source non-interactively (F37): reopen it directly as
+   * an indexed read-only document, awaiting the open job, WITHOUT the inspect
+   * dialog. Used by project open so a Parquet / Arrow tab is actually created. */
+  openColumnarRestore: (path: string) => Promise<void>;
+  /** Close the inspect dialog. */
+  dismissColumnarInspect: () => void;
+  /** Open the inspected file as an indexed READ-ONLY document. */
+  columnarOpenIndexed: (options: ColumnarOpenOptions) => Promise<void>;
+  /** Open the inspected file fully editable in memory (`force` past the
+   * memory guard after an explicit user decision). */
+  columnarOpenEditable: (options: ColumnarOpenOptions, force: boolean) => Promise<void>;
+  /** Prompt for a path and export the active document to Parquet / Arrow (F32). */
+  runColumnarExport: (options: ColumnarExportOptions, scope: ExportScope) => Promise<void>;
+  /** Reset the columnar export result (dialog closed / reopened). */
+  clearColumnarExport: () => void;
 
   // data-cleaning transforms (F06)
   /**
@@ -2095,7 +2169,16 @@ export const useStore = create<Store>((set, get) => {
     openingProject = true;
     try {
       for (const entry of plan.entries) {
-        await get().openPath(entry.path);
+        // A restore is non-interactive: a columnar (Parquet / Arrow) source
+        // must NOT route through the interactive inspect dialog `openPath`
+        // would open — that returns without creating a tab, leaving the
+        // restored source missing until the user manually confirmed it. Reopen
+        // it directly as an indexed read-only document instead (F37).
+        if (restoreOpenRoute(entry.path) === "columnarIndexed") {
+          await get().openColumnarRestore(entry.path);
+        } else {
+          await get().openPath(entry.path);
+        }
       }
     } finally {
       openingProject = false;
@@ -2233,6 +2316,8 @@ export const useStore = create<Store>((set, get) => {
     derive: null,
     deriveError: null,
     jsonImport: null,
+    columnarOpen: null,
+    columnarExportResult: { running: false, report: null, error: null },
     sample: null,
     sampleError: null,
     samplingInitialMode: "sampling",
@@ -2662,6 +2747,11 @@ export const useStore = create<Store>((set, get) => {
       if (typeof selected === "string") await get().openPath(selected);
     },
 
+    openColumnarDialog: async () => {
+      const selected = await openFileDialog({ multiple: false, filters: COLUMNAR_FILE_FILTERS });
+      if (typeof selected === "string") await get().openPath(selected);
+    },
+
     openPath: async (path) => {
       const existing = get().tabs.find((t) => t.path === path);
       if (existing) {
@@ -2694,6 +2784,12 @@ export const useStore = create<Store>((set, get) => {
       // dialog instead of the CSV open path.
       if (lower.endsWith(".json") || lower.endsWith(".jsonl") || lower.endsWith(".ndjson")) {
         await get().openJsonImport(path);
+        return;
+      }
+      // F32: Parquet / Arrow IPC route through the inspect dialog (metadata,
+      // schema, open-indexed vs convert-editable choice).
+      if (isColumnarPath(path)) {
+        await get().openColumnarInspect(path);
         return;
       }
       set({ busy: true, error: null });
@@ -5605,6 +5701,169 @@ export const useStore = create<Store>((set, get) => {
         set({ error: String(e) });
       }
     },
+
+    // ----- Parquet / Arrow interop (F32) ------------------------------------------
+
+    openColumnarInspect: async (path) => {
+      // Reuse an already-open tab for this source rather than re-inspecting.
+      const existing = get().tabs.find((t) => t.path === path);
+      if (existing) {
+        set((s) => switchPatch(s, existing.id));
+        return;
+      }
+      const fileName = path.split(/[\\/]/).pop() ?? path;
+      set({ columnarOpen: { path, fileName, inspection: null, loading: true, error: null } });
+      try {
+        const inspection = await api.columnarInspect(path);
+        // The dialog may have been dismissed while the invoke was in flight.
+        if (get().columnarOpen?.path !== path) return;
+        set((s) =>
+          s.columnarOpen ? { columnarOpen: { ...s.columnarOpen, inspection, loading: false } } : {},
+        );
+      } catch (e) {
+        if (get().columnarOpen?.path !== path) return;
+        set((s) =>
+          s.columnarOpen
+            ? { columnarOpen: { ...s.columnarOpen, loading: false, error: String(e) } }
+            : {},
+        );
+      }
+    },
+
+    openColumnarRestore: async (path) => {
+      // Non-interactive columnar restore (F37 project open). Reuse an already
+      // open tab, otherwise reopen the source as an indexed READ-ONLY document
+      // with default policies — no inspect dialog. Indexed is the memory-safe,
+      // prompt-free reproduction of a columnar source (it never hits the F10
+      // memory decision, and indexed documents stay read-only unless the user
+      // later converts them). The open is a job, so await it here rather than
+      // via the shared `indexing` pipeline: the restore's later steps (tab
+      // order, annotations, view reapply) need the tab to exist synchronously.
+      const existing = get().tabs.find((t) => t.path === path);
+      if (existing) {
+        set((s) => switchPatch(s, existing.id));
+        return;
+      }
+      try {
+        const started = await api.columnarOpenIndexed(path, defaultColumnarOpenOptions());
+        const finished = await awaitJob(started.jobId);
+        if (finished.status !== "done") {
+          // A restore only warns on incompatibility; a failed columnar open
+          // surfaces its message but never blocks the rest of the project.
+          if (finished.status === "failed") {
+            set({ error: finished.error ?? `Could not restore ${path}` });
+          }
+          return;
+        }
+        const meta = await api.getMeta(started.docId);
+        set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] }));
+        pushRecent(path);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    dismissColumnarInspect: () => set({ columnarOpen: null }),
+
+    columnarOpenIndexed: async (options) => {
+      const st = get().columnarOpen;
+      if (!st || get().indexing) return;
+      // The open job reports progress in rows (ctx.set_total = row count); use
+      // the inspected row count as the placeholder until the first event.
+      const total = st.inspection?.rowCount ?? null;
+      try {
+        const started = await api.columnarOpenIndexed(st.path, options);
+        // Hand off to the shared indexing pipeline; its completion adds the tab.
+        set({
+          columnarOpen: null,
+          indexing: {
+            jobId: started.jobId,
+            docId: started.docId,
+            kind: "openIndexed",
+            path: st.path,
+            processed: 0,
+            total,
+            unit: "rows",
+          },
+        });
+        consumeEarlyFinish(started.jobId);
+      } catch (e) {
+        // Keep the dialog open and surface the failure inline.
+        set((s) =>
+          s.columnarOpen
+            ? { columnarOpen: { ...s.columnarOpen, error: String(e) } }
+            : { error: String(e) },
+        );
+      }
+    },
+
+    columnarOpenEditable: async (options, force) => {
+      const st = get().columnarOpen;
+      if (!st || get().indexing) return;
+      // Reports progress in rows, like the indexed open above.
+      const total = st.inspection?.rowCount ?? null;
+      try {
+        const started = await api.columnarOpenEditable(st.path, options, force);
+        set({
+          columnarOpen: null,
+          indexing: {
+            jobId: started.jobId,
+            docId: started.docId,
+            kind: "openIndexed",
+            path: st.path,
+            processed: 0,
+            total,
+            unit: "rows",
+          },
+        });
+        consumeEarlyFinish(started.jobId);
+      } catch (e) {
+        // Typically the memory-estimate refusal (force=false); keep the dialog
+        // open so the user can choose "open editable anyway".
+        set((s) =>
+          s.columnarOpen
+            ? { columnarOpen: { ...s.columnarOpen, error: String(e) } }
+            : { error: String(e) },
+        );
+      }
+    },
+
+    runColumnarExport: async (options, scope) => {
+      const meta = activeMeta();
+      if (!meta || get().columnarExportResult.running) return;
+      const chosen = await saveFileDialog({
+        defaultPath: suggestColumnarFileName(meta.fileName, options.format),
+        filters: COLUMNAR_FILE_FILTERS,
+      });
+      if (!chosen) return;
+      set({ columnarExportResult: { running: true, report: null, error: null } });
+      try {
+        // The invoke resolves the scope and checks the revision up front, so an
+        // invalid scope / stale snapshot rejects here before any job spawns.
+        const jobId = await api.columnarExport(meta.id, chosen, options, scope, meta.revision);
+        const finished = await awaitJob(jobId);
+        if (finished.status === "done") {
+          const report = await api.getColumnarExportReport(jobId).catch(() => null);
+          set({ columnarExportResult: { running: false, report, error: null } });
+        } else if (finished.status === "failed") {
+          set({
+            columnarExportResult: {
+              running: false,
+              report: null,
+              error: finished.error ?? "export failed",
+            },
+          });
+        } else {
+          // Cancelled: back to the config phase with nothing written.
+          set({ columnarExportResult: { running: false, report: null, error: null } });
+        }
+      } catch (e) {
+        set({ columnarExportResult: { running: false, report: null, error: String(e) } });
+      }
+    },
+
+    clearColumnarExport: () =>
+      set({ columnarExportResult: { running: false, report: null, error: null } }),
 
     // ----- compare (F09) -----------------------------------------------------------
 

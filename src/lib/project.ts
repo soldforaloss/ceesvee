@@ -3,6 +3,7 @@
 // can be unit-tested without a backend — status mapping, per-source resolution
 // building, source/tab section capture, and project dirty-state derivation.
 
+import { isColumnarPath } from "./columnar";
 import type {
   AnnotationsExport,
   DocumentMeta,
@@ -495,6 +496,27 @@ export function buildAnnotationsSection(
     }
   }
   return out;
+}
+
+// ----- restore open routing ---------------------------------------------------
+
+/**
+ * How a project restore should open one source's file. `columnarIndexed` opens
+ * a Parquet / Arrow source directly as an indexed read-only document; `standard`
+ * uses the ordinary open pipeline (CSV, JSON, archives, …).
+ */
+export type RestoreOpenRoute = "columnarIndexed" | "standard";
+
+/**
+ * Decide how a project restore should open one source (pure). A columnar
+ * (Parquet / Arrow) path must NOT go through the interactive inspect dialog the
+ * normal open uses: a restore is non-interactive, so it reopens the source
+ * directly as an indexed read-only document instead of leaving the tab
+ * un-created until the user manually confirms a dialog. Every other path
+ * restores through the ordinary open pipeline.
+ */
+export function restoreOpenRoute(path: string): RestoreOpenRoute {
+  return isColumnarPath(path) ? "columnarIndexed" : "standard";
 }
 
 /**

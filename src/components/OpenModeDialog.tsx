@@ -87,8 +87,13 @@ export function OpenModeDialog() {
             />
           </div>
           <p className="text-xs text-zinc-500 dark:text-zinc-400">
-            {formatBytes(indexing.processed)}
-            {indexing.total ? ` of ${formatBytes(indexing.total)}` : ""} scanned
+            {indexing.unit === "rows"
+              ? `${indexing.processed.toLocaleString()}${
+                  indexing.total ? ` of ${indexing.total.toLocaleString()}` : ""
+                } rows`
+              : `${formatBytes(indexing.processed)}${
+                  indexing.total ? ` of ${formatBytes(indexing.total)}` : ""
+                } scanned`}
             {pct !== null ? ` · ${pct}%` : ""}
           </p>
         </div>
