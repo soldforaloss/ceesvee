@@ -1,6 +1,13 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { AnnotationsView, DictionaryView, DocumentMeta, ProjectMeta } from "../types";
+import type {
+  AnnotationsView,
+  DbExportPreview,
+  DictionaryView,
+  DocumentMeta,
+  ProjectMeta,
+} from "../types";
+import type { ExportForm } from "../lib/dbExport";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), save: vi.fn() }));
 vi.mock("@tauri-apps/api/window", () => ({
@@ -28,10 +35,12 @@ vi.mock("../lib/tauri", () => ({
   annotationsView: vi.fn(),
   annotationsGetExport: vi.fn(),
   annotationsLoadExport: vi.fn().mockResolvedValue(undefined),
+  // F35 database export preview.
+  dbExportPreview: vi.fn(),
 }));
 
 import * as api from "../lib/tauri";
-import { INDEXED_FIND_LIMIT, useStore } from "./useStore";
+import { INDEXED_FIND_LIMIT, useStore, type DbExportState } from "./useStore";
 
 function meta(id: number, backing: DocumentMeta["backing"] = "editable"): DocumentMeta {
   return {
@@ -649,5 +658,100 @@ describe("annotation persistence: sidecar vs project (F40)", () => {
     // The large read-only document reads its existing sidecar on open, so a
     // later edit merges instead of overwriting an empty store onto it.
     expect(api.annotationsLoadSidecar).toHaveBeenCalledWith(9, "C:/data/doc-9.csv");
+  });
+});
+
+describe("database export preview invalidation (F35)", () => {
+  const exportForm = (over: Partial<ExportForm> = {}): ExportForm => ({
+    path: "/tmp/out.sqlite",
+    table: "customers",
+    mode: "create",
+    conflictPolicy: "abort",
+    confirmReplace: false,
+    overrides: {},
+    ...over,
+  });
+
+  const preview = (over: Partial<DbExportPreview> = {}): DbExportPreview => ({
+    revision: 3,
+    tableExists: false,
+    targetRows: null,
+    columns: [],
+    blocking: [],
+    failures: [],
+    failureCount: 0,
+    rowsScanned: 10,
+    scanComplete: true,
+    ...over,
+  });
+
+  const exportState = (over: Partial<DbExportState> = {}): DbExportState => ({
+    docId: 1,
+    docName: "doc-1.csv",
+    form: exportForm(),
+    preview: null,
+    previewLoading: false,
+    previewError: null,
+    jobId: null,
+    processed: 0,
+    total: null,
+    result: null,
+    error: null,
+    ...over,
+  });
+
+  beforeEach(() => {
+    vi.mocked(api.dbExportPreview).mockReset();
+    useStore.setState({ dbExport: exportState() });
+  });
+
+  afterEach(() => {
+    // Clears the debounce timer patchDbExportForm scheduled so it can never
+    // fire into a later test.
+    useStore.getState().closeDbExport();
+  });
+
+  it("clears an existing preview synchronously so Export cannot run against a changed form", () => {
+    // A clean preview is present (Export would be enabled)…
+    useStore.setState({ dbExport: exportState({ preview: preview() }) });
+    expect(useStore.getState().dbExport?.preview).not.toBeNull();
+
+    // …changing the form drops it immediately, before any new preview runs.
+    useStore.getState().patchDbExportForm({ table: "renamed" });
+    const st = useStore.getState().dbExport;
+    expect(st?.preview).toBeNull();
+    expect(st?.previewLoading).toBe(true);
+    expect(st?.form.table).toBe("renamed");
+    // The old, resolved-but-now-stale response never gets a chance to run.
+    expect(api.dbExportPreview).not.toHaveBeenCalled();
+  });
+
+  it("ignores an in-flight preview response that resolves after the form changed", async () => {
+    // Hold the preview invoke open so we can change the form while it is in
+    // flight and only then let it resolve.
+    const deferred: { resolve: (p: DbExportPreview) => void } = { resolve: () => {} };
+    vi.mocked(api.dbExportPreview).mockImplementationOnce(
+      () =>
+        new Promise<DbExportPreview>((resolve) => {
+          deferred.resolve = resolve;
+        }),
+    );
+
+    const pending = useStore.getState().previewDbExport();
+    expect(api.dbExportPreview).toHaveBeenCalledTimes(1);
+
+    // The form changes while that first invoke is still pending.
+    useStore.getState().patchDbExportForm({ table: "renamed" });
+
+    // The stale invoke now resolves with a preview computed for the OLD form.
+    deferred.resolve(preview({ revision: 99 }));
+    await pending;
+
+    // It must NOT be applied: the token bumped when the form changed, so the
+    // preview stays cleared and Export stays disabled until the fresh preview
+    // for the new form lands.
+    const st = useStore.getState().dbExport;
+    expect(st?.preview).toBeNull();
+    expect(st?.form.table).toBe("renamed");
   });
 });

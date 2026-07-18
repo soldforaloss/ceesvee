@@ -6178,7 +6178,26 @@ export const useStore = create<Store>((set, get) => {
     patchDbExportForm: (patch) => {
       const st = get().dbExport;
       if (!st) return;
-      set({ dbExport: { ...st, form: { ...st.form, ...patch }, result: null, error: null } });
+      // Invalidate the current preview synchronously: it was computed for the
+      // OLD form and must not stay actionable against the patched one. Bumping
+      // the token makes any preview invoke already in flight fail its staleness
+      // guard when it resolves, so an earlier response cannot repopulate a
+      // preview for the previous path/mapping. Clearing `preview` disables the
+      // Export button until a fresh preview for the new form lands (the
+      // debounced refresh below), so a user can never start an export whose
+      // blockers/failure counts were measured against a different spec.
+      dbPreviewToken++;
+      set({
+        dbExport: {
+          ...st,
+          form: { ...st.form, ...patch },
+          preview: null,
+          previewLoading: true,
+          previewError: null,
+          result: null,
+          error: null,
+        },
+      });
       if (dbPreviewTimer !== null) clearTimeout(dbPreviewTimer);
       dbPreviewTimer = setTimeout(() => {
         dbPreviewTimer = null;
