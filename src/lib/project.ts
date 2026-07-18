@@ -4,6 +4,7 @@
 // building, source/tab section capture, and project dirty-state derivation.
 
 import type {
+  AnnotationsExport,
   DocumentMeta,
   FileFingerprint,
   NamedView,
@@ -426,6 +427,66 @@ export function buildViewsSection(
     seen.add(src.id);
   }
   // Preserve saved views for still-referenced sources that aren't open.
+  const referenced = new Set(sources.map((s) => s.id));
+  for (const prior of existing) {
+    if (referenced.has(prior.sourceId) && !seen.has(prior.sourceId)) {
+      out.push(prior);
+      seen.add(prior.sourceId);
+    }
+  }
+  return out;
+}
+
+/** One source's saved annotations, mirroring the backend `annotations` section
+ * (F40): the versioned export envelope keyed by stable source id. */
+export interface SourceAnnotationsSection {
+  sourceId: string;
+  annotations: AnnotationsExport;
+}
+
+/** Whether an annotations export carries nothing worth persisting (no rows, no
+ * tags, no author label and no key spec) — used to skip empty sources. */
+export function annotationsExportIsEmpty(e: AnnotationsExport): boolean {
+  return (
+    (e.entries?.length ?? 0) === 0 &&
+    (e.tags?.length ?? 0) === 0 &&
+    e.author == null &&
+    e.keySpec == null
+  );
+}
+
+/**
+ * Build the `annotations` section (F40): for each open, file-backed source, its
+ * live annotations export (from the backend registry) when non-empty. Sources
+ * the project references but that are NOT open now keep their previously-saved
+ * annotations (merged from `existing`), so leaving a document out on open never
+ * drops its notes; an open source whose annotations were all cleared emits
+ * nothing and does NOT fall back to its stale saved entry. Carries no cell data
+ * — the envelope references rows by identity (composite key / record number)
+ * and content hash only, so it passes the project's no-cell-data scan.
+ */
+export function buildAnnotationsSection(
+  sources: ProjectSource[],
+  tabs: DocumentMeta[],
+  existing: SourceAnnotationsSection[],
+  exportForTab: (tab: DocumentMeta) => AnnotationsExport | null,
+): SourceAnnotationsSection[] {
+  const tabByPath = new Map<string, DocumentMeta>();
+  for (const t of tabs) if (t.path) tabByPath.set(pathKey(t.path), t);
+  const out: SourceAnnotationsSection[] = [];
+  const seen = new Set<string>();
+
+  // Capture live annotations for every referenced source that is open now.
+  for (const src of sources) {
+    const tab = tabByPath.get(pathKey(src.path));
+    if (!tab) continue;
+    seen.add(src.id);
+    const exp = exportForTab(tab);
+    if (exp && !annotationsExportIsEmpty(exp)) {
+      out.push({ sourceId: src.id, annotations: exp });
+    }
+  }
+  // Preserve saved annotations for still-referenced sources that aren't open.
   const referenced = new Set(sources.map((s) => s.id));
   for (const prior of existing) {
     if (referenced.has(prior.sourceId) && !seen.has(prior.sourceId)) {

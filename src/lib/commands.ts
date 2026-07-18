@@ -13,6 +13,7 @@ export type CommandCategory =
   | "Edit"
   | "View"
   | "Data"
+  | "Annotate"
   | "Export"
   | "Tabs"
   | "Navigate"

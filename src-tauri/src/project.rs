@@ -6,9 +6,9 @@
 //! sections are typed and registered in [`SECTION_REGISTRY`]. Future features
 //! extend the registry by adding a typed field to [`ProjectSections`], a row
 //! to the registry, and a match arm in [`set_section_typed`] — as the F38
-//! `dictionary` section does. The still-reserved `annotations` (F40) and
-//! `queries` (F36) sections are already named, default-empty, and rejected for
-//! writes until their owning feature lands.
+//! `dictionary` and F40 `annotations` sections do. The still-reserved `queries`
+//! (F36) section is already named, default-empty, and rejected for writes until
+//! its owning feature lands.
 //!
 //! Hard rules enforced here:
 //!
@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::State;
 
+use crate::annotations::AnnotationsExport;
 use crate::compare::CompareSpec;
 use crate::dictionary::DictionaryExport;
 use crate::dto::{BackupPolicy, FileFingerprint};
@@ -168,10 +169,12 @@ pub struct ProjectSections {
     /// source.
     #[serde(default)]
     pub row_keys: Vec<SourceRowKey>,
-    /// RESERVED for F40 row annotations: entries will reference rows by
-    /// `row_identity::RowIdentity` (keys/record numbers), never by content.
+    /// F40 row annotations, per source: bookmarks, tags and notes referencing
+    /// rows by `row_identity::RowIdentity` (composite keys / record numbers) and
+    /// a content fingerprint — never by cell value — in the versioned
+    /// annotations export envelope.
     #[serde(default)]
-    pub annotations: Vec<Value>,
+    pub annotations: Vec<SourceAnnotations>,
     /// F38 data dictionaries, per source: per-column documentation and
     /// constraints in the versioned dictionary export envelope (configuration
     /// only — column IDs and metadata, never cell values).
@@ -250,7 +253,7 @@ pub const SECTION_REGISTRY: &[SectionSpec] = &[
     },
     SectionSpec {
         name: "annotations",
-        reserved: true,
+        reserved: false,
         owner: "F40",
     },
     SectionSpec {
@@ -360,6 +363,18 @@ pub struct SourceDictionary {
 pub struct SourceRowKey {
     pub source_id: String,
     pub key: KeySpec,
+}
+
+/// F40 row annotations for one source, in the versioned export envelope. The
+/// envelope references rows by identity (composite key / record number) and a
+/// content hash and carries only annotation metadata (marks, tags, notes,
+/// author, timestamps) — never a cell value — so it passes the no-cell-data
+/// scan like every other section.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceAnnotations {
+    pub source_id: String,
+    pub annotations: AnnotationsExport,
 }
 
 /// A named opaque configuration payload (used for recipes, whose engine
@@ -939,6 +954,7 @@ fn remove_source(sections: &mut ProjectSections, id: &str) {
     sections.views.retain(|v| v.source_id != id);
     sections.schemas.retain(|s| s.source_id != id);
     sections.row_keys.retain(|k| k.source_id != id);
+    sections.annotations.retain(|a| a.source_id != id);
     sections
         .join_mappings
         .retain(|j| j.left_source_id != id && j.right_source_id != id);
@@ -1249,6 +1265,7 @@ fn set_section_typed(sections: &mut ProjectSections, name: &str, value: Value) -
         "joinMappings" => sections.join_mappings = serde_json::from_value(value).map_err(shape)?,
         "comparisons" => sections.comparisons = serde_json::from_value(value).map_err(shape)?,
         "rowKeys" => sections.row_keys = serde_json::from_value(value).map_err(shape)?,
+        "annotations" => sections.annotations = serde_json::from_value(value).map_err(shape)?,
         "dictionary" => sections.dictionary = serde_json::from_value(value).map_err(shape)?,
         _ => unreachable!("registry check above covers every arm"),
     }
@@ -1311,6 +1328,7 @@ fn strip_sources(sections: &mut ProjectSections) {
     sections.views.clear();
     sections.schemas.clear();
     sections.row_keys.clear();
+    sections.annotations.clear();
     sections.join_mappings.clear();
     sections.comparisons.clear();
     for profile in &mut sections.profiles {
@@ -1492,11 +1510,12 @@ pub fn project_open_apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotations::{AnnotationsExport, Note, RowAnchor, RowEntry, ANNOTATIONS_VERSION};
     use crate::compare::CompareMode;
     use crate::dictionary::{
         DictionaryExportEntry, DictionaryField, FieldRole, Sensitivity, DICTIONARY_VERSION,
     };
-    use crate::row_identity::KeyNormalization;
+    use crate::row_identity::{KeyNormalization, RowIdentity};
     use crate::schema::{ColumnSchema, LogicalType, SCHEMA_VERSION};
     use crate::settings::ProfileMatch;
 
@@ -1574,6 +1593,36 @@ mod tests {
                     allowed_values: vec!["low".into(), "high".into()],
                     ..DictionaryField::empty("c1")
                 },
+            }],
+        }
+    }
+
+    /// A one-entry annotations export: a starred, tagged, record-anchored row
+    /// with a note (identity + content hash only — no cell values).
+    fn an_annotations() -> AnnotationsExport {
+        AnnotationsExport {
+            version: ANNOTATIONS_VERSION,
+            author: Some("Dana".into()),
+            key_spec: None,
+            tags: Vec::new(),
+            entries: vec![RowEntry {
+                handle: 0,
+                anchor: RowAnchor {
+                    identity: RowIdentity::SourceRecord { record: 3 },
+                    content_hash: Some("abc123".into()),
+                },
+                star: true,
+                flag: false,
+                tags: vec!["keep".into()],
+                note: Some(Note {
+                    text: "check this row".into(),
+                    author: Some("Dana".into()),
+                    created_ms: 1,
+                    updated_ms: 2,
+                }),
+                cell_notes: BTreeMap::new(),
+                created_ms: 1,
+                updated_ms: 2,
             }],
         }
     }
@@ -1675,6 +1724,10 @@ mod tests {
             source_id: "srcA".into(),
             dictionary: a_dictionary(),
         }];
+        s.annotations = vec![SourceAnnotations {
+            source_id: "srcA".into(),
+            annotations: an_annotations(),
+        }];
         (file, a, b)
     }
 
@@ -1775,6 +1828,38 @@ mod tests {
     }
 
     #[test]
+    fn annotations_section_registers_and_round_trips_per_source() {
+        // The F40 annotations section is a real registered section now, not
+        // reserved: a well-formed per-source payload is accepted, not rejected.
+        let mut sections = ProjectSections::default();
+        let payload = serde_json::to_value(vec![SourceAnnotations {
+            source_id: "srcA".into(),
+            annotations: an_annotations(),
+        }])
+        .unwrap();
+        set_section_typed(&mut sections, "annotations", payload).unwrap();
+        assert_eq!(sections.annotations.len(), 1);
+        assert_eq!(sections.annotations[0].source_id, "srcA");
+
+        // It survives an atomic save + reload verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        let (file, _a, _b) = full_project(dir.path());
+        let path = dir.path().join(format!("notes.{PROJECT_EXTENSION}"));
+        write_project_file(&path, &file).unwrap();
+        let loaded = load_project_file(&path).unwrap();
+        assert_eq!(loaded.sections.annotations, file.sections.annotations);
+        let entry = &loaded.sections.annotations[0].annotations.entries[0];
+        assert!(entry.star);
+        assert_eq!(entry.tags, vec!["keep"]);
+        assert_eq!(entry.note.as_ref().unwrap().text, "check this row");
+
+        // Annotations reference rows by identity + content hash, never by cell
+        // value: the whole serialized file still passes the no-cell-data scan.
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        scan_for_data_keys("whole file", &value).expect("annotations carry no cell data");
+    }
+
+    #[test]
     fn unknown_fields_and_sections_survive_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.ceesveeproj");
@@ -1785,7 +1870,7 @@ mod tests {
               "appVersion": "9.1.0",
               "futureTopLevel": {"keep": true},
               "sections": {
-                "annotations": [{"rowKey": ["1"], "note": "check this"}],
+                "queries": [{"rowKey": ["1"], "note": "check this"}],
                 "futureSection": {"nested": [1, 2, 3]},
                 "sources": [{"id": "s1", "path": "x.csv", "futureSourceField": "keep-me"}]
               }
@@ -1943,12 +2028,12 @@ mod tests {
     #[test]
     fn reserved_and_unknown_section_writes_are_rejected() {
         let mut sections = ProjectSections::default();
-        for reserved in ["annotations", "queries"] {
-            let err = set_section_typed(&mut sections, reserved, serde_json::json!([]))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("reserved"), "{reserved}: {err}");
-        }
+        // `annotations` is no longer reserved (F40 owns it now); `queries`
+        // (F36) is still reserved and rejects writes.
+        let err = set_section_typed(&mut sections, "queries", serde_json::json!([]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reserved"), "queries: {err}");
         let err = set_section_typed(&mut sections, "nope", serde_json::json!([]))
             .unwrap_err()
             .to_string();
@@ -2363,9 +2448,10 @@ mod tests {
             );
         }
         // layout serializes as null; everything else defaults to empty lists
-        // or objects. Reserved sections are present-but-empty by design.
-        for reserved in ["annotations", "queries"] {
-            assert_eq!(map[reserved], serde_json::json!([]), "{reserved}");
+        // or objects. The still-reserved `queries` section and the now-active
+        // but empty-by-default `annotations` section are both present-but-empty.
+        for empty in ["annotations", "queries"] {
+            assert_eq!(map[empty], serde_json::json!([]), "{empty}");
         }
         assert_eq!(
             map.len(),

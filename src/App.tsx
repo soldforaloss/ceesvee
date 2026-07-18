@@ -3,6 +3,8 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useState } from "react";
 
+import { AnnotationExportDialog } from "./components/AnnotationExportDialog";
+import { AnnotationsPanel } from "./components/AnnotationsPanel";
 import { AppendDialog } from "./components/AppendDialog";
 import { ArchiveEntryDialog } from "./components/ArchiveEntryDialog";
 import { CellEditorDialog } from "./components/CellEditorDialog";
@@ -29,6 +31,9 @@ import { ViewsDialog } from "./components/ViewsDialog";
 import { ViewWarningBar } from "./components/ViewWarningBar";
 import { Grid } from "./components/Grid";
 import { GroupByDialog } from "./components/GroupByDialog";
+import { NoteEditorDialog } from "./components/NoteEditorDialog";
+import { TagPickerDialog } from "./components/TagPickerDialog";
+import { TagToColumnDialog } from "./components/TagToColumnDialog";
 import { Close } from "./components/Icons";
 import { JoinDialog } from "./components/JoinDialog";
 import { JsonExportDialog } from "./components/JsonExportDialog";
@@ -81,6 +86,7 @@ export default function App() {
   const jsonImportPath = useStore((s) => s.jsonImport?.path ?? null);
   const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
   const changesOpen = useStore((s) => s.changesOpen);
+  const annotationsPanelOpen = useStore((s) => s.annotationsPanelOpen);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const [dragOver, setDragOver] = useState(false);
 
@@ -286,6 +292,7 @@ export default function App() {
         </div>
         {diagnosticsOpen && meta && <DiagnosticsPanel />}
         {changesOpen && meta && <ChangesPanel />}
+        {annotationsPanelOpen && meta && <AnnotationsPanel />}
         {meta && <ColumnExplorerPanel />}
       </main>
 
@@ -320,6 +327,10 @@ export default function App() {
       {activeModal === "join" && <JoinDialog onClose={() => setModal(null)} />}
       {activeModal === "groupBy" && <GroupByDialog onClose={() => setModal(null)} />}
       {activeModal === "sampling" && <SamplingDialog onClose={() => setModal(null)} />}
+      {activeModal === "tagToColumn" && <TagToColumnDialog />}
+      {activeModal === "annotationExport" && (
+        <AnnotationExportDialog onClose={() => setModal(null)} />
+      )}
       {activeModal === "reshape" && <ReshapeDialog onClose={() => setModal(null)} />}
       {activeModal === "recipes" && <RecipeDialog onClose={() => setModal(null)} />}
       {activeModal === "pii" && <PiiDialog onClose={() => setModal(null)} />}
@@ -331,6 +342,8 @@ export default function App() {
       {jsonImportPath && <JsonImportDialog key={jsonImportPath} />}
       <CommandPalette />
       <CellEditorDialog />
+      <NoteEditorDialog />
+      <TagPickerDialog />
       <ReopenDialog />
       <ExternalChangeDialog />
       <OpenModeDialog />

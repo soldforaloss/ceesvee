@@ -11,9 +11,11 @@ import {
   type GridSelection,
   type Item,
   type Rectangle,
+  type Theme,
 } from "@glideapps/glide-data-grid";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { buildRecordIndex, cellNoteColumns } from "../lib/annotations";
 import { SENSITIVITY_LABELS } from "../lib/dictionary";
 import { indicesToRanges } from "../lib/gridSelection";
 import { darkGridTheme, dirtyCellOverride, lightGridTheme } from "../lib/gridTheme";
@@ -27,6 +29,7 @@ import type {
   DictionaryEntryView,
   DocumentMeta,
   LogicalType,
+  RowAnnotationView,
   Sensitivity,
 } from "../types";
 import { ColumnMenu, type ColumnMenuState } from "./ColumnMenu";
@@ -122,6 +125,9 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   const gridRef = useRef<DataEditorRef>(null);
   const rowCache = useRef<Map<number, string[]>>(new Map());
   const dirtyCache = useRef<Map<number, boolean[]>>(new Map());
+  // F40: DISPLAY row -> absolute record number, fetched alongside each page so
+  // annotation gutter indicators land on the correct rows under sort/filter.
+  const recordCache = useRef<Map<number, number | null>>(new Map());
   const inFlight = useRef<Set<number>>(new Set());
   const visibleRegion = useRef<Rectangle | null>(null);
   // Bumped on every cache invalidation; an in-flight fetch from a previous
@@ -142,11 +148,17 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   });
   const [menu, setMenu] = useState<ColumnMenuState | null>(null);
   // F13: right-click cell menu (edit in the multiline editor / copy full value).
+  // F40 extends it with the row's annotation state so star/flag/note/tag/cell
+  // note actions can be offered inline.
   const [cellMenu, setCellMenu] = useState<{
     row: number;
     col: number;
     x: number;
     y: number;
+    record: number | null;
+    columnId: string | null;
+    columnLabel: string;
+    entry: RowAnnotationView | undefined;
   } | null>(null);
 
   const findMatches = useStore((s) => s.find.matches);
@@ -198,6 +210,21 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     if (dictionaryEntries) for (const e of dictionaryEntries) map.set(e.columnId, e);
     return map;
   }, [dictionaryEntries]);
+
+  // F40: the active document's annotations, indexed by resolved record number
+  // (matched entries only). Drives the row-gutter glyphs, row tint and per-cell
+  // note corners. `cellNoteIndex` is the record -> {column ids with a note} map
+  // consulted per cell in the custom draw.
+  const annotationsView = useStore((s) => s.annotationsView);
+  const recordIndex = useMemo(() => buildRecordIndex(annotationsView), [annotationsView]);
+  const cellNoteIndex = useMemo(() => {
+    const map = new Map<number, Set<string>>();
+    for (const [record, entry] of recordIndex) {
+      const cols = cellNoteColumns(entry);
+      if (cols.size > 0) map.set(record, cols);
+    }
+    return map;
+  }, [recordIndex]);
 
   const tooltipForPhys = useCallback(
     (phys: number): DictionaryTooltip | null => {
@@ -259,12 +286,20 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     if (inFlight.current.has(page) || rowCache.current.has(startRow)) return;
     inFlight.current.add(page);
     try {
-      const resp = await api.getRows(id, startRow, PAGE);
+      // Fetch the row data and the display->record map together (F40): the
+      // latter lets annotation indicators track the current sort/filter.
+      const [resp, records] = await Promise.all([
+        api.getRows(id, startRow, PAGE),
+        api.displayRecords(id, startRow, PAGE),
+      ]);
       // The document was invalidated while this fetch was in flight — drop it.
       if (gen !== generation.current) return;
       for (let i = 0; i < resp.rows.length; i++) {
         rowCache.current.set(resp.start + i, resp.rows[i]);
         dirtyCache.current.set(resp.start + i, resp.dirty[i]);
+      }
+      for (let i = 0; i < records.length; i++) {
+        recordCache.current.set(startRow + i, records[i]);
       }
       const updates: { cell: Item }[] = [];
       // Repaints happen in DISPLAY coordinates (the projection's width).
@@ -297,6 +332,7 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     generation.current += 1;
     rowCache.current.clear();
     dirtyCache.current.clear();
+    recordCache.current.clear();
     inFlight.current.clear();
     const region = visibleRegion.current;
     const start = region ? Math.max(0, region.y - PAGE) : 0;
@@ -314,6 +350,9 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     // F38: refetch the dictionary alongside so header tooltips (display name /
     // description / unit / sensitivity) track renames and structural edits.
     void useStore.getState().loadDictionary();
+    // F40: re-resolve annotations against the (possibly reparsed) document so
+    // the gutter indicators and the panel's review list stay in sync.
+    void useStore.getState().loadAnnotations();
   }, [docId, dataVersion]);
 
   const onVisibleRegionChanged = useCallback(
@@ -516,17 +555,26 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     setMenu({ col: phys, x: bounds.x, y: bounds.y + bounds.height });
   }, []);
 
-  const onCellContextMenu = useCallback((cell: Item, event: CellClickedEventArgs) => {
-    const [col, row] = cell;
-    if (row < 0 || col < 0) return;
-    event.preventDefault();
-    setCellMenu({
-      row,
-      col: projectionRef.current.physical[col] ?? col,
-      x: event.bounds.x + event.localEventX,
-      y: event.bounds.y + event.localEventY,
-    });
-  }, []);
+  const onCellContextMenu = useCallback(
+    (cell: Item, event: CellClickedEventArgs) => {
+      const [col, row] = cell;
+      if (row < 0 || col < 0) return;
+      event.preventDefault();
+      const phys = projectionRef.current.physical[col] ?? col;
+      const record = recordCache.current.get(row) ?? null;
+      setCellMenu({
+        row,
+        col: phys,
+        x: event.bounds.x + event.localEventX,
+        y: event.bounds.y + event.localEventY,
+        record,
+        columnId: meta.columnIds[phys] ?? null,
+        columnLabel: meta.headers[phys] || `Column ${phys + 1}`,
+        entry: record == null ? undefined : recordIndex.get(record),
+      });
+    },
+    [recordIndex, meta.columnIds, meta.headers],
+  );
 
   // ----- scroll to the active find match ---------------------------------
 
@@ -647,6 +695,59 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
 
   const activeTip = headerTip ? tooltipForPhys(headerTip.phys) : null;
 
+  // ----- F40 annotation indicators ----------------------------------------
+
+  // The resolved annotation for a display row, via the display->record map.
+  // Uncertain (ambiguous/orphaned) entries are absent from `recordIndex`, so
+  // they never tint a row or draw a glyph.
+  const entryForDisplayRow = useCallback(
+    (row: number): RowAnnotationView | undefined => {
+      const record = recordCache.current.get(row);
+      return record == null ? undefined : recordIndex.get(record);
+    },
+    [recordIndex],
+  );
+
+  // Subtly tint annotated rows so they read at a glance even off-glyph. Star
+  // wins (amber), then flag (rose), then any other annotation (violet).
+  const getRowThemeOverride = useCallback(
+    (row: number): Partial<Theme> | undefined => {
+      const entry = entryForDisplayRow(row);
+      if (!entry) return undefined;
+      if (entry.star) return dark ? STAR_ROW_DARK : STAR_ROW_LIGHT;
+      if (entry.flag) return dark ? FLAG_ROW_DARK : FLAG_ROW_LIGHT;
+      return dark ? NOTE_ROW_DARK : NOTE_ROW_LIGHT;
+    },
+    [entryForDisplayRow, dark],
+  );
+
+  // Overlay the gutter glyphs (first display column) and the per-cell note
+  // corner (any column) on top of the normal cell content.
+  const drawCell = useCallback(
+    (
+      args: {
+        ctx: CanvasRenderingContext2D;
+        rect: Rectangle;
+        col: number;
+        row: number;
+      },
+      draw: () => void,
+    ) => {
+      draw();
+      const { ctx, rect, col, row } = args;
+      const entry = entryForDisplayRow(row);
+      if (!entry) return;
+      const record = recordCache.current.get(row);
+      const phys = projectionRef.current.physical[col] ?? col;
+      const colId = meta.columnIds[phys];
+      if (record != null && colId && cellNoteIndex.get(record)?.has(colId)) {
+        drawCellNoteCorner(ctx, rect);
+      }
+      if (col === 0) drawGutterGlyphs(ctx, rect, entry);
+    },
+    [entryForDisplayRow, cellNoteIndex, meta.columnIds],
+  );
+
   // Effective leading freeze: pinned view columns when any, else the manual
   // "freeze up to here" count (both clamped below the display width).
   const displayCount = projection.physical.length;
@@ -674,6 +775,8 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         onItemHovered={onItemHovered}
         onHeaderMenuClick={onHeaderMenuClick}
         onCellContextMenu={onCellContextMenu}
+        getRowThemeOverride={getRowThemeOverride}
+        drawCell={drawCell}
         gridSelection={selection}
         onGridSelectionChange={onGridSelectionChange}
         getCellsForSelection={getCellsForSelection}
@@ -712,6 +815,133 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
 
 function rectOf(range: Rectangle) {
   return { x: range.x, y: range.y, width: range.width, height: range.height };
+}
+
+// ----- F40 annotation drawing -------------------------------------------------
+
+const STAR_COLOR = "#f59e0b"; // amber-500
+const FLAG_COLOR = "#f43f5e"; // rose-500
+const NOTE_COLOR = "#8b5cf6"; // violet-500
+
+// Subtle full-row tints (bgCell + bgCellMedium so alternating stripes match).
+const STAR_ROW_LIGHT: Partial<Theme> = { bgCell: "#fef9ec", bgCellMedium: "#fdf4dd" };
+const STAR_ROW_DARK: Partial<Theme> = { bgCell: "#221d10", bgCellMedium: "#282111" };
+const FLAG_ROW_LIGHT: Partial<Theme> = { bgCell: "#fef2f3", bgCellMedium: "#fde8ea" };
+const FLAG_ROW_DARK: Partial<Theme> = { bgCell: "#241417", bgCellMedium: "#2a161a" };
+const NOTE_ROW_LIGHT: Partial<Theme> = { bgCell: "#f7f5fe", bgCellMedium: "#efeafd" };
+const NOTE_ROW_DARK: Partial<Theme> = { bgCell: "#1c1a2b", bgCellMedium: "#211d33" };
+
+/** A small filled five-point star centred at (cx, cy). */
+function drawStar(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i += 1) {
+    const radius = i % 2 === 0 ? r : r * 0.45;
+    const angle = (Math.PI / 5) * i - Math.PI / 2;
+    const x = cx + radius * Math.cos(angle);
+    const y = cy + radius * Math.sin(angle);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+  ctx.fillStyle = STAR_COLOR;
+  ctx.fill();
+}
+
+/** A small pennant flag with its centre near (cx, cy). */
+function drawFlag(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number) {
+  const top = cy - r;
+  const bottom = cy + r;
+  const poleX = cx - r * 0.7;
+  ctx.strokeStyle = FLAG_COLOR;
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  ctx.moveTo(poleX, top);
+  ctx.lineTo(poleX, bottom);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(poleX, top);
+  ctx.lineTo(poleX + r * 1.5, top + r * 0.55);
+  ctx.lineTo(poleX, top + r * 1.1);
+  ctx.closePath();
+  ctx.fillStyle = FLAG_COLOR;
+  ctx.fill();
+}
+
+/** A small "note" chit (rounded square) for a row note, or a dot for tags. */
+function drawNoteMark(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  r: number,
+  kind: "note" | "tag",
+) {
+  ctx.fillStyle = NOTE_COLOR;
+  if (kind === "tag") {
+    ctx.beginPath();
+    ctx.arc(cx, cy, r * 0.7, 0, Math.PI * 2);
+    ctx.fill();
+    return;
+  }
+  const s = r * 1.5;
+  const x = cx - s / 2;
+  const y = cy - s / 2;
+  const rad = 2;
+  ctx.beginPath();
+  ctx.moveTo(x + rad, y);
+  ctx.arcTo(x + s, y, x + s, y + s, rad);
+  ctx.arcTo(x + s, y + s, x, y + s, rad);
+  ctx.arcTo(x, y + s, x, y, rad);
+  ctx.arcTo(x, y, x + s, y, rad);
+  ctx.closePath();
+  ctx.fill();
+}
+
+/** Draw the row's annotation glyphs (star / flag / note or tag) stacked at the
+ * left edge of the first display column — the grid's "gutter" next to the row
+ * marker. */
+function drawGutterGlyphs(
+  ctx: CanvasRenderingContext2D,
+  rect: Rectangle,
+  entry: RowAnnotationView,
+) {
+  const r = 5;
+  const cy = rect.y + rect.height / 2;
+  let cx = rect.x + r + 2;
+  const step = r * 2 + 2;
+  ctx.save();
+  if (entry.star) {
+    drawStar(ctx, cx, cy, r);
+    cx += step;
+  }
+  if (entry.flag) {
+    drawFlag(ctx, cx, cy, r);
+    cx += step;
+  }
+  if (entry.note != null) {
+    drawNoteMark(ctx, cx, cy, r, "note");
+    cx += step;
+  } else if ((entry.tags?.length ?? 0) > 0) {
+    drawNoteMark(ctx, cx, cy, r, "tag");
+    cx += step;
+  }
+  ctx.restore();
+}
+
+/** A small filled corner triangle marking a cell note (top-right, like a
+ * spreadsheet comment marker). */
+function drawCellNoteCorner(ctx: CanvasRenderingContext2D, rect: Rectangle) {
+  const size = 7;
+  const x = rect.x + rect.width;
+  const y = rect.y;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(x - size, y);
+  ctx.lineTo(x, y);
+  ctx.lineTo(x, y + size);
+  ctx.closePath();
+  ctx.fillStyle = NOTE_COLOR;
+  ctx.fill();
+  ctx.restore();
 }
 
 /** The documentation shown in a column header tooltip (F38). */
@@ -765,19 +995,34 @@ function HeaderTooltip({ x, y, tip }: { x: number; y: number; tip: DictionaryToo
 }
 
 /** Right-click cell menu (F13): open the multiline editor or copy the FULL
- * value (fetched from Rust — the grid cache may hold only visible rows). */
+ * value (fetched from Rust — the grid cache may hold only visible rows). F40
+ * adds inline annotation actions (star / flag / tag / row note / cell note)
+ * for the row under the cursor; these never touch the source data. */
 function CellContextMenu({
   state,
   docId,
   readOnly,
   onClose,
 }: {
-  state: { row: number; col: number; x: number; y: number };
+  state: {
+    row: number;
+    col: number;
+    x: number;
+    y: number;
+    record: number | null;
+    columnId: string | null;
+    columnLabel: string;
+    entry: RowAnnotationView | undefined;
+  };
   docId: number;
   readOnly: boolean;
   onClose: () => void;
 }) {
   const openCellEditor = useStore((s) => s.openCellEditor);
+  const applyRowMarks = useStore((s) => s.applyRowMarks);
+  const openRowNoteEditor = useStore((s) => s.openRowNoteEditor);
+  const openCellNoteEditor = useStore((s) => s.openCellNoteEditor);
+  const openTagPicker = useStore((s) => s.openTagPicker);
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -808,12 +1053,64 @@ function CellContextMenu({
   const item =
     "block w-full px-3 py-1.5 text-left text-sm text-zinc-700 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-700";
 
+  const entry = state.entry;
+  const starred = entry?.star ?? false;
+  const flagged = entry?.flag ?? false;
+  // A record number labels the row for note dialogs (1-based, human).
+  const rowLabel = state.record != null ? `Row ${state.record + 1}` : `Row ${state.row + 1}`;
+  const hasCellNote = !!(
+    state.columnId && entry?.cellNotes?.some((n) => n.columnId === state.columnId)
+  );
+  const act = (fn: () => void) => {
+    fn();
+    onClose();
+  };
+
   return (
     <div
       ref={ref}
-      className="fixed z-50 w-44 overflow-hidden rounded-lg border border-zinc-200 bg-white py-1 shadow-xl dark:border-zinc-700 dark:bg-zinc-800"
+      className="fixed z-50 w-52 overflow-hidden rounded-lg border border-zinc-200 bg-white py-1 shadow-xl dark:border-zinc-700 dark:bg-zinc-800"
       style={{ left: state.x, top: state.y }}
     >
+      <button
+        className={item}
+        onClick={() => act(() => void applyRowMarks([state.row], { star: !starred }))}
+      >
+        {starred ? "Remove star" : "Star row"}
+      </button>
+      <button
+        className={item}
+        onClick={() => act(() => void applyRowMarks([state.row], { flag: !flagged }))}
+      >
+        {flagged ? "Remove flag" : "Flag row"}
+      </button>
+      <button className={item} onClick={() => act(() => openTagPicker([state.row]))}>
+        Tags…
+      </button>
+      <button
+        className={item}
+        onClick={() => act(() => openRowNoteEditor(state.row, rowLabel, entry?.note?.text ?? ""))}
+      >
+        {entry?.note ? "Edit row note…" : "Add row note…"}
+      </button>
+      {state.columnId && (
+        <button
+          className={item}
+          onClick={() =>
+            act(() =>
+              openCellNoteEditor(
+                state.row,
+                state.columnId!,
+                `${rowLabel} · ${state.columnLabel}`,
+                entry?.cellNotes?.find((n) => n.columnId === state.columnId)?.note.text ?? "",
+              ),
+            )
+          }
+        >
+          {hasCellNote ? "Edit cell note…" : "Add cell note…"}
+        </button>
+      )}
+      <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
       <button
         className={item}
         onClick={() => {

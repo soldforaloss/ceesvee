@@ -240,6 +240,18 @@ and faithful on large, real-world delimited files.**
 - **Change inspector** — see every unsaved operation with before/after
   values, jump to changes, and selectively revert cells, columns,
   operations, or everything — each revert itself undoable.
+- **Row bookmarks, tags & notes** — star or flag rows, apply multiple
+  named tags, and attach a row note or per-column cell notes (with an
+  optional author and created/updated timestamps) without ever touching
+  the source data. Annotations are pinned by row identity — a chosen
+  composite key (survives reordering; duplicate keys are reported) or the
+  source record plus a content fingerprint — and re-match on reparse into
+  a matched / ambiguous / orphaned review list, so a note is never
+  silently attached to an uncertain row. List them in a side panel with
+  jump-to-row, filter the grid by annotation state, copy a tag into a real
+  column as one previewed, undoable step, and export to JSON or CSV.
+  Stored in the open project or a versioned `<file>.ceesvee-notes.json`
+  sidecar written atomically — never inside the CSV.
 - Multi-column **sort** (ascending/descending per key).
 - **Find & replace** — plain text or regex, scoped to a selection or the whole file.
 
