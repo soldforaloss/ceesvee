@@ -27,9 +27,11 @@
 //! query must see ONE consistent revision even if the user edits the
 //! document mid-query, so the vtab picks a strategy at connect time:
 //!
-//! * **Snapshot copy** — documents up to [`SNAPSHOT_MAX_CELLS`] cells are
+//! * **Snapshot copy** — documents small enough by BOTH cell count
+//!   ([`SNAPSHOT_MAX_CELLS`]) and total size ([`SNAPSHOT_MAX_BYTES`]) are
 //!   copied outright; the query reads the copy and concurrent edits are
-//!   invisible. Bounded memory: at most a few MB for the largest snapshot.
+//!   invisible. The byte budget bounds memory even for a document with few
+//!   but very large cells: at most a few MB for the largest snapshot.
 //! * **Revision-check-abort** — larger documents are read live in bounded
 //!   windows; the revision pinned at connect time is re-checked on every
 //!   window refill and a mismatch aborts the query with a clear error. This
@@ -64,6 +66,12 @@ use crate::state::SharedDocument;
 /// at vtab connect time; larger documents use revision-check-abort (see the
 /// module docs for the trade-off).
 pub(crate) const SNAPSHOT_MAX_CELLS: usize = 200_000;
+/// A snapshot copy also stops here: a document with few but very large cells
+/// (long free text, embedded JSON, blobs-as-text) can slip under
+/// [`SNAPSHOT_MAX_CELLS`] yet still be hundreds of MB, so the copy is bounded
+/// by accumulated bytes too and falls back to revision-check-abort the moment
+/// this budget is crossed. Sized so the largest snapshot stays within a few MB.
+pub(crate) const SNAPSHOT_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Rows fetched per window when reading a large document live.
 const LIVE_WINDOW: usize = 1024;
 /// SQLite VM steps between cancellation polls (sub-millisecond granularity).
@@ -493,14 +501,34 @@ unsafe impl<'vtab> VTab<'vtab> for DocVTab {
         let n_rows = guard.n_rows();
 
         let strategy = if n_rows.saturating_mul(n_cols.max(1)) <= SNAPSHOT_MAX_CELLS {
+            // Copy under BOTH a cell-count and a byte budget. A document with
+            // few but very large cells passes the cell gate yet can dwarf "a
+            // few MB", so track accumulated bytes and fall back to the live
+            // (revision-check) strategy the instant the byte budget is crossed
+            // — never buffering hundreds of MB on a 6 GB machine.
             let mut copy: Vec<Vec<String>> = Vec::with_capacity(n_rows);
+            let mut bytes: usize = 0;
+            let mut over_budget = false;
             guard
                 .visit_rows(0..n_rows, &mut |_, row| {
+                    for cell in row {
+                        bytes = bytes.saturating_add(cell.len());
+                    }
+                    if bytes > SNAPSHOT_MAX_BYTES {
+                        over_budget = true;
+                        return Ok(false);
+                    }
                     copy.push(row.to_vec());
                     Ok(true)
                 })
                 .map_err(|e| module_err(&e.to_string()))?;
-            Strategy::Snapshot(Arc::new(copy))
+            if over_budget {
+                let revision = guard.revision();
+                drop(guard);
+                Strategy::Live { doc, revision }
+            } else {
+                Strategy::Snapshot(Arc::new(copy))
+            }
         } else {
             let revision = guard.revision();
             drop(guard);
@@ -682,6 +710,20 @@ mod tests {
         let mut csv = String::from("n\n");
         for i in 0..(SNAPSHOT_MAX_CELLS + 10) {
             csv.push_str(&format!("{i}\n"));
+        }
+        doc(&csv)
+    }
+
+    /// A document with FEW rows but very large cells: comfortably under
+    /// [`SNAPSHOT_MAX_CELLS`] yet over [`SNAPSHOT_MAX_BYTES`], and past
+    /// [`LIVE_WINDOW`] rows so a mid-query edit hits a window refill.
+    fn wide_cell_doc() -> SharedDocument {
+        let cell = "x".repeat(8192);
+        let rows = SNAPSHOT_MAX_BYTES / 8192 + 200; // safely over the byte budget
+        let mut csv = String::from("v\n");
+        for _ in 0..rows {
+            csv.push_str(&cell);
+            csv.push('\n');
         }
         doc(&csv)
     }
@@ -948,6 +990,47 @@ mod tests {
             .query_row("SELECT v FROM snap", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, "old", "snapshot pins the connect-time revision");
+    }
+
+    #[test]
+    fn large_cells_force_the_live_strategy_despite_a_low_cell_count() {
+        // Few rows, huge cells: under the cell-count gate but over the byte
+        // budget. A snapshot would copy hundreds of MB and be immune to
+        // edits; the byte-bounded fallback must pick the live strategy, so a
+        // mid-query edit aborts on the pinned-revision check.
+        let approved = ApprovedSources::default();
+        let d = wide_cell_doc();
+        assert!(
+            d.read().unwrap().n_rows() < SNAPSHOT_MAX_CELLS,
+            "the doc must stay under the cell-count gate"
+        );
+        let conn = connect(&approved, None, &[("wide".into(), Arc::clone(&d))]).unwrap();
+        let mut stmt = conn.prepare("SELECT v FROM wide").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        for _ in 0..LIVE_WINDOW {
+            assert!(rows.next().unwrap().is_some());
+        }
+        d.write().unwrap().set_cell(0, 0, "edited".into()).unwrap();
+        let mut failed = false;
+        loop {
+            match rows.next() {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(e) => {
+                    failed = true;
+                    assert!(
+                        e.to_string()
+                            .contains("changed while the query was running"),
+                        "unexpected error: {e}"
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(
+            failed,
+            "a large-cell document must use the live strategy, not a snapshot"
+        );
     }
 
     #[test]

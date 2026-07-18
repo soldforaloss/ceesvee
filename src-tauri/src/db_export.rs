@@ -33,16 +33,24 @@
 //! * **NULLs**: for typed (non-TEXT) columns an empty cell or a configured
 //!   null token becomes SQL `NULL`; TEXT columns are written verbatim (the
 //!   document cannot represent SQL NULL — reads narrowed it to "" — so a
-//!   TEXT round trip turns NULL into '').
+//!   TEXT round trip turns NULL into ''). One exception: when append maps a
+//!   cell onto a `NOT NULL` target column, an empty/null cell (which would
+//!   become SQL NULL) is a CONVERSION FAILURE — surfaced in the preview and
+//!   aborting the write — never a silent drop.
 //! * **Values**: integers are bound as 64-bit ints (out-of-range i128 is a
 //!   conversion failure), floats as REAL, booleans as 0/1, decimals as
 //!   their canonical text (SQLite's NUMERIC affinity applies from there).
 //!   Parsing reuses the F31 classifier, so declared locales and null
 //!   tokens behave exactly like the rest of the app.
-//! * **PK conflicts**: explicit policy — `abort` (plain INSERT: first
-//!   conflict fails and rolls back everything), `skip` (INSERT OR IGNORE),
-//!   `replace` (INSERT OR REPLACE) — applying to ANY uniqueness
-//!   constraint on the target.
+//! * **PK conflicts**: explicit policy scoped to PRIMARY KEY / UNIQUE
+//!   conflicts — `abort` (the first conflict fails and rolls everything
+//!   back), `skip` (the conflicting row is left out and counted in
+//!   `rows_skipped`), `replace` (INSERT OR REPLACE overwrites it). ONLY
+//!   uniqueness conflicts are in scope: a row that breaks a `NOT NULL`,
+//!   `CHECK` or `FOREIGN KEY` constraint is NEVER silently skipped — it
+//!   aborts the whole write with a clear error (skip classifies the
+//!   violation by SQLite extended code rather than using `OR IGNORE`, which
+//!   would swallow every constraint indiscriminately).
 //! * **Approval**: the user picking the export target in the file dialog
 //!   is approval, exactly like `db_open` — the path joins the
 //!   SafeQueryEngine registry so refresh probes and F36 can read what was
@@ -238,14 +246,31 @@ impl ConflictPolicy {
         }
     }
 
-    /// The INSERT conflict clause implementing the policy.
+    /// The INSERT conflict clause implementing the policy. `abort` and `skip`
+    /// both issue a PLAIN insert: `skip` classifies each constraint violation
+    /// by extended code at execution time (see [`is_uniqueness_conflict`]) so
+    /// it can swallow ONLY primary-key/unique conflicts, where `OR IGNORE`
+    /// would silently drop `NOT NULL`/`CHECK`/`FOREIGN KEY` violations too.
     fn verb(self) -> &'static str {
         match self {
-            ConflictPolicy::Abort => "",
-            ConflictPolicy::Skip => "OR IGNORE ",
+            ConflictPolicy::Abort | ConflictPolicy::Skip => "",
             ConflictPolicy::Replace => "OR REPLACE ",
         }
     }
+}
+
+/// Whether a constraint-violation extended error code is a PRIMARY KEY /
+/// UNIQUE / rowid uniqueness conflict — the ONLY conflicts the `skip` policy
+/// swallows. Everything else (`NOT NULL`, `CHECK`, `FOREIGN KEY`, …) is a
+/// different failure and must abort the write rather than be miscounted as a
+/// skipped duplicate.
+fn is_uniqueness_conflict(extended_code: i32) -> bool {
+    matches!(
+        extended_code,
+        rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+            | rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+            | rusqlite::ffi::SQLITE_CONSTRAINT_ROWID
+    )
 }
 
 /// The five writable SQL column types. Deliberately small: every one has an
@@ -329,6 +354,11 @@ struct ColumnPlan {
     schema: ColumnSchema,
     primary_key: bool,
     target_decl: Option<String>,
+    /// Append mode: whether the mapped target column is `NOT NULL`. A cell
+    /// that would convert to SQL NULL against such a column is a conversion
+    /// failure (it can never be written there), so the preview flags it and
+    /// the write aborts rather than a policy silently dropping the row.
+    target_notnull: bool,
 }
 
 fn validate_table_name(table: &str) -> AppResult<&str> {
@@ -456,6 +486,7 @@ fn base_plan(doc: &Document, spec: &DbExportSpec) -> AppResult<Vec<ColumnPlan>> 
             schema: conversion_schema(declared, id, header, sql_type),
             primary_key: ov.map(|m| m.primary_key).unwrap_or(false),
             target_decl: None,
+            target_notnull: false,
         });
     }
     Ok(plan)
@@ -567,6 +598,7 @@ fn check_target(
                         col.sql_type = SqlType::for_logical(logical_type_of_decl(&t.decl));
                         col.schema.logical_type = col.sql_type.validation_type();
                         col.target_decl = Some(t.decl.clone());
+                        col.target_notnull = t.notnull;
                     }
                     None => issues.push(format!(
                         "column \"{}\" does not exist in table \"{table}\" — appending never \
@@ -613,7 +645,22 @@ fn convert_cell(col: &ColumnPlan, raw: &str) -> Result<Value, String> {
         return Ok(Value::Text(raw.to_string()));
     }
     match classify(Some(raw), &col.schema) {
-        CellState::Missing | CellState::NullToken | CellState::Empty => Ok(Value::Null),
+        CellState::Missing | CellState::NullToken | CellState::Empty => {
+            // An empty/null cell maps to SQL NULL — which a NOT NULL target
+            // column cannot hold. Report it as a conversion failure (shown in
+            // the preview, aborts the write) instead of letting it reach the
+            // insert, where "abort" errors opaquely and "skip" would silently
+            // drop the row as if it were a duplicate.
+            if col.target_notnull {
+                Err(format!(
+                    "the target column \"{}\" is NOT NULL, but this cell is empty \
+                     (it would insert SQL NULL)",
+                    col.sql_name
+                ))
+            } else {
+                Ok(Value::Null)
+            }
+        }
         CellState::Invalid(reason) => Err(reason),
         CellState::Valid(tv) => match tv {
             TypedValue::Integer(i) => i64::try_from(i)
@@ -850,19 +897,37 @@ fn write_transaction(
                 values.push(value);
             }
             match stmt.execute(rusqlite::params_from_iter(values)) {
-                // INSERT OR IGNORE reports 0 changed rows for a skip.
-                Ok(0) => skipped += 1,
                 Ok(_) => written += 1,
                 Err(rusqlite::Error::SqliteFailure(f, msg))
                     if f.code == rusqlite::ffi::ErrorCode::ConstraintViolation =>
                 {
-                    return Err(AppError::invalid(format!(
-                        "row {} violates the table's constraints ({}) — nothing was written; \
-                         choose the \"skip\" or \"replace\" conflict policy to handle key \
-                         conflicts",
-                        i + 1,
-                        msg.unwrap_or_else(|| "constraint violation".into()),
-                    )));
+                    // "skip" swallows ONLY primary-key/unique conflicts; every
+                    // other constraint violation aborts the whole write so it
+                    // is never miscounted as a skipped duplicate.
+                    if policy == ConflictPolicy::Skip && is_uniqueness_conflict(f.extended_code) {
+                        skipped += 1;
+                    } else {
+                        let hint = match policy {
+                            ConflictPolicy::Abort => {
+                                " — choose the \"skip\" or \"replace\" conflict policy to \
+                                 handle primary-key/unique conflicts"
+                            }
+                            ConflictPolicy::Skip => {
+                                " — \"skip\" only skips primary-key/unique conflicts; this \
+                                 row breaks another constraint"
+                            }
+                            ConflictPolicy::Replace => {
+                                " — \"replace\" resolves primary-key/unique conflicts, but \
+                                 this row breaks another constraint"
+                            }
+                        };
+                        return Err(AppError::invalid(format!(
+                            "row {} violates the table's constraints ({}) — nothing was \
+                             written{hint}",
+                            i + 1,
+                            msg.unwrap_or_else(|| "constraint violation".into()),
+                        )));
+                    }
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -1517,6 +1582,74 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][1].as_deref(), Some("99"));
         assert_eq!(rows[0][2].as_deref(), Some("replaced"));
+    }
+
+    #[test]
+    fn empty_cell_into_not_null_target_is_a_preview_failure_not_a_silent_skip() {
+        // `qty` is INTEGER NOT NULL; a blank cell would insert SQL NULL. That
+        // is a conversion failure the preview must show, and neither abort nor
+        // skip may let it through: abort errors with the row/column, skip must
+        // NOT silently drop it (it is not a duplicate).
+        let dir = tempfile::tempdir().unwrap();
+        let path = existing_db(dir.path());
+        let handle = shared_doc("id,qty,note\n5,,blank-qty\n", &[]);
+
+        let spec = spec_for(&path, "items", "append");
+        let p = preview(&handle, &spec);
+        assert!(p.blocking.is_empty(), "{:?}", p.blocking);
+        assert_eq!(p.failure_count, 1, "the blank NOT NULL cell is a failure");
+        assert_eq!(p.failures[0].column, "qty");
+        assert!(
+            p.failures[0].reason.contains("NOT NULL"),
+            "{}",
+            p.failures[0].reason
+        );
+
+        // Abort: clear row/column error, DB untouched.
+        let before = std::fs::read(&path).unwrap();
+        let err = export(&handle, &spec).unwrap_err();
+        assert!(err.to_string().contains("row 1"), "{err}");
+        assert!(err.to_string().contains("\"qty\""), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // Skip: still refused (a NOT NULL violation is not a skippable
+        // duplicate), DB still untouched.
+        let mut skip = spec_for(&path, "items", "append");
+        skip.conflict_policy = "skip".into();
+        assert!(export(&handle, &skip).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn skip_only_swallows_uniqueness_conflicts_not_other_constraints() {
+        // A CHECK constraint the document violates: "skip" must NOT drop the
+        // offending row (that would hide a data error as a duplicate skip); it
+        // aborts the whole write instead. A genuine PK conflict under the same
+        // policy is still skipped (see pk_conflict_skip_*).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checked.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER CHECK(n > 0));
+                 INSERT INTO t VALUES (1, 5);",
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        // The 2nd data row (n = -3) breaks the CHECK; it converts fine (valid
+        // integer), so the violation only surfaces at the insert.
+        let handle = shared_doc("id,n\n2,7\n3,-3\n", &[]);
+        let mut spec = spec_for(&path, "t", "append");
+        spec.conflict_policy = "skip".into();
+        let err = export(&handle, &spec).unwrap_err();
+        assert!(err.to_string().contains("row 2"), "{err}");
+        assert!(err.to_string().contains("another constraint"), "{err}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a non-uniqueness violation rolls the whole skip export back"
+        );
     }
 
     // ----- replace ----------------------------------------------------------
