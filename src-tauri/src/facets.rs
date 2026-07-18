@@ -399,12 +399,17 @@ impl StatusInput {
             if !issue.row_filterable || !seen.insert(issue.id.as_str()) {
                 continue;
             }
-            let rows = diagnostics::issue_rows(doc, &issue.id)?;
-            categories.push(StatusCategory {
-                key: issue.id.clone(),
-                label: issue.title.clone(),
-                rows,
-            });
+            // A stale cache entry can name a column removed by a later structural
+            // edit (nothing invalidates the diagnostics cache on edit). Mirror the
+            // F42 highlight engine: skip such an issue so one dead category never
+            // fails the whole facet computation, degrading it to unresolved.
+            if let Ok(rows) = diagnostics::issue_rows(doc, &issue.id) {
+                categories.push(StatusCategory {
+                    key: issue.id.clone(),
+                    label: issue.title.clone(),
+                    rows,
+                });
+            }
         }
         Ok(StatusInput {
             categories,
@@ -422,7 +427,11 @@ impl StatusInput {
     ) -> AppResult<StatusInput> {
         let mut categories = Vec::new();
         if !rules.is_empty() {
-            let rows = crossval::violating_rows(doc, rules, None)?;
+            // Cached rules reference columns by name; a rename/delete makes
+            // `violating_rows` error on resolution. Mirror F42 highlighting
+            // (`.unwrap_or_default()`): a stale rule degrades the category to
+            // empty rather than failing the whole computation.
+            let rows = crossval::violating_rows(doc, rules, None).unwrap_or_default();
             categories.push(StatusCategory {
                 key: "crossval".into(),
                 label: "Cross-column violation".into(),
@@ -507,12 +516,29 @@ pub fn compute(
     inputs: &FacetInputs,
     ctx: Option<&JobCtx>,
 ) -> AppResult<FacetResultSet> {
-    let n = doc.n_rows();
     let scan_end = if doc.is_editable() {
-        n
+        doc.n_rows()
     } else {
-        FACET_SAMPLE_ROWS.min(n)
+        FACET_SAMPLE_ROWS.min(doc.n_rows())
     };
+    compute_scan(doc, config, inputs, ctx, scan_end)
+}
+
+/// Core of [`compute`] with an explicit scan bound. Rows `0..scan_end` are
+/// counted; when `scan_end < n_rows` the counts are a leading-sample estimate
+/// and every facet's `sampled` flag (value AND status) plus the top-level
+/// [`FacetResultSet::sampled`] is set — status facets tally over the same window
+/// and so are under-counted identically. Split out so the sampled path is
+/// unit-testable without a multi-hundred-thousand-row indexed document.
+fn compute_scan(
+    doc: &Document,
+    config: &FacetConfig,
+    inputs: &FacetInputs,
+    ctx: Option<&JobCtx>,
+    scan_end: usize,
+) -> AppResult<FacetResultSet> {
+    let n = doc.n_rows();
+    let scan_end = scan_end.min(n);
     let scan_sampled = scan_end < n;
 
     let mut built = build_facets(doc, config, inputs)?;
@@ -768,13 +794,12 @@ fn build_column_eval(
 
 impl BuiltFacet {
     fn finish(self, scan_sampled: bool, inputs_sampled: bool) -> FacetResult {
-        let sampled = match self.kind {
-            FacetKind::Diagnostics
-            | FacetKind::Validation
-            | FacetKind::Duplicate
-            | FacetKind::Annotation => inputs_sampled,
-            _ => scan_sampled,
-        };
+        // Every facet's counts are tallied over the same `0..scan_end` window, so
+        // a truncated scan under-counts the four status facets exactly as it does
+        // value facets — flag both on `scan_sampled`. `inputs_sampled`
+        // additionally marks a status facet whose underlying report was itself
+        // only a sample.
+        let sampled = scan_sampled || inputs_sampled;
         let base = FacetResult {
             id: self.id,
             kind: self.kind,
@@ -858,13 +883,21 @@ impl TextEval {
         let mut buckets: Vec<FacetBucket> = Vec::new();
         let mut placed: HashSet<&str> = HashSet::new();
 
-        // Selected values are always shown (checked), even at count 0.
+        // Selected values are always shown (checked), even at count 0 — but bound
+        // the emitted buckets by MAX_TEXT_VALUES so a pathological or hand-edited
+        // saved view with a huge `selection.values` array can never produce an
+        // unbounded payload (the "never a full dump" guarantee). Every selected
+        // key is still marked `placed` (so it is excluded from `rest`) and still
+        // filters exactly via `self.selected` in `passes`; only the DISPLAY list
+        // is capped. The cap is deterministic (sorted, leading MAX_TEXT_VALUES).
         let mut sorted_selected: Vec<&String> = self.selected.iter().collect();
         sorted_selected.sort();
-        for key in sorted_selected {
-            let count = self.counts.get(key).copied().unwrap_or(0);
+        for (i, key) in sorted_selected.iter().enumerate() {
             placed.insert(key.as_str());
-            buckets.push(text_bucket(key, count, true));
+            if i < MAX_TEXT_VALUES {
+                let count = self.counts.get(*key).copied().unwrap_or(0);
+                buckets.push(text_bucket(key, count, true));
+            }
         }
 
         // Then the top values by count among the (search-narrowed) remainder.
@@ -2136,5 +2169,130 @@ mod tests {
         let cfg = FacetConfig { facets: vec![ann] };
         // Only row 4 has no annotation.
         assert_eq!(matching_rows(&d, &cfg, &inputs).unwrap(), vec![4]);
+    }
+
+    // ----- self-review regression tests ------------------------------------
+
+    fn ann_facet(id: &str) -> FacetSpec {
+        FacetSpec {
+            id: id.into(),
+            kind: FacetKind::Annotation,
+            column_id: None,
+            semantic: None,
+            selection: FacetSelection::default(),
+            top_n: None,
+            search: None,
+            bins: None,
+            pinned: false,
+            collapsed: false,
+            width: None,
+        }
+    }
+
+    #[test]
+    fn truncated_scan_flags_status_facets_sampled() {
+        // A truncated scan (as an indexed document over FACET_SAMPLE_ROWS gets)
+        // under-counts status facets exactly like value facets, so their per-facet
+        // `sampled` flag — the one that drives the UI "≈" estimate mark — must be
+        // set, not just the top-level flag. `compute_scan` forces the sampled path
+        // without a 200k-row indexed fixture.
+        let (d, inputs) = annotated_doc(); // 5 rows
+        let cfg = FacetConfig {
+            facets: vec![ann_facet("ann"), spec("name", FacetKind::Text, "c1")],
+        };
+        // Full scan: nothing sampled.
+        let full = compute_scan(&d, &cfg, &inputs, None, d.n_rows()).unwrap();
+        assert!(!full.sampled);
+        assert!(!find(&full, "ann").sampled);
+        assert!(!find(&full, "name").sampled);
+
+        // Truncated to the leading 3 rows: everything is an estimate.
+        let rs = compute_scan(&d, &cfg, &inputs, None, 3).unwrap();
+        assert!(rs.sampled);
+        assert_eq!(rs.scanned_rows, 3);
+        assert!(
+            find(&rs, "ann").sampled,
+            "status facet must flag sampled when its counts are truncated"
+        );
+        assert!(find(&rs, "name").sampled);
+    }
+
+    #[test]
+    fn stale_diagnostics_issue_degrades_instead_of_failing() {
+        // A diagnostics report cached before a column delete can name a column
+        // that no longer exists ("whitespace:9"). `from_diagnostics` must skip it
+        // (like F42) rather than propagate `issue_rows`' out-of-range error and
+        // fail every other facet in the same compute call.
+        use crate::diagnostics::{DiagnosticIssue, DiagnosticsReport, Severity};
+        let d = sample_doc(); // 3 columns
+        let stale = DiagnosticIssue {
+            id: "whitespace:9".into(),
+            kind: "whitespace".into(),
+            severity: Severity::Warning,
+            title: "Edge whitespace".into(),
+            description: String::new(),
+            affected_count: 0,
+            samples: Vec::new(),
+            suggested_action: None,
+            row_filterable: true,
+        };
+        let report = DiagnosticsReport {
+            doc_id: 1,
+            revision: d.revision(),
+            source: Vec::new(),
+            current: vec![stale],
+        };
+        let input = StatusInput::from_diagnostics(&d, &report).expect("stale issue must not error");
+        // The dead category is dropped; the facet degrades to just its none bucket.
+        assert!(input.categories.is_empty());
+        assert_eq!(input.none_label.as_deref(), Some("No issues"));
+    }
+
+    #[test]
+    fn stale_crossval_rule_degrades_instead_of_failing() {
+        // A cached cross-column rule referencing a renamed/deleted column makes
+        // `violating_rows` error on name resolution; `from_validation` must swallow
+        // that (like F42) and still return a usable validation facet.
+        use crate::crossval::CrossRule;
+        let d = sample_doc();
+        let rules = vec![CrossRule::ExactlyOne {
+            columns: vec!["ghost_a".into(), "ghost_b".into()],
+        }];
+        let input = StatusInput::from_validation(&d, &rules, d.schema_issues())
+            .expect("stale rule must not error");
+        // Cross-val category present but degraded to empty; schema category always.
+        let crossval = input
+            .categories
+            .iter()
+            .find(|c| c.key == "crossval")
+            .expect("crossval category present");
+        assert!(crossval.rows.is_empty());
+        assert!(input.categories.iter().any(|c| c.key == "schema"));
+    }
+
+    #[test]
+    fn selected_text_buckets_are_bounded() {
+        // A hand-edited / persisted saved view with a giant selection.values array
+        // must not turn into an unbounded bucket payload: the always-shown selected
+        // buckets are capped at MAX_TEXT_VALUES (plus at most top_n "rest" buckets).
+        let d = sample_doc();
+        let mut s = spec("city", FacetKind::Text, "c0");
+        let values: Vec<String> = (0..MAX_TEXT_VALUES + 500)
+            .map(|i| format!("v{i}"))
+            .collect();
+        s.selection = FacetSelection {
+            mode: FacetMode::Include,
+            values,
+            range: FacetRange::default(),
+        };
+        s.top_n = Some(20);
+        let cfg = FacetConfig { facets: vec![s] };
+        let rs = compute(&d, &cfg, &FacetInputs::default(), None).unwrap();
+        let f = find(&rs, "city");
+        assert!(
+            f.buckets.len() <= MAX_TEXT_VALUES + 20,
+            "selected buckets must stay bounded, got {}",
+            f.buckets.len()
+        );
     }
 }
