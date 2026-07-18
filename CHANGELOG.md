@@ -18,10 +18,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   re-matched on reparse or external change into a matched / ambiguous /
   orphaned review list, so a note is never silently attached to an uncertain
   row (a deleted row keeps its annotation as an orphan until the delete is
-  committed or reverted). Filter the grid by annotation state (starred,
-  flagged, tagged, has-note) through the existing filter view; copy a tag into
-  a real column as one previewed, undoable operation; and export the
-  annotations to JSON or CSV on an explicit action. Annotations are stored in
+  committed or reverted). List every annotation in a side panel with
+  jump-to-row and a review queue for the ambiguous and orphaned ones; filter
+  the grid by annotation state (starred, flagged, tagged, has-note) through
+  the existing filter view; copy a tag into a real column as one previewed,
+  undoable operation; and export the annotations to JSON or CSV on an
+  explicit action. Annotations are stored in
   the active project's workspace file or, with no project open, a versioned
   `<file>.ceesvee-notes.json` sidecar written atomically — never inside the
   CSV, and never in an ordinary data export.
