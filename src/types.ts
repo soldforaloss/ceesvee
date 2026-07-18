@@ -2039,3 +2039,156 @@ export interface SampleStart {
   jobId: number;
   docIds: number[];
 }
+
+// ----- row bookmarks, tags & notes (F40) -----------------------------------
+// Annotations are pure metadata resolved against the current document. The wire
+// shapes mirror `src-tauri/src/annotations.rs`; serde skips empty collections
+// and `None`, so those fields are optional here.
+
+/** Composite-key normalization (mirrors `row_identity::KeyNormalization`). */
+export interface KeyNormalization {
+  trim: boolean;
+  caseFold: boolean;
+  unicodeNfkc: boolean;
+}
+
+/** Key columns (STABLE column ids, in key order) that anchor annotations so
+ * they survive row reordering (mirrors `row_identity::KeySpec`). */
+export interface KeySpec {
+  columns: string[];
+  normalization?: KeyNormalization;
+}
+
+/** A dated free-text note with an optional author label. */
+export interface AnnotationNote {
+  text: string;
+  author?: string;
+  createdMs: number;
+  updatedMs: number;
+}
+
+/** A tag definition in the per-document namespace. */
+export interface TagDef {
+  name: string;
+  color?: string;
+  description?: string;
+}
+
+/** A tag with its usage count across annotated rows. */
+export interface TagUsage {
+  name: string;
+  color?: string;
+  description?: string;
+  count: number;
+}
+
+/** How one annotation resolves against the current source. */
+export type MatchStatus = "matched" | "ambiguous" | "orphaned";
+
+/** One per-column cell note in a row view. */
+export interface CellNoteView {
+  columnId: string;
+  note: AnnotationNote;
+}
+
+/** One annotation, resolved against the current document, for the panel. */
+export interface RowAnnotationView {
+  handle: number;
+  status: MatchStatus;
+  /** Absolute record number when matched. */
+  record?: number;
+  /** Candidate records when ambiguous. */
+  candidates?: number[];
+  /** Anchor mechanism: "key" | "record" | "editor". */
+  anchorKind: string;
+  star: boolean;
+  flag: boolean;
+  tags?: string[];
+  note?: AnnotationNote;
+  cellNotes?: CellNoteView[];
+  createdMs: number;
+  updatedMs: number;
+}
+
+/** The full annotations surface for the front end. */
+export interface AnnotationsView {
+  annotationsRevision: number;
+  /** The document revision, echoed for guarding downstream document ops. */
+  revision: number;
+  author?: string;
+  /** Active key columns (stable ids); empty when record-anchored. */
+  keyColumns?: string[];
+  tags: TagUsage[];
+  matched: number;
+  ambiguous: number;
+  orphaned: number;
+  entries: RowAnnotationView[];
+}
+
+/** One item in the rematch review list (ambiguous / orphaned). */
+export interface ReviewItem {
+  handle: number;
+  label: string;
+  candidates?: number[];
+}
+
+/** The outcome of a rematch: tallies plus the review list. */
+export interface RematchReport {
+  annotationsRevision: number;
+  matched: number;
+  ambiguous: ReviewItem[];
+  orphaned: ReviewItem[];
+}
+
+/** The star/flag/tag edit applied to a row in one call. Absent fields are left
+ * unchanged; `addTags` / `removeTags` mutate the tag set. */
+export interface RowMarkPatch {
+  star?: boolean;
+  flag?: boolean;
+  addTags?: string[];
+  removeTags?: string[];
+}
+
+/** The annotation-state filter predicate (integrates with the row filter). */
+export type AnnotationPredicate =
+  | { type: "starred" }
+  | { type: "flagged" }
+  | { type: "tagged"; tag?: string }
+  | { type: "hasNote" }
+  | { type: "hasCellNote" }
+  | { type: "anyAnnotation" };
+
+/** Where a tag-to-column apply writes. */
+export type TagToColumnTarget =
+  | { type: "newColumn"; name: string }
+  | { type: "existingColumn"; column: number };
+
+/** One record -> value write in a tag-to-column preview sample. */
+export interface TagCellSample {
+  record: number;
+  value: string;
+}
+
+/** Preview of copying a tag into a column (revision-guarded on apply). */
+export interface TagToColumnPreview {
+  revision: number;
+  tag: string;
+  rowsAffected: number;
+  ambiguousSkipped: number;
+  orphanedSkipped: number;
+  sample: TagCellSample[];
+}
+
+/** Export formats for the explicit annotation export action. */
+export type AnnotationExportFormat = "json" | "csv";
+
+/** The versioned persistence envelope (sidecar file / project section). Carries
+ * no source cell values — the front end only shuttles it between the backend,
+ * the project's `annotations` section and a sidecar, so entries stay opaque. */
+export interface AnnotationsExport {
+  version: number;
+  author?: string;
+  keySpec?: KeySpec;
+  tags?: TagDef[];
+  entries?: unknown[];
+}

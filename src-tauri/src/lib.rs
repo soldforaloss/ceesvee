@@ -321,6 +321,7 @@ pub fn run() {
             project::project_open_apply,
             commands::preview_sample,
             commands::start_sample,
+            commands::display_records,
             commands::annotations_view,
             commands::annotations_rematch,
             commands::annotations_set_key_spec,

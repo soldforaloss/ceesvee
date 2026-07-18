@@ -4,6 +4,16 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AnnotationExportFormat,
+  AnnotationPredicate,
+  AnnotationsExport,
+  AnnotationsView,
+  KeySpec,
+  RematchReport,
+  RowMarkPatch,
+  TagDef,
+  TagToColumnPreview,
+  TagToColumnTarget,
   AppendInput,
   AppendOptions,
   AppendPreview,
@@ -769,6 +779,14 @@ export const applyDiagnosticFilter = (docId: number, issueId: string, expectedRe
 export const getRows = (docId: number, start: number, count: number) =>
   invoke<RowsResponse>("get_rows", { docId, start, count });
 
+/**
+ * Absolute source record numbers for a DISPLAY-row window (F40). Lets the grid
+ * place per-row annotation indicators on the right rows under any sort/filter,
+ * where display row != record. `null` for a display index past the end.
+ */
+export const displayRecords = (docId: number, start: number, count: number) =>
+  invoke<(number | null)[]>("display_records", { docId, start, count });
+
 export const selectionStats = (docId: number, rect: CellRect) =>
   invoke<SelectionStats>("selection_stats", { docId, rect });
 
@@ -1075,3 +1093,173 @@ export const projectOpenPreview = (path: string) =>
 /** Apply a project open with per-source resolutions, replacing any open one. */
 export const projectOpenApply = (path: string, resolutions: ResolutionEntry[]) =>
   invoke<ProjectOpenPlan>("project_open_apply", { path, resolutions });
+
+// ----- row bookmarks, tags & notes (F40) -----------------------------------
+// Annotations live in a doc_id-keyed registry OUTSIDE the document, so they
+// survive reparse/reindex/convert (the id is stable) and never dirty the doc.
+// Every mutation is guarded by the store's own `annotationsRevision` and returns
+// the fresh view. The front end calls {@link annotationsRematch} after a reload.
+
+/** The annotations panel surface, rematched against the current document. */
+export const annotationsView = (docId: number) =>
+  invoke<AnnotationsView>("annotations_view", { docId });
+
+/** Re-resolve every annotation against the current document; returns the
+ * matched tally plus the ambiguous / orphaned review list. Call after any
+ * reparse / reindex / external-change reload. */
+export const annotationsRematch = (docId: number) =>
+  invoke<RematchReport>("annotations_rematch", { docId });
+
+/** Set (or clear, with `null`) the key columns anchoring NEW annotations, then
+ * re-anchor the matched existing ones to the new mechanism. */
+export const annotationsSetKeySpec = (
+  docId: number,
+  keySpec: KeySpec | null,
+  expectedAnnotationsRevision: number,
+) =>
+  invoke<AnnotationsView>("annotations_set_key_spec", {
+    docId,
+    keySpec,
+    expectedAnnotationsRevision,
+  });
+
+/** Set (or clear, with `null`) the default author label carried on new notes. */
+export const annotationsSetAuthor = (
+  docId: number,
+  author: string | null,
+  expectedAnnotationsRevision: number,
+) =>
+  invoke<AnnotationsView>("annotations_set_author", {
+    docId,
+    author,
+    expectedAnnotationsRevision,
+  });
+
+/** Star / flag / add or remove tags on the row at `displayRow`. Creates the
+ * annotation if absent; prunes it if the edit leaves it empty. */
+export const annotationsEditRow = (
+  docId: number,
+  displayRow: number,
+  patch: RowMarkPatch,
+  expectedAnnotationsRevision: number,
+) =>
+  invoke<AnnotationsView>("annotations_edit_row", {
+    docId,
+    displayRow,
+    patch,
+    expectedAnnotationsRevision,
+  });
+
+/** Set (or clear, with `text = null`) the ROW note on `displayRow`. */
+export const annotationsSetRowNote = (
+  docId: number,
+  displayRow: number,
+  text: string | null,
+  author: string | null,
+  expectedAnnotationsRevision: number,
+) =>
+  invoke<AnnotationsView>("annotations_set_row_note", {
+    docId,
+    displayRow,
+    text,
+    author,
+    expectedAnnotationsRevision,
+  });
+
+/** Set (or clear, with `text = null`) a CELL note on `columnId` of `displayRow`. */
+export const annotationsSetCellNote = (
+  docId: number,
+  displayRow: number,
+  columnId: string,
+  text: string | null,
+  author: string | null,
+  expectedAnnotationsRevision: number,
+) =>
+  invoke<AnnotationsView>("annotations_set_cell_note", {
+    docId,
+    displayRow,
+    columnId,
+    text,
+    author,
+    expectedAnnotationsRevision,
+  });
+
+/** Delete one whole annotation entry by its stable handle (e.g. discarding a
+ * single orphan from the review list). */
+export const annotationsRemoveRow = (
+  docId: number,
+  handle: number,
+  expectedAnnotationsRevision: number,
+) =>
+  invoke<AnnotationsView>("annotations_remove_row", {
+    docId,
+    handle,
+    expectedAnnotationsRevision,
+  });
+
+/** Discard every orphaned annotation (no matching row in the current document). */
+export const annotationsDiscardOrphans = (docId: number, expectedAnnotationsRevision: number) =>
+  invoke<AnnotationsView>("annotations_discard_orphans", { docId, expectedAnnotationsRevision });
+
+/** Define or update a tag in the per-document namespace. */
+export const annotationsDefineTag = (
+  docId: number,
+  tag: TagDef,
+  expectedAnnotationsRevision: number,
+) => invoke<AnnotationsView>("annotations_define_tag", { docId, tag, expectedAnnotationsRevision });
+
+/** Remove a tag from the namespace and from every row that carries it. */
+export const annotationsRemoveTag = (
+  docId: number,
+  name: string,
+  expectedAnnotationsRevision: number,
+) =>
+  invoke<AnnotationsView>("annotations_remove_tag", { docId, name, expectedAnnotationsRevision });
+
+/** Filter the grid to the rows matching an annotation-state predicate, via the
+ * existing row-filter view. Only MATCHED rows contribute. Guarded by the
+ * document revision; returns the fresh document meta. */
+export const applyAnnotationFilter = (
+  docId: number,
+  predicate: AnnotationPredicate,
+  expectedRevision: number,
+) => invoke<DocumentMeta>("apply_annotation_filter", { docId, predicate, expectedRevision });
+
+/** Preview copying a tag into a column (rows affected, what is skipped as
+ * ambiguous / orphaned, a bounded sample). Read-only. */
+export const previewTagToColumn = (docId: number, tag: string) =>
+  invoke<TagToColumnPreview>("preview_tag_to_column", { docId, tag });
+
+/** Copy a tag into a real column as ONE undoable document operation. Guarded by
+ * the document revision; the notes themselves are untouched. */
+export const applyTagToColumn = (
+  docId: number,
+  tag: string,
+  target: TagToColumnTarget,
+  expectedRevision: number,
+) => invoke<DocumentMeta>("apply_tag_to_column", { docId, tag, target, expectedRevision });
+
+/** Export the annotations as versioned JSON or flat CSV (atomic write). An
+ * EXPLICIT action — notes never leave through an ordinary data export. */
+export const exportAnnotations = (docId: number, path: string, format: AnnotationExportFormat) =>
+  invoke<void>("export_annotations", { docId, path, format });
+
+/** The full annotations export envelope — what the front end writes into the
+ * project's `annotations` section, or a sidecar. */
+export const annotationsGetExport = (docId: number) =>
+  invoke<AnnotationsExport>("annotations_get_export", { docId });
+
+/** Hydrate a document's annotation store from an export envelope (from the
+ * project section on project open, say). Replaces any current store. */
+export const annotationsLoadExport = (docId: number, exportEnvelope: AnnotationsExport) =>
+  invoke<AnnotationsView>("annotations_load_export", { docId, export: exportEnvelope });
+
+/** Load a document's annotations from its sidecar file, replacing any current
+ * store. An absent sidecar yields an empty store. Used when no project is open. */
+export const annotationsLoadSidecar = (docId: number, sourcePath: string) =>
+  invoke<AnnotationsView>("annotations_load_sidecar", { docId, sourcePath });
+
+/** Save a document's annotations to its sidecar file (atomic). An empty store
+ * deletes the sidecar. */
+export const annotationsSaveSidecar = (docId: number, sourcePath: string) =>
+  invoke<void>("annotations_save_sidecar", { docId, sourcePath });

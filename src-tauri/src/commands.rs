@@ -3371,6 +3371,24 @@ pub fn get_rows(doc_id: u64, start: usize, count: usize, state: Db<'_>) -> AppRe
     read_doc(&state, doc_id, |doc| doc.get_rows(start, count))
 }
 
+/// Absolute source record numbers for a DISPLAY-row window (F40). Under a sort
+/// or filter the display row is not the record, so the front end needs this map
+/// to place per-row annotation indicators on the correct rows. `None` for a
+/// display index past the current view's end.
+#[tauri::command]
+pub fn display_records(
+    doc_id: u64,
+    start: usize,
+    count: usize,
+    state: Db<'_>,
+) -> AppResult<Vec<Option<u64>>> {
+    read_doc(&state, doc_id, |doc| {
+        Ok((start..start.saturating_add(count))
+            .map(|display| doc.display_to_abs(display).map(|abs| abs as u64))
+            .collect())
+    })
+}
+
 /// The COMPLETE content of one cell (display coordinates), read through the
 /// backing-aware path so the F13 cell editor never operates on truncated
 /// grid text. Works for indexed documents (inspection is read-only there).
