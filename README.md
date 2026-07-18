@@ -58,16 +58,17 @@ and faithful on large, real-world delimited files.**
   explode into rows, or drop). Signed/unsigned 64-bit integers, exact
   decimal precision/scale, timestamps with timezone, and null-vs-empty-string
   all survive intact.
-- **Import & export Excel `.xlsx`** — a chooser lists every sheet (including
-  hidden ones), named tables and ranges, used ranges, and formula/merged-cell
-  counts. Pick a sheet, table or cell range; choose the header row, how merged
-  cells and formulas are handled (cached result, formula text, or blank), and
-  blank-row/column trimming. The workbook's 1900/1904 date system is honoured
-  (no date shifting) and leading-zero text stays text. Export one document — or
-  several open tabs as one sheet each — with optional header styling, a frozen
-  header row, an autofilter, column widths, and typed numbers/dates/booleans
-  from the declared schema; imports always create a new document, never an
-  in-place `.xlsx` save.
+- **Open Excel `.xlsx`** — a chooser lists every sheet (including hidden and
+  very-hidden ones), named tables and ranges, used ranges and dimensions, and
+  formula/merged-cell counts. Pick a sheet, table or cell range; choose the
+  header row (first, a chosen row, or none), how merged cells are handled
+  (top-left value only, or repeated across the region) and how formulas are
+  handled (cached result, formula text, or blank — with a warning when a
+  workbook has formulas but no cached results), and blank-row/column trimming.
+  The workbook's 1900/1904 date system is honoured (no date shifting, the
+  1900 leap-year quirk preserved) and leading-zero text stays text. Every
+  import creates a new document — there is no in-place `.xlsx` save, so the
+  original workbook is never modified.
 - Auto-detect the **delimiter** (comma, tab, semicolon, pipe) with a manual /
   custom override — plus an **advanced import** for preambles, comment
   lines, custom quoting/escaping, multi-row headers, and footers.
@@ -131,6 +132,14 @@ and faithful on large, real-world delimited files.**
   column's declared logical type to the matching arrow type (preserving 64-bit
   integer widths, decimal precision/scale, and timestamp timezones); cells
   that can't be represented are written as NULL and reported per column.
+- **Export to Excel `.xlsx`** — write one document — or several open tabs as
+  one sheet each — to a single workbook, with optional bold/filled header
+  styling, a frozen header row, an autofilter, and column widths from the grid
+  or autofit. Typed columns emit real Excel numbers, booleans, and dates from
+  the declared schema (text stays text; cells invalid under their schema fall
+  back to text). Excel's 1,048,576-row × 16,384-column limits are checked
+  before anything is written, and the workbook commits through the same atomic
+  save pipeline, so a failed or cancelled export never touches an existing file.
 
 **Reliability**
 
