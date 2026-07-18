@@ -1329,7 +1329,12 @@ pub fn execute_to_derived(
             headers.clone(),
             cache_root.clone(),
             crate::derived::SPILL_BUDGET,
-        );
+        )
+        // A header-less source exposes synthetic `Column N` placeholders; keep
+        // the derived document header-less too, exactly like the CSV export
+        // path below honours `source.has_header_row()`, so the placeholders are
+        // never baked in as a real header that would resurface on save/export.
+        .with_header_row(source.has_header_row());
         let mut hasher = ContentHasher::new();
         read_indices(source, &plan.indices, Some(ctx), &mut |_abs, row| {
             hasher.update(row);
@@ -1359,14 +1364,33 @@ pub fn execute_to_derived(
     Ok((docs, manifest))
 }
 
-/// `<dir>/<base>-<label>.csv`, sanitising the label like the F04 split export.
-fn output_path(dir: &Path, base: &str, label: &str, single: bool) -> PathBuf {
-    if single {
-        dir.join(format!("{base}.csv"))
-    } else {
-        let safe = crate::export_scope::sanitize_filename_part(label);
-        dir.join(format!("{base}-{safe}.csv"))
+/// One `<dir>/<base>-<label>.csv` path per plan (a lone plan keeps the bare
+/// `<dir>/<base>.csv`). Labels are sanitised like the F04 split export AND made
+/// unique deterministically by plan order (`-2`, `-3`, …): two partitions whose
+/// distinct names collapse to the same fragment — `a/b` and `a_b`, or names
+/// equal only after truncation — would otherwise map to one path, and the
+/// export loop would silently overwrite the first file with the second while
+/// the manifest still lists both. Reserving every FINAL fragment also keeps a
+/// suffixed name from colliding with a later plan whose raw value already looks
+/// suffixed (a literal `a_b-2` gets its own file).
+fn output_paths(dir: &Path, base: &str, plans: &[OutputPlan]) -> Vec<PathBuf> {
+    if plans.len() == 1 {
+        return vec![dir.join(format!("{base}.csv"))];
     }
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    plans
+        .iter()
+        .map(|plan| {
+            let base_label = crate::export_scope::sanitize_filename_part(&plan.name);
+            let mut label = base_label.clone();
+            let mut n = 1usize;
+            while !taken.insert(label.clone()) {
+                n += 1;
+                label = format!("{base_label}-{n}");
+            }
+            dir.join(format!("{base}-{label}.csv"))
+        })
+        .collect()
 }
 
 /// Write every output plan to a CSV file through the atomic streaming sink,
@@ -1389,7 +1413,7 @@ pub fn execute_to_export(
     ctx: &JobCtx,
 ) -> AppResult<SampleManifest> {
     ctx.set_total(plans.iter().map(|p| p.indices.len() as u64).sum());
-    let single = plans.len() == 1;
+    let paths = output_paths(dir, base_name, plans);
     let mut committed: Vec<PathBuf> = Vec::with_capacity(plans.len());
 
     let result = (|| -> AppResult<SampleManifest> {
@@ -1398,7 +1422,7 @@ pub fn execute_to_export(
             ctx.set_part((i + 1) as u32);
             ctx.set_message(format!("writing '{}'", plan.name));
             ctx.flush_progress();
-            let path = output_path(dir, base_name, &plan.name, single);
+            let path = paths[i].clone();
 
             let mut sink = CsvSink::create(&path, options)?;
             sink.begin(&source.columns(), source.has_header_row())?;
@@ -2277,6 +2301,64 @@ mod tests {
         assert_eq!(h1, h2, "content hashes are deterministic");
     }
 
+    #[test]
+    fn derived_from_headerless_source_stays_headerless() {
+        // A source WITHOUT a header row exposes synthetic `Column N` labels.
+        // The derived document must not bake those in as a genuine header —
+        // otherwise a later save/export would gain an extra synthetic line,
+        // whereas the CSV export path preserves `source.has_header_row()`.
+        let csv = {
+            let mut s = String::new();
+            for i in 0..40 {
+                s.push_str(&format!("{i},v{i}\n"));
+            }
+            s
+        };
+        let parsed = parse(csv.as_bytes(), &ParseSettings::default()).unwrap();
+        let doc = Document::from_parsed(1, None, parsed, false); // no header row
+        let src = DocumentSource::new(&doc);
+        assert!(!src.has_header_row(), "the source is header-less");
+
+        let u = Universe::All(40);
+        let plan = plan_sample(
+            &src,
+            &u,
+            &SamplingMethod::Head { n: 5 },
+            SampleOrder::SourceOrder,
+            1,
+            None,
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let ids = vec![10u64];
+        let (_r, c) = ctx();
+        let (docs, _m) = execute_to_derived(
+            &src,
+            &plan.outputs,
+            &ids,
+            dir.path().to_path_buf(),
+            1,
+            SampleScope::All,
+            SampleOrder::SourceOrder,
+            40,
+            "head",
+            &c,
+        )
+        .unwrap();
+        assert_eq!(docs.len(), 1);
+        let d = &docs[0];
+        assert!(
+            !d.has_header_row(),
+            "derived document preserves header-less provenance"
+        );
+        // The first source data row survives AS DATA (not consumed as a header),
+        // and the column labels are synthetic placeholders, never written out.
+        assert_eq!(d.n_rows(), 5, "no data row was eaten as a header");
+        assert_eq!(d.rows()[0], vec!["0".to_string(), "v0".to_string()]);
+        assert_eq!(d.headers(), &["Column 1", "Column 2"]);
+    }
+
     // ----- execution: exports + manifest -----------------------------------
 
     #[test]
@@ -2357,6 +2439,75 @@ mod tests {
             dir.path().join("head.csv").exists(),
             "single output uses the base name"
         );
+    }
+
+    #[test]
+    fn colliding_partition_names_get_distinct_export_files() {
+        // Two DISTINCT partition names that sanitise to the same fragment
+        // ("a/b" and "a_b" both -> "a_b") must not map to one file: without a
+        // uniqueness step the loop would write the first and silently overwrite
+        // it with the second, leaving a manifest that lists a file no longer on
+        // disk.
+        let s = mem(4, 1);
+        let plans = vec![
+            OutputPlan {
+                name: "a/b".into(),
+                indices: vec![0, 1],
+            },
+            OutputPlan {
+                name: "a_b".into(),
+                indices: vec![2, 3],
+            },
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let (_r, c) = ctx();
+        let manifest = execute_to_export(
+            &s,
+            &plans,
+            dir.path(),
+            "split",
+            &export_opts(),
+            false,
+            1,
+            SampleScope::All,
+            SampleOrder::SourceOrder,
+            4,
+            "partition",
+            &c,
+        )
+        .unwrap();
+
+        // The manifest names two DISTINCT, deterministic filenames.
+        let names: Vec<String> = manifest
+            .outputs
+            .iter()
+            .map(|o| o.file_name.clone().unwrap())
+            .collect();
+        assert_eq!(names, vec!["split-a_b.csv", "split-a_b-2.csv"]);
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), 2, "no two outputs share a filename");
+
+        // Both files exist on disk, and nothing else was written.
+        let csvs = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "csv").unwrap_or(false))
+            .count();
+        assert_eq!(csvs, 2, "both partitions survived; neither was clobbered");
+
+        // Each manifest hash matches the file that actually holds its rows.
+        for out in &manifest.outputs {
+            let name = out.file_name.as_ref().unwrap();
+            let bytes = std::fs::read(dir.path().join(name)).unwrap();
+            let expected = format!("{:x}", Sha256::digest(&bytes));
+            assert_eq!(&out.sha256, &expected, "{name}");
+        }
+        // Distinct row sets prove the second write did not overwrite the first.
+        let first = std::fs::read_to_string(dir.path().join("split-a_b.csv")).unwrap();
+        let second = std::fs::read_to_string(dir.path().join("split-a_b-2.csv")).unwrap();
+        assert!(first.contains("r0c0") && first.contains("r1c0"));
+        assert!(second.contains("r2c0") && second.contains("r3c0"));
+        assert_ne!(first, second);
     }
 
     // ----- cancellation cleanup --------------------------------------------
