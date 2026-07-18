@@ -179,6 +179,49 @@ export function hasPointer(options: Pick<JsonImportOptions, "pointer">): boolean
 }
 
 /**
+ * Whether the displayed preview still reflects the currently-edited options.
+ * After any option change there is a debounce before the re-scan starts (and
+ * that scan can then be cancelled or fail), so the shown preview can lag the
+ * edited options. `scannedOptions` is the option set the current preview was
+ * produced under (`null` before the first scan).
+ */
+export function previewReflectsOptions(
+  editedOptions: JsonImportOptions,
+  scannedOptions: JsonImportOptions | null,
+): boolean {
+  return scannedOptions != null && JSON.stringify(editedOptions) === JSON.stringify(scannedOptions);
+}
+
+/**
+ * Whether the import can run right now. Beyond the obvious guards — not already
+ * importing, no in-flight scan, no validation errors, and some columns to
+ * import — the gate REQUIRES the shown preview to reflect the edited options
+ * and the last scan to have succeeded. Without that, the 300 ms debounce (or a
+ * cancelled/failed rescan) leaves the old preview's columns in place while the
+ * options have moved on, and applying then would import a different result than
+ * the preview shows (e.g. flipping arrayPolicy to "explode" changes the row
+ * set). The backend re-validates regardless; this only keeps the button honest.
+ */
+export function canApplyImport(gate: {
+  importing: boolean;
+  scanning: boolean;
+  scanError: string | null | undefined;
+  errors: string[];
+  hasColumns: boolean;
+  editedOptions: JsonImportOptions;
+  scannedOptions: JsonImportOptions | null;
+}): boolean {
+  return (
+    !gate.importing &&
+    !gate.scanning &&
+    gate.scanError == null &&
+    gate.errors.length === 0 &&
+    gate.hasColumns &&
+    previewReflectsOptions(gate.editedOptions, gate.scannedOptions)
+  );
+}
+
+/**
  * Toggle a flattened path in the ignore list, returning a NEW list (reducer
  * helper for the per-path nested controls).
  */

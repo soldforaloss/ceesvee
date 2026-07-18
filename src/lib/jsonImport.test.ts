@@ -1,19 +1,21 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  canApplyImport,
   describeShape,
   escapeJsonKey,
   explodingFields,
   isIgnored,
   needsMultiArrayChoice,
   pathSegments,
+  previewReflectsOptions,
   projectColumns,
   splitJsonPath,
   toggleIgnorePath,
   validateImportOptions,
   defaultImportOptions,
 } from "./jsonImport";
-import type { ArrayFieldInfo, JsonImportPreview, PreviewColumn } from "../types";
+import type { ArrayFieldInfo, JsonImportOptions, JsonImportPreview, PreviewColumn } from "../types";
 
 const col = (name: string, over: Partial<PreviewColumn> = {}): PreviewColumn => ({
   name,
@@ -186,6 +188,59 @@ describe("import option validation", () => {
       preview({ maxRecordDims: 1, arrayFields: [arr("x"), arr("y")] }),
     );
     expect(errs).toEqual([]);
+  });
+});
+
+describe("import-apply gate", () => {
+  // A gate that is runnable by default, so each case flips exactly one input.
+  const scanned: JsonImportOptions = defaultImportOptions();
+  const runnable = () => ({
+    importing: false,
+    scanning: false,
+    scanError: null as string | null,
+    errors: [] as string[],
+    hasColumns: true,
+    editedOptions: { ...scanned },
+    scannedOptions: { ...scanned },
+  });
+
+  it("allows import when the preview reflects the edited options", () => {
+    expect(canApplyImport(runnable())).toBe(true);
+  });
+
+  it("blocks import while a scan is running or an import is in flight", () => {
+    expect(canApplyImport({ ...runnable(), scanning: true })).toBe(false);
+    expect(canApplyImport({ ...runnable(), importing: true })).toBe(false);
+  });
+
+  it("blocks import on validation errors or when there is nothing to import", () => {
+    expect(canApplyImport({ ...runnable(), errors: ["bad"] })).toBe(false);
+    expect(canApplyImport({ ...runnable(), hasColumns: false })).toBe(false);
+  });
+
+  it("blocks import while the edited options differ from the scanned preview", () => {
+    // The reviewer's case: an option changed but the shown preview still has
+    // columns (within the debounce / rescan). Importing would apply options
+    // the preview never represented.
+    const stale = { ...runnable(), editedOptions: { ...scanned, arrayPolicy: "explode" as const } };
+    expect(previewReflectsOptions(stale.editedOptions, stale.scannedOptions)).toBe(false);
+    expect(canApplyImport(stale)).toBe(false);
+  });
+
+  it("blocks import after a failed rescan, and before the first scan", () => {
+    expect(canApplyImport({ ...runnable(), scanError: "scan failed" })).toBe(false);
+    expect(canApplyImport({ ...runnable(), scannedOptions: null })).toBe(false);
+  });
+
+  it("re-enables import once the preview catches up to the options", () => {
+    const changed = { ...scanned, arrayPolicy: "explode" as const };
+    // Stale while only the edited side changed…
+    expect(previewReflectsOptions(changed, scanned)).toBe(false);
+    // …and current again once the scan records the same options.
+    expect(previewReflectsOptions(changed, changed)).toBe(true);
+    expect(canApplyImport({ ...runnable(), editedOptions: changed, scannedOptions: changed })).toBe(
+      true,
+    );
   });
 });
 
