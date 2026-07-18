@@ -4,8 +4,8 @@ import {
   CONDITION_LABELS,
   EMPHASIS_LABELS,
   HIGHLIGHT_TONE_RGB,
+  conditionAnnotationBacked,
   conditionColumnId,
-  conditionReserved,
   conditionSupportsColumn,
   createDraftPersister,
   defaultCondition,
@@ -184,10 +184,15 @@ describe("condition helpers", () => {
     expect(conditionSupportsColumn("diagnostic")).toBe(false);
   });
 
-  it("flags the reserved F40 annotation conditions", () => {
-    expect(conditionReserved("bookmarked")).toBe(true);
-    expect(conditionReserved("tagged")).toBe(true);
-    expect(conditionReserved("equals")).toBe(false);
+  it("flags the F40 annotation-backed conditions", () => {
+    expect(conditionAnnotationBacked("bookmarked")).toBe(true);
+    expect(conditionAnnotationBacked("flagged")).toBe(true);
+    expect(conditionAnnotationBacked("tagged")).toBe(true);
+    expect(conditionAnnotationBacked("equals")).toBe(false);
+  });
+
+  it("builds a label-free flagged condition (F40 flags carry no label)", () => {
+    expect(defaultCondition("flagged")).toEqual({ type: "flagged" });
   });
 
   it("reads a condition's column scope", () => {

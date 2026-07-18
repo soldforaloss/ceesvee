@@ -8,8 +8,8 @@ import {
   TONE_LABELS,
   TONE_ORDER,
   conditionAnalysisBacked,
+  conditionAnnotationBacked,
   conditionColumnId,
-  conditionReserved,
   conditionSupportsColumn,
   createDraftPersister,
   defaultCondition,
@@ -396,7 +396,6 @@ function RuleEditor({
   onDuplicate: () => void;
 }) {
   const kind = draft.condition.type;
-  const reserved = conditionReserved(kind);
 
   const changeKind = (next: ConditionKind) => {
     // Preserve the column scope when both kinds carry one.
@@ -459,10 +458,10 @@ function RuleEditor({
         </select>
       </div>
 
-      {reserved && (
-        <p className="rounded border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200">
-          Row annotations (bookmarks / flags / tags) aren’t available yet — this rule is saved but
-          matches nothing until that feature ships.
+      {conditionAnnotationBacked(kind) && (
+        <p className="rounded border border-sky-300 bg-sky-50 px-3 py-1.5 text-xs text-sky-800 dark:border-sky-500/40 dark:bg-sky-500/10 dark:text-sky-200">
+          Reads the document’s row annotations (bookmarks / flags / tags) — empty until you annotate
+          rows.
         </p>
       )}
       {conditionAnalysisBacked(kind) && (
@@ -796,17 +795,6 @@ function ConditionFields({
           />
         </div>
       );
-    case "flagged":
-      return (
-        <div>
-          <label className={labelClass}>Flag label (optional)</label>
-          <input
-            value={condition.label ?? ""}
-            onChange={(e) => onChange({ ...condition, label: e.target.value || null })}
-            className={`${inputClass} mt-1`}
-          />
-        </div>
-      );
     case "tagged":
       return (
         <div>
@@ -819,8 +807,8 @@ function ConditionFields({
         </div>
       );
     default:
-      // blank / invalid / changedSinceSave / outlier / bookmarked carry no extra
-      // fields beyond the (already-rendered) column scope.
+      // blank / invalid / changedSinceSave / outlier / bookmarked / flagged
+      // carry no extra fields beyond the (already-rendered) column scope.
       return null;
   }
 }

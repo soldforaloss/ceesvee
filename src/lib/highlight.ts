@@ -165,17 +165,17 @@ export function conditionSupportsColumn(kind: ConditionKind): boolean {
   return COLUMN_SCOPED.has(kind);
 }
 
-/** Row-annotation conditions (F40) — modelled but not yet wired: they match
- *  nothing until row annotations land beneath this feature. */
-const RESERVED: ReadonlySet<ConditionKind> = new Set<ConditionKind>([
+/** Row-annotation conditions (F40): they decorate rows the user has bookmarked,
+ *  flagged, or tagged, and are empty until the document carries annotations. */
+const ANNOTATION_BACKED: ReadonlySet<ConditionKind> = new Set<ConditionKind>([
   "bookmarked",
   "flagged",
   "tagged",
 ]);
 
-/** Whether a condition is a reserved (currently-unavailable) F40 stub. */
-export function conditionReserved(kind: ConditionKind): boolean {
-  return RESERVED.has(kind);
+/** Whether a condition reads the F40 row annotations (empty until any exist). */
+export function conditionAnnotationBacked(kind: ConditionKind): boolean {
+  return ANNOTATION_BACKED.has(kind);
 }
 
 /** Analysis-backed conditions that read a cached scan (empty until it runs). */
@@ -232,7 +232,7 @@ export function defaultCondition(kind: ConditionKind): HighlightCondition {
     case "bookmarked":
       return { type: "bookmarked" };
     case "flagged":
-      return { type: "flagged", label: null };
+      return { type: "flagged" };
     case "tagged":
       return { type: "tagged", tag: "" };
   }
@@ -375,7 +375,7 @@ export function describeCondition(
     case "bookmarked":
       return "bookmarked (F40)";
     case "flagged":
-      return condition.label ? `flagged "${condition.label}" (F40)` : "flagged (F40)";
+      return "flagged (F40)";
     case "tagged":
       return `tagged "${condition.tag}" (F40)`;
   }

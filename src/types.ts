@@ -1269,8 +1269,8 @@ export type HighlightTarget =
  * The predicate a rule tests. Column-scoped predicates carry an optional
  * `columnId`; when omitted they apply to the columns named by a `columns`
  * target, or to every column for a `cell` / `row` target. The `bookmarked`,
- * `flagged` and `tagged` variants are RESERVED for row annotations (F40) and
- * currently match nothing until that feature lands beneath this one.
+ * `flagged` and `tagged` variants decorate rows the user has annotated (F40);
+ * F40 flags carry no label, so `flagged` decorates every flagged row.
  */
 export type HighlightCondition =
   | { type: "equals"; columnId?: string | null; value: string; caseSensitive?: boolean }
@@ -1299,7 +1299,7 @@ export type HighlightCondition =
   | { type: "outlier" }
   | { type: "changedSinceSave"; columnId?: string | null }
   | { type: "bookmarked" }
-  | { type: "flagged"; label?: string | null }
+  | { type: "flagged" }
   | { type: "tagged"; tag: string };
 
 /** One conditional-highlighting rule (persists in views (F12) & profiles (F08)). */

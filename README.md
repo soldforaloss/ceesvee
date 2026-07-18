@@ -147,8 +147,9 @@ and faithful on large, real-world delimited files.**
 - **Conditional highlighting** — decorate cells and rows with prioritized,
   view-only rules (equals / not-equals, contains, regex, numeric and date
   ranges, blank / null / invalid, duplicate values, diagnostic issues,
-  cross-column violations, outliers, and changed-since-save) in theme-aware
-  semantic tones that stay readable in light and dark. Each rule targets the
+  cross-column violations, outliers, changed-since-save, and row
+  bookmarks / flags / tags) in theme-aware semantic tones that stay readable in
+  light and dark. Each rule targets the
   cell, its whole row, or selected columns; overlaps resolve by priority into
   one winning decoration per cell, flattened server-side so only the visible
   window crosses to the grid and a million-row scroll stays smooth. An

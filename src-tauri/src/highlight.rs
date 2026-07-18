@@ -28,9 +28,12 @@
 //!   reads (outlier/cross-column/diagnostics), so re-running an analysis
 //!   refreshes the highlight without a data change.
 //!
-//! A handful of conditions are *volatile* (changed-since-save reads the dirty
-//! set, which a save clears without moving the revision; the F40 bookmark/flag/
-//! tag stubs are trivial) and are recomputed every query rather than cached.
+//! The changed-since-save condition is *volatile* — it reads the dirty-cell set,
+//! which a save clears without moving any tracked revision — so it is recomputed
+//! on every query rather than cached. The F40 annotation conditions (bookmarked
+//! / flagged / tagged) are cached like the rest: their `analysis revision` is the
+//! annotation store's revision, so an annotation edit invalidates them while a
+//! plain scroll reuses the warm match sets.
 //!
 //! ## Windowed transfer
 //!
@@ -261,18 +264,16 @@ pub enum HighlightCondition {
         #[serde(default)]
         column_id: Option<String>,
     },
-    // ---- F40 siblings (row annotations) --------------------------------
-    // F40 is built concurrently and is NOT beneath this stage, so these three
-    // variants are modelled but evaluate to NO matches. The integration stage
-    // wires them to the real annotation store once F40 lands underneath.
-    /// STUB (F40): bookmarked rows. Always empty here.
+    // ---- F40 row annotations (wired beneath this stage) ----------------
+    // Backed by the annotation store's resolved marks (see `AnnotationMatches`).
+    // Only MATCHED rows contribute — an ambiguous / orphaned annotation never
+    // decorates a row. Empty when the document carries no annotations.
+    /// Rows the user has bookmarked (starred) in F40 annotations.
     Bookmarked,
-    /// STUB (F40): flagged rows, optionally by flag label. Always empty here.
-    Flagged {
-        #[serde(default)]
-        label: Option<String>,
-    },
-    /// STUB (F40): rows carrying a tag. Always empty here.
+    /// Rows the user has flagged in F40 annotations. F40 flags carry no label,
+    /// so this decorates every flagged row.
+    Flagged,
+    /// Rows carrying the named F40 tag.
     Tagged { tag: String },
 }
 
@@ -315,16 +316,11 @@ impl HighlightRule {
     }
 
     /// Whether this rule is recomputed on every query instead of cached: its
-    /// inputs can change without moving any tracked revision (the dirty set a
-    /// save clears) or it is a trivial stub.
+    /// inputs can change without moving any tracked revision (the dirty-cell set
+    /// a save clears). The annotation conditions are NOT volatile — they cache
+    /// against the annotation store's revision like the analysis-backed ones.
     fn is_volatile(&self) -> bool {
-        matches!(
-            self.condition,
-            HighlightCondition::ChangedSinceSave { .. }
-                | HighlightCondition::Bookmarked
-                | HighlightCondition::Flagged { .. }
-                | HighlightCondition::Tagged { .. }
-        )
+        matches!(self.condition, HighlightCondition::ChangedSinceSave { .. })
     }
 
     /// Whether the condition reads the document per-cell (as opposed to a
@@ -428,6 +424,26 @@ pub struct AnalysisContext {
     pub outlier: Option<CachedOutlier>,
     pub crossval: Option<CachedCrossVal>,
     pub diagnostics: Option<DiagnosticsReport>,
+    /// Resolved F40 annotation marks (absolute rows), when the document has any
+    /// annotation-backed rule. `None` when no annotation condition is active, so
+    /// the rematch that builds it is skipped entirely on the common path.
+    pub annotations: Option<AnnotationMatches>,
+}
+
+/// The absolute rows an F40 annotation condition decorates, resolved once from
+/// the annotation store and shared across a query's rules. The `revision` is the
+/// annotation store's revision — the analysis-revision component of the three
+/// annotation conditions' cache key, so an annotation edit invalidates them.
+#[derive(Debug, Clone, Default)]
+pub struct AnnotationMatches {
+    /// The annotation-store revision these sets were resolved at.
+    pub revision: u64,
+    /// Sorted absolute rows that are bookmarked (starred).
+    pub starred: Vec<usize>,
+    /// Sorted absolute rows that are flagged.
+    pub flagged: Vec<usize>,
+    /// Tag name → sorted absolute rows carrying it.
+    pub tagged: HashMap<String, Vec<usize>>,
 }
 
 /// Stable-ish fingerprint of a serializable analysis input, used to detect an
@@ -460,6 +476,14 @@ fn analysis_revision(condition: &HighlightCondition, actx: &AnalysisContext) -> 
             .as_ref()
             // +1 so "present at revision 0" is distinguishable from "absent".
             .map(|report| report.revision.wrapping_add(1))
+            .unwrap_or(0),
+        HighlightCondition::Bookmarked
+        | HighlightCondition::Flagged
+        | HighlightCondition::Tagged { .. } => actx
+            .annotations
+            .as_ref()
+            // +1 so "present at revision 0" is distinguishable from "absent".
+            .map(|a| a.revision.wrapping_add(1))
             .unwrap_or(0),
         _ => 0,
     }
@@ -940,10 +964,25 @@ fn evaluate_rule(
             Some(report) => RawMatches::Rows(diagnostic_rows(doc, report, issue_id.as_deref())),
             None => RawMatches::Rows(Vec::new()),
         },
-        // ----- F40 stubs: no matches until integration wires them -----
-        HighlightCondition::Bookmarked
-        | HighlightCondition::Flagged { .. }
-        | HighlightCondition::Tagged { .. } => RawMatches::Rows(Vec::new()),
+        // ----- F40 annotations (resolved marks from the annotation store) -----
+        HighlightCondition::Bookmarked => RawMatches::Rows(
+            actx.annotations
+                .as_ref()
+                .map(|a| a.starred.clone())
+                .unwrap_or_default(),
+        ),
+        HighlightCondition::Flagged => RawMatches::Rows(
+            actx.annotations
+                .as_ref()
+                .map(|a| a.flagged.clone())
+                .unwrap_or_default(),
+        ),
+        HighlightCondition::Tagged { tag } => RawMatches::Rows(
+            actx.annotations
+                .as_ref()
+                .and_then(|a| a.tagged.get(tag).cloned())
+                .unwrap_or_default(),
+        ),
     };
     Ok(project(raw, &rule.target, doc))
 }
@@ -1574,20 +1613,67 @@ fn emphasis_label(emphasis: Emphasis) -> &'static str {
 // The store (Tauri-managed): per-document highlight state behind its own lock
 // ---------------------------------------------------------------------------
 
-/// Process-wide highlight state, keyed by document id. The outer map is locked
-/// only long enough to clone a document's `Arc<Mutex<DocState>>`, mirroring the
-/// per-tab independence of the document registry.
+/// A document's resolved F40 annotation match snapshot, tagged with the
+/// (document, annotation-store) revisions it was built at so a rematch is only
+/// paid when one of them moves — a plain scroll reuses the cached snapshot.
+struct CachedAnnotationMatches {
+    doc_revision: u64,
+    annotation_revision: u64,
+    matches: AnnotationMatches,
+}
+
+/// Process-wide highlight state, keyed by document id. The `states` map is
+/// locked only long enough to clone a document's `Arc<Mutex<DocState>>`,
+/// mirroring the per-tab independence of the document registry. The
+/// `annotation_cache` memoizes the resolved F40 marks per document.
 #[derive(Default)]
-pub struct HighlightStore(Mutex<HashMap<u64, Arc<Mutex<DocState>>>>);
+pub struct HighlightStore {
+    states: Mutex<HashMap<u64, Arc<Mutex<DocState>>>>,
+    annotation_cache: Mutex<HashMap<u64, CachedAnnotationMatches>>,
+}
 
 impl HighlightStore {
     /// The per-document state, created on first use.
     fn doc_state(&self, doc_id: u64) -> AppResult<Arc<Mutex<DocState>>> {
         let mut map = self
-            .0
+            .states
             .lock()
             .map_err(|_| AppError::Other("internal highlight lock error".into()))?;
         Ok(Arc::clone(map.entry(doc_id).or_default()))
+    }
+
+    /// The F40 annotation match snapshot for a document, resolved via `build`
+    /// (a rematch against the annotation store) only when the document or the
+    /// annotation-store revision has moved since the last resolve. Building is
+    /// otherwise skipped, so a windowed scroll never re-runs the rematch.
+    pub fn annotation_matches(
+        &self,
+        doc_id: u64,
+        doc_revision: u64,
+        annotation_revision: u64,
+        build: impl FnOnce() -> AppResult<AnnotationMatches>,
+    ) -> AppResult<AnnotationMatches> {
+        let mut map = self
+            .annotation_cache
+            .lock()
+            .map_err(|_| AppError::Other("internal highlight lock error".into()))?;
+        if let Some(cached) = map.get(&doc_id) {
+            if cached.doc_revision == doc_revision
+                && cached.annotation_revision == annotation_revision
+            {
+                return Ok(cached.matches.clone());
+            }
+        }
+        let matches = build()?;
+        map.insert(
+            doc_id,
+            CachedAnnotationMatches {
+                doc_revision,
+                annotation_revision,
+                matches: matches.clone(),
+            },
+        );
+        Ok(matches)
     }
 
     fn with_state<T>(&self, doc_id: u64, f: impl FnOnce(&mut DocState) -> T) -> AppResult<T> {
@@ -1623,9 +1709,13 @@ impl HighlightStore {
         self.with_state(doc_id, |s| s.clear())
     }
 
-    /// Forget a document entirely (on close).
+    /// Forget a document entirely (on close): its rule state and its cached
+    /// annotation snapshot.
     pub fn remove_doc(&self, doc_id: u64) {
-        if let Ok(mut map) = self.0.lock() {
+        if let Ok(mut map) = self.states.lock() {
+            map.remove(&doc_id);
+        }
+        if let Ok(mut map) = self.annotation_cache.lock() {
             map.remove(&doc_id);
         }
     }
@@ -2044,17 +2134,99 @@ mod tests {
         assert_eq!(rows_of(&evaluate_rule(&r, &d, &actx).unwrap()), vec![1, 2]);
     }
 
+    fn annotations_ctx(
+        revision: u64,
+        starred: Vec<usize>,
+        flagged: Vec<usize>,
+        tagged: &[(&str, &[usize])],
+    ) -> AnalysisContext {
+        AnalysisContext {
+            annotations: Some(AnnotationMatches {
+                revision,
+                starred,
+                flagged,
+                tagged: tagged
+                    .iter()
+                    .map(|(t, rows)| (t.to_string(), rows.to_vec()))
+                    .collect(),
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn f40_stub_conditions_are_empty() {
+    fn annotation_conditions_decorate_marked_rows() {
+        let d = doc("a\n1\n2\n3\n4");
+        let actx = annotations_ctx(7, vec![0, 2], vec![3], &[("keep", &[1, 3])]);
+
+        let bm = rule("bm", HighlightCondition::Bookmarked, HighlightTarget::Row);
+        assert_eq!(rows_of(&evaluate_rule(&bm, &d, &actx).unwrap()), vec![0, 2]);
+
+        let fl = rule("fl", HighlightCondition::Flagged, HighlightTarget::Row);
+        assert_eq!(rows_of(&evaluate_rule(&fl, &d, &actx).unwrap()), vec![3]);
+
+        let tg = rule(
+            "tg",
+            HighlightCondition::Tagged { tag: "keep".into() },
+            HighlightTarget::Row,
+        );
+        assert_eq!(rows_of(&evaluate_rule(&tg, &d, &actx).unwrap()), vec![1, 3]);
+
+        // An unknown tag (and any condition with no annotation context) is empty.
+        let missing = rule(
+            "missing",
+            HighlightCondition::Tagged {
+                tag: "absent".into(),
+            },
+            HighlightTarget::Row,
+        );
+        assert!(rows_of(&evaluate_rule(&missing, &d, &actx).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn annotation_conditions_empty_without_context() {
         let d = doc("a\n1\n2");
         for cond in [
             HighlightCondition::Bookmarked,
-            HighlightCondition::Flagged { label: None },
+            HighlightCondition::Flagged,
             HighlightCondition::Tagged { tag: "t".into() },
         ] {
             let r = rule("r", cond, HighlightTarget::Row);
             assert!(rows_of(&eval(&d, &r)).is_empty());
         }
+    }
+
+    #[test]
+    fn annotation_condition_caches_and_invalidates_on_revision() {
+        let d = doc("a\n1\n2\n3");
+        let mut state = DocState::default();
+        state
+            .set_rules(vec![rule(
+                "bm",
+                HighlightCondition::Bookmarked,
+                HighlightTarget::Row,
+            )])
+            .unwrap();
+        let painted = |w: &HighlightWindow| w.cells.iter().map(|c| c.row).collect::<Vec<_>>();
+
+        // Row 0 starred at annotation revision 1.
+        let w = state
+            .window(&d, &annotations_ctx(1, vec![0], vec![], &[]), 0, 3)
+            .unwrap();
+        assert_eq!(painted(&w), vec![0]);
+
+        // A different snapshot at the SAME revision serves the warm cache — the
+        // annotation condition is cached (not recomputed) until the revision moves.
+        let w = state
+            .window(&d, &annotations_ctx(1, vec![2], vec![], &[]), 0, 3)
+            .unwrap();
+        assert_eq!(painted(&w), vec![0]);
+
+        // Bumping the annotation revision invalidates the cache → new rows win.
+        let w = state
+            .window(&d, &annotations_ctx(2, vec![2], vec![], &[]), 0, 3)
+            .unwrap();
+        assert_eq!(painted(&w), vec![2]);
     }
 
     // ----- windowed query + priority flattening --------------------------

@@ -856,6 +856,57 @@ impl AnnotationStore {
         Ok(records)
     }
 
+    /// Resolve every MATCHED row's marks in a SINGLE rematch: the absolute
+    /// record numbers that are starred, flagged, and — per tag — carry each tag.
+    /// Ambiguous / orphaned annotations never contribute (an uncertain row is
+    /// never decorated). Every record vector is ascending and de-duplicated.
+    ///
+    /// Backs F42 conditional highlighting's bookmarked / flagged / tagged
+    /// conditions without re-resolving once per predicate; the store `revision`
+    /// travels with the result so a consumer can invalidate its own cache on any
+    /// annotation edit. A pure read of `self` + `source`.
+    pub fn mark_index(
+        &self,
+        source: &dyn TabularSource,
+        ctx: Option<&JobCtx>,
+    ) -> AppResult<MarkIndex> {
+        let resolution = self.rematch(source, ctx)?;
+        let mut idx = MarkIndex {
+            revision: self.revision,
+            ..Default::default()
+        };
+        for (handle, entry) in &self.rows {
+            let Some(res) = resolution.by_handle.get(handle) else {
+                continue;
+            };
+            if res.status != MatchStatus::Matched {
+                continue;
+            }
+            let Some(record) = res.record else {
+                continue;
+            };
+            if entry.star {
+                idx.starred.push(record);
+            }
+            if entry.flag {
+                idx.flagged.push(record);
+            }
+            for tag in &entry.tags {
+                idx.tagged.entry(tag.clone()).or_default().push(record);
+            }
+        }
+        let tidy = |records: &mut Vec<u64>| {
+            records.sort_unstable();
+            records.dedup();
+        };
+        tidy(&mut idx.starred);
+        tidy(&mut idx.flagged);
+        for records in idx.tagged.values_mut() {
+            tidy(records);
+        }
+        Ok(idx)
+    }
+
     // ----- tag → column ----------------------------------------------------
 
     /// Preview copying a tag into a column: how many matched rows carry the tag,
@@ -1290,6 +1341,21 @@ pub struct RematchReport {
     pub matched: usize,
     pub ambiguous: Vec<ReviewItem>,
     pub orphaned: Vec<ReviewItem>,
+}
+
+/// A resolved snapshot of the MATCHED rows' marks, produced by one rematch:
+/// which absolute records are starred, flagged, and — per tag — carry each tag.
+/// Records are ascending and de-duplicated. See [`AnnotationStore::mark_index`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarkIndex {
+    /// The annotation-store revision this index was built at.
+    pub revision: u64,
+    /// Matched records that are starred, ascending.
+    pub starred: Vec<u64>,
+    /// Matched records that are flagged, ascending.
+    pub flagged: Vec<u64>,
+    /// Tag name → the matched records carrying it, each ascending.
+    pub tagged: BTreeMap<String, Vec<u64>>,
 }
 
 /// The annotation-state filter predicate (integrates with the row-filter view).
@@ -1837,6 +1903,82 @@ mod tests {
                 .unwrap(),
             vec![2]
         );
+    }
+
+    #[test]
+    fn mark_index_resolves_all_marks_in_one_pass() {
+        let s = source(&[("1", "Ada"), ("2", "Bob"), ("3", "Cy"), ("4", "Di")]);
+        let mut store = AnnotationStore::default();
+        // Row 0: star + tag "t". Row 1: flag. Row 2: star + flag + tags t,u.
+        store
+            .edit_row_marks(
+                &s,
+                0,
+                &RowMarkPatch {
+                    star: Some(true),
+                    add_tags: vec!["t".into()],
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .edit_row_marks(
+                &s,
+                1,
+                &RowMarkPatch {
+                    flag: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .edit_row_marks(
+                &s,
+                2,
+                &RowMarkPatch {
+                    star: Some(true),
+                    flag: Some(true),
+                    add_tags: vec!["t".into(), "u".into()],
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+
+        let idx = store.mark_index(&s, None).unwrap();
+        assert_eq!(idx.revision, store.revision());
+        assert_eq!(idx.starred, vec![0, 2]);
+        assert_eq!(idx.flagged, vec![1, 2]);
+        assert_eq!(idx.tagged.get("t").unwrap(), &vec![0, 2]);
+        assert_eq!(idx.tagged.get("u").unwrap(), &vec![2]);
+        assert!(!idx.tagged.contains_key("absent"));
+    }
+
+    #[test]
+    fn mark_index_excludes_ambiguous_and_orphaned() {
+        let mut store = AnnotationStore::default();
+        store.set_key_spec(Some(key_spec(&["c0"])));
+        let s = source(&[("1", "Ada"), ("2", "Bob")]);
+        store
+            .edit_row_marks(
+                &s,
+                1,
+                &RowMarkPatch {
+                    star: Some(true),
+                    add_tags: vec!["t".into()],
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        // Duplicate key "2" makes the anchored row ambiguous — never decorated.
+        let dup = source(&[("2", "x"), ("2", "y")]);
+        let idx = store.mark_index(&dup, None).unwrap();
+        assert!(idx.starred.is_empty());
+        // An ambiguous row contributes to no mark set, so no tag entry appears.
+        assert!(idx.tagged.is_empty());
     }
 
     #[test]
