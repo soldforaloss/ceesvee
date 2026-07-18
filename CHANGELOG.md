@@ -25,8 +25,27 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and lists/maps follow an explicit policy (preserve as JSON, explode into
   rows on editable opens, or reject the field). Equality and range filters
   on numeric/date columns of indexed parquet documents skip row groups via
-  their statistics, with identical results to a full scan. (UI, commands and
-  typed export land in the follow-up stages.)
+  their statistics, with identical results to a full scan. (UI lands in the
+  follow-up stage.)
+- **Parquet & Arrow interop — typed export & commands** (F32, backend):
+  export any scope (all rows, the filtered view, selected rows / columns /
+  range) to Apache Parquet (uncompressed, Snappy or Zstd, with a
+  configurable row-group size), an Arrow IPC file (= Feather v2) or an Arrow
+  IPC stream, as a cancellable job through the atomic-save pipeline. Typed
+  export maps each column's declared F31 logical type to the matching arrow
+  type — integers as Int64 (or UInt64 when the data needs it, so `u64::MAX`
+  round-trips losslessly), decimals as Decimal128 with an exactly unified
+  precision/scale, dates as Date32, datetimes as microsecond (or, when
+  sub-microsecond digits exist, nanosecond) timestamps with the schema's
+  time zone preserved — while null tokens and columnar NULLs export as real
+  nulls, distinct from empty strings. Cells that cannot be represented
+  export as NULL and are counted into a per-column warning report; columns
+  without a schema export as text verbatim. New commands: inspect before
+  open, open indexed (read-only), open editable (with complex-field
+  policies and the explicit memory check; the document opens unsaved so a
+  later Save can never overwrite the binary source with CSV — converting an
+  open columnar document to editable now detaches it from its file the same
+  way), scoped export, and the export report.
 - **Row bookmarks, tags & notes** (F40): mark and annotate records without
   touching the source data. Star or flag a row, apply multiple named tags
   (a per-document tag namespace with usage counts), and attach a row note or

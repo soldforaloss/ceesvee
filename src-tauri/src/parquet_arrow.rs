@@ -120,8 +120,10 @@ fn arrow_err(e: impl std::fmt::Display) -> AppError {
 // Format detection
 // ---------------------------------------------------------------------------
 
-/// The three supported columnar container formats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// The three supported columnar container formats. Deserializable so the
+/// F32 export options ([`crate::columnar_export`]) name their target with
+/// the same wire values the inspection reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ColumnarFormat {
     Parquet,
