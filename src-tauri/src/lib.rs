@@ -2,6 +2,11 @@
 //! exposed to the web front end through a small Tauri command surface.
 
 mod analyze;
+/// Public like [`job`]: the F40 annotations engine (row bookmarks, tags and
+/// notes anchored by `row_identity` handles, the rematch engine, filter
+/// predicates, tag-to-column and versioned sidecar/project-section persistence)
+/// is a stable internal API consumed by the command surface and test harness.
+pub mod annotations;
 mod append;
 mod archive;
 mod clipboard;
@@ -149,6 +154,7 @@ pub fn run() {
         .manage(crate::follow::FollowRegistry::default())
         .manage(crate::json_import::JsonImportPreviewCache::default())
         .manage(crate::project::ProjectStore::default())
+        .manage(crate::annotations::AnnotationRegistry::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -315,6 +321,25 @@ pub fn run() {
             project::project_open_apply,
             commands::preview_sample,
             commands::start_sample,
+            commands::annotations_view,
+            commands::annotations_rematch,
+            commands::annotations_set_key_spec,
+            commands::annotations_set_author,
+            commands::annotations_edit_row,
+            commands::annotations_set_row_note,
+            commands::annotations_set_cell_note,
+            commands::annotations_remove_row,
+            commands::annotations_discard_orphans,
+            commands::annotations_define_tag,
+            commands::annotations_remove_tag,
+            commands::apply_annotation_filter,
+            commands::preview_tag_to_column,
+            commands::apply_tag_to_column,
+            commands::export_annotations,
+            commands::annotations_get_export,
+            commands::annotations_load_export,
+            commands::annotations_load_sidecar,
+            commands::annotations_save_sidecar,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

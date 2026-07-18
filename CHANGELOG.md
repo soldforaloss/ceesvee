@@ -8,6 +8,23 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Row bookmarks, tags & notes** (F40): mark and annotate records without
+  touching the source data. Star or flag a row, apply multiple named tags
+  (a per-document tag namespace with usage counts), and attach a row note or
+  per-column cell notes with an optional author label and created/updated
+  timestamps. Annotations are pinned by row identity — a user-selected
+  composite key (survives reordering; duplicate keys are reported ambiguous)
+  or, otherwise, the source record number plus a content fingerprint — and are
+  re-matched on reparse or external change into a matched / ambiguous /
+  orphaned review list, so a note is never silently attached to an uncertain
+  row (a deleted row keeps its annotation as an orphan until the delete is
+  committed or reverted). Filter the grid by annotation state (starred,
+  flagged, tagged, has-note) through the existing filter view; copy a tag into
+  a real column as one previewed, undoable operation; and export the
+  annotations to JSON or CSV on an explicit action. Annotations are stored in
+  the active project's workspace file or, with no project open, a versioned
+  `<file>.ceesvee-notes.json` sidecar written atomically — never inside the
+  CSV, and never in an ordinary data export.
 - **JSON & JSON Lines interoperability** (palette → "Open JSON…" and
   "Export as JSON…"): open structured JSON without pre-converting to CSV —
   an array of objects, an array of arrays, JSON Lines / NDJSON, or an
