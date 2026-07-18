@@ -27,6 +27,7 @@ import {
   isColumnarPath,
   suggestColumnarFileName,
 } from "../lib/columnar";
+import { buildSpec, suggestTableName, type ExportForm } from "../lib/dbExport";
 import { isLegacyEncoding } from "../lib/save";
 import {
   availableOnlyChoices,
@@ -138,6 +139,11 @@ import type {
   ExcelExportOptions,
   ExcelWorkbookInfo,
   ExcelSheetExport,
+  DbSchemaInfo,
+  DbPreview,
+  DbRefreshStatus,
+  DbExportPreview,
+  DbExportResult,
 } from "../types";
 import type { GatingWarning } from "../lib/project";
 import { clampRecord, type RecordDraft } from "../lib/recordForm";
@@ -198,6 +204,7 @@ const FILE_FILTERS = [
   { name: "JSON (F33)", extensions: ["json", "jsonl", "ndjson"] },
   { name: "Columnar (F32)", extensions: ["parquet", "arrow", "feather", "ipc", "arrows"] },
   { name: "Excel (F34)", extensions: ["xlsx"] },
+  { name: "SQLite database (F35)", extensions: ["db", "sqlite", "sqlite3", "db3"] },
   { name: "Compressed (F17)", extensions: ["gz", "zip"] },
   { name: "All files", extensions: ["*"] },
 ];
@@ -222,6 +229,12 @@ const JSON_FILE_FILTERS = [
 
 /** File filter for the project open/save dialogs (F37). */
 const PROJECT_FILTERS = [{ name: "CEESVEE project", extensions: ["ceesveeproj"] }];
+
+/** File filters for the SQLite database open/export dialogs (F35). */
+const DB_FILE_FILTERS = [
+  { name: "SQLite database", extensions: ["db", "sqlite", "sqlite3", "db3"] },
+  { name: "All files", extensions: ["*"] },
+];
 
 export interface SelectionInfo {
   count: number;
@@ -399,6 +412,12 @@ function awaitJob(jobId: number): Promise<JobFinished> {
 let scrollTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingScroll: { row: number; column: number } | null = null;
 
+// F35: trailing-debounce timer + monotonic token for the database-export
+// preview. The preview is a plain invoke (not a job), so a token guards against
+// a slower earlier request clobbering a newer one's result.
+let dbPreviewTimer: ReturnType<typeof setTimeout> | null = null;
+let dbPreviewToken = 0;
+
 /**
  * Everything document-specific about the UI (F08), snapshotted and restored
  * on tab switches so nothing leaks between documents.
@@ -494,11 +513,18 @@ export interface OpenDecisionState {
   archiveToken?: number;
 }
 
-/** A running index-related job (open, convert, reload, or extract). */
+/** A running index-related job (open, convert, reload, extract, or a database
+ * table open/import — F35). */
 export interface IndexingState {
   jobId: number;
   docId: number;
-  kind: "openIndexed" | "convertEditable" | "reindex" | "archiveExtract";
+  kind:
+    | "openIndexed"
+    | "convertEditable"
+    | "reindex"
+    | "archiveExtract"
+    | "dbOpenTable"
+    | "dbImportTable";
   path: string | null;
   /** Bytes scanned (open/reindex/extract) or rows materialised (convert). */
   processed: number;
@@ -509,6 +535,8 @@ export interface IndexingState {
   /** Extraction bookkeeping (F17). */
   archiveToken?: number;
   archiveEntry?: string | null;
+  /** F35: the table/view being opened or imported (for the force-import prompt). */
+  dbObject?: string;
 }
 
 /** Fuzzy clustering state (F24), for the ACTIVE document. */
@@ -678,6 +706,52 @@ export interface ExcelImportState {
   previewProcessed: number;
   previewTotal: number | null;
   previewError: string | null;
+}
+
+/**
+ * Local database browser flow (F35). Non-null while the database dialog is
+ * open; it pins ONE read-only backend session (the `data_version` baseline is
+ * per-connection) that `closeDatabaseDialog` releases. SQLite only this cycle.
+ */
+export interface DbBrowserState {
+  sessionId: number;
+  path: string;
+  fileName: string;
+  schema: DbSchemaInfo;
+  /** The object whose preview pane is shown. */
+  selected: string | null;
+  preview: DbPreview | null;
+  previewLoading: boolean;
+  previewError: string | null;
+  /** External-change probe awaiting a reload decision (null = nothing pending). */
+  refresh: DbRefreshStatus | null;
+  /** A memory-bounded import awaiting an explicit "import anyway". */
+  forceImport: { object: string; message: string } | null;
+  /** Last open/import action error, shown inline in the dialog. */
+  actionError: string | null;
+  /** True while db_open / db_schema is in flight. */
+  busy: boolean;
+}
+
+/**
+ * Database export flow (F35). Non-null while the export dialog is open. The
+ * form drives both the (debounced) preview and the write; the write runs as a
+ * cancellable `dbExport` job whose report lands in `result`.
+ */
+export interface DbExportState {
+  docId: number;
+  docName: string;
+  form: ExportForm;
+  preview: DbExportPreview | null;
+  previewLoading: boolean;
+  previewError: string | null;
+  /** Running export job id; null when idle. */
+  jobId: number | null;
+  processed: number;
+  total: number | null;
+  /** The finished export's report; the dialog shows it and offers to close. */
+  result: DbExportResult | null;
+  error: string | null;
 }
 
 /** A running sampling/partitioning job (F48). Unlike a derive job it can emit
@@ -988,6 +1062,10 @@ interface Store {
   columnarExportResult: ColumnarExportState;
   /** Excel `.xlsx` import flow (F34); non-null while the open chooser is open. */
   excelImport: ExcelImportState | null;
+  /** Local database browser (F35); non-null while its dialog is open. */
+  dbBrowser: DbBrowserState | null;
+  /** Database export flow (F35); non-null while its dialog is open. */
+  dbExport: DbExportState | null;
   /** Running sampling/partitioning job (F48), if any. */
   sample: SampleState | null;
   /** Error from the last sampling job, for the dialog that started it. */
@@ -1464,6 +1542,43 @@ interface Store {
     options: ExcelExportOptions,
     suggestedName: string,
   ) => Promise<void>;
+
+  // local database browser (F35)
+  /** Prompt for a SQLite file and open the database browser dialog. */
+  openDatabaseDialog: () => Promise<void>;
+  /** Open the database browser for a specific SQLite file path. */
+  openDatabasePath: (path: string) => Promise<void>;
+  /** Close the browser (releases its pinned read-only session). */
+  closeDatabaseDialog: () => Promise<void>;
+  /** Show the preview pane for one table/view. */
+  selectDbObject: (object: string) => Promise<void>;
+  /** Probe whether rows/schema changed outside CEESVEE since the baseline. */
+  probeDbRefresh: () => Promise<void>;
+  /** Re-read the schema (accepting a refresh) and rebase the baseline. */
+  reloadDbSchema: () => Promise<void>;
+  /** Open a table/view as an indexed READ-ONLY document (background job). */
+  openDbTable: (object: string) => Promise<void>;
+  /** Import a table/view into an editable document (`force` overrides the
+   * memory bound). */
+  importDbTable: (object: string, force: boolean) => Promise<void>;
+  /** Dismiss the memory-bound "import anyway" prompt. */
+  dismissDbForceImport: () => void;
+
+  // database export (F35)
+  /** Open the export dialog for the active editable document. */
+  openDbExport: () => Promise<void>;
+  /** Close the export dialog (cancels an in-flight write). */
+  closeDbExport: () => void;
+  /** Merge a patch into the export form and re-run the preview (debounced). */
+  patchDbExportForm: (patch: Partial<ExportForm>) => void;
+  /** Pick the target database file (`create` = a new file via save dialog). */
+  chooseDbExportTarget: (create: boolean) => Promise<void>;
+  /** Recompute the export preview now (used internally after form/target edits). */
+  previewDbExport: () => Promise<void>;
+  /** Start the export as a cancellable job. */
+  runDbExport: () => Promise<void>;
+  /** Cancel the running export job, if any. */
+  cancelDbExport: () => Promise<void>;
 
   // data-cleaning transforms (F06)
   /**
@@ -2377,6 +2492,8 @@ export const useStore = create<Store>((set, get) => {
     columnarOpen: null,
     columnarExportResult: { running: false, report: null, error: null },
     excelImport: null,
+    dbBrowser: null,
+    dbExport: null,
     sample: null,
     sampleError: null,
     samplingInitialMode: "sampling",
@@ -2860,6 +2977,17 @@ export const useStore = create<Store>((set, get) => {
       // selection + import options), never the CSV open path.
       if (lower.endsWith(".xlsx")) {
         await get().openExcelImport(path);
+        return;
+      }
+      // F35: SQLite databases route to the database browser (schema + previews),
+      // not the CSV open path.
+      if (
+        lower.endsWith(".sqlite") ||
+        lower.endsWith(".sqlite3") ||
+        lower.endsWith(".db") ||
+        lower.endsWith(".db3")
+      ) {
+        await get().openDatabasePath(path);
         return;
       }
       set({ busy: true, error: null });
@@ -4647,7 +4775,9 @@ export const useStore = create<Store>((set, get) => {
         progress.kind === "openIndexed" ||
         progress.kind === "convertEditable" ||
         progress.kind === "reindex" ||
-        progress.kind === "archiveExtract"
+        progress.kind === "archiveExtract" ||
+        progress.kind === "dbOpenTable" ||
+        progress.kind === "dbImportTable"
       ) {
         if (get().indexing?.jobId !== progress.jobId) return;
         set((s) => ({
@@ -4754,6 +4884,14 @@ export const useStore = create<Store>((set, get) => {
             message: progress.message ?? sample.message,
           },
         });
+        return;
+      }
+
+      // F35: database export write progress (rows written).
+      if (progress.kind === "dbExport") {
+        const dbExport = get().dbExport;
+        if (dbExport?.jobId !== progress.jobId) return;
+        set({ dbExport: { ...dbExport, processed: progress.processed, total: progress.total } });
         return;
       }
 
@@ -4892,6 +5030,40 @@ export const useStore = create<Store>((set, get) => {
           // later edit merges into any existing notes instead of overwriting
           // an empty store on top of them.
           void get().hydrateAnnotationsFromSidecar(meta.id, meta.path);
+        } catch (e) {
+          set({ error: String(e) });
+        }
+        return;
+      }
+
+      // F35: a database table/view opened read-only, or imported editable.
+      // Both register a NEW document and open it in a fresh tab (no source file,
+      // so no recents / sidecar). A memory-bounded import failure offers the
+      // "import anyway" prompt back in the browser dialog.
+      if (finished.kind === "dbOpenTable" || finished.kind === "dbImportTable") {
+        const indexing = get().indexing;
+        if (indexing?.jobId !== finished.jobId) return;
+        const object = indexing.dbObject ?? "";
+        set({ indexing: null });
+        if (finished.status !== "done") {
+          if (finished.status === "failed") {
+            const message = finished.error ?? "the database open failed";
+            const browser = get().dbBrowser;
+            const memoryBound =
+              finished.kind === "dbImportTable" && /\bmemory\b/i.test(message) && object;
+            if (browser && memoryBound) {
+              set({ dbBrowser: { ...browser, forceImport: { object, message } } });
+            } else if (browser) {
+              set({ dbBrowser: { ...browser, actionError: message } });
+            } else {
+              set({ error: message });
+            }
+          }
+          return;
+        }
+        try {
+          const meta = await api.getMeta(indexing.docId);
+          set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] }));
         } catch (e) {
           set({ error: String(e) });
         }
@@ -5077,6 +5249,33 @@ export const useStore = create<Store>((set, get) => {
           if (derive.kind === "excelImport") set({ excelImport: null });
         } catch (e) {
           set({ deriveError: String(e) });
+        }
+        return;
+      }
+
+      // F35: a database export write finished. Fetch its (take-once) report and
+      // show it in the dialog; the write was fully transactional either way.
+      if (finished.kind === "dbExport") {
+        const dbExport = get().dbExport;
+        if (dbExport?.jobId !== finished.jobId) return;
+        if (finished.status === "done") {
+          const result = await api.dbExportReport(finished.jobId).catch(() => null);
+          set((s) =>
+            s.dbExport ? { dbExport: { ...s.dbExport, jobId: null, result, error: null } } : {},
+          );
+        } else {
+          set((s) =>
+            s.dbExport
+              ? {
+                  dbExport: {
+                    ...s.dbExport,
+                    jobId: null,
+                    error:
+                      finished.status === "failed" ? (finished.error ?? "the export failed") : null,
+                  },
+                }
+              : {},
+          );
         }
         return;
       }
@@ -5763,6 +5962,305 @@ export const useStore = create<Store>((set, get) => {
       const jobId = get().jsonImport?.scanJobId;
       if (jobId != null) void api.cancelJob(jobId).catch(() => undefined);
       set({ jsonImport: null });
+    },
+
+    // ----- local database browser (F35) ------------------------------------------
+
+    openDatabaseDialog: async () => {
+      const selected = await openFileDialog({ multiple: false, filters: DB_FILE_FILTERS });
+      if (typeof selected === "string") await get().openDatabasePath(selected);
+    },
+
+    openDatabasePath: async (path) => {
+      // Reopening while a browser is open? Release the previous session first.
+      const prev = get().dbBrowser;
+      if (prev) void api.dbClose(prev.sessionId).catch(() => undefined);
+      set({ dbBrowser: null });
+      try {
+        const info = await api.dbOpen(path);
+        const fileName = info.path.split(/[\\/]/).pop() ?? info.path;
+        const first = info.schema.objects[0]?.name ?? null;
+        set({
+          dbBrowser: {
+            sessionId: info.sessionId,
+            path: info.path,
+            fileName,
+            schema: info.schema,
+            selected: first,
+            preview: null,
+            previewLoading: false,
+            previewError: null,
+            refresh: null,
+            forceImport: null,
+            actionError: null,
+            busy: false,
+          },
+        });
+        if (first) void get().selectDbObject(first);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    closeDatabaseDialog: async () => {
+      const st = get().dbBrowser;
+      set({ dbBrowser: null });
+      // Releasing the session drops its pinned connection. Any table already
+      // opened as a document keeps its OWN backing/connection, so this is safe.
+      if (st) await api.dbClose(st.sessionId).catch(() => undefined);
+    },
+
+    selectDbObject: async (object) => {
+      const st = get().dbBrowser;
+      if (!st) return;
+      set({
+        dbBrowser: {
+          ...st,
+          selected: object,
+          preview: null,
+          previewLoading: true,
+          previewError: null,
+        },
+      });
+      try {
+        const preview = await api.dbPreview(st.sessionId, object);
+        // Guard against a tab-away or a newer selection while the invoke ran.
+        const cur = get().dbBrowser;
+        if (!cur || cur.sessionId !== st.sessionId || cur.selected !== object) return;
+        set({ dbBrowser: { ...cur, preview, previewLoading: false } });
+      } catch (e) {
+        const cur = get().dbBrowser;
+        if (!cur || cur.sessionId !== st.sessionId || cur.selected !== object) return;
+        set({ dbBrowser: { ...cur, previewLoading: false, previewError: String(e) } });
+      }
+    },
+
+    probeDbRefresh: async () => {
+      const st = get().dbBrowser;
+      if (!st) return;
+      try {
+        const refresh = await api.dbRefreshProbe(st.sessionId);
+        const cur = get().dbBrowser;
+        if (!cur || cur.sessionId !== st.sessionId) return;
+        // Only surface the reload banner when something actually changed.
+        const changed = refresh.rowsChanged || refresh.schemaChanged;
+        set({ dbBrowser: { ...cur, refresh: changed ? refresh : null } });
+      } catch {
+        /* a probe failure is non-fatal; the schema is still browsable */
+      }
+    },
+
+    reloadDbSchema: async () => {
+      const st = get().dbBrowser;
+      if (!st) return;
+      set({ dbBrowser: { ...st, busy: true, actionError: null } });
+      try {
+        const schema = await api.dbSchema(st.sessionId);
+        const cur = get().dbBrowser;
+        if (!cur || cur.sessionId !== st.sessionId) return;
+        // Keep the selection when it still exists; otherwise fall back to the
+        // first object.
+        const keep = cur.selected && schema.objects.some((o) => o.name === cur.selected);
+        const selected = keep ? cur.selected : (schema.objects[0]?.name ?? null);
+        set({ dbBrowser: { ...cur, schema, selected, refresh: null, busy: false } });
+        if (selected) void get().selectDbObject(selected);
+      } catch (e) {
+        const cur = get().dbBrowser;
+        if (!cur || cur.sessionId !== st.sessionId) return;
+        set({ dbBrowser: { ...cur, busy: false, actionError: String(e) } });
+      }
+    },
+
+    openDbTable: async (object) => {
+      const st = get().dbBrowser;
+      if (!st) return;
+      if (get().indexing) {
+        set({ dbBrowser: { ...st, actionError: "Another open is already in progress." } });
+        return;
+      }
+      set({ dbBrowser: { ...st, actionError: null } });
+      try {
+        const started = await api.startDbOpenTable(st.sessionId, object);
+        set({
+          indexing: {
+            jobId: started.jobId,
+            docId: started.docId,
+            kind: "dbOpenTable",
+            path: st.path,
+            processed: 0,
+            total: null,
+            dbObject: object,
+          },
+        });
+        consumeEarlyFinish(started.jobId);
+      } catch (e) {
+        const cur = get().dbBrowser;
+        if (cur) set({ dbBrowser: { ...cur, actionError: String(e) } });
+      }
+    },
+
+    importDbTable: async (object, force) => {
+      const st = get().dbBrowser;
+      if (!st) return;
+      if (get().indexing) {
+        set({ dbBrowser: { ...st, actionError: "Another open is already in progress." } });
+        return;
+      }
+      set({ dbBrowser: { ...st, actionError: null, forceImport: null } });
+      try {
+        const started = await api.startDbImportTable(st.sessionId, object, force);
+        set({
+          indexing: {
+            jobId: started.jobId,
+            docId: started.docId,
+            kind: "dbImportTable",
+            path: st.path,
+            processed: 0,
+            total: null,
+            dbObject: object,
+          },
+        });
+        consumeEarlyFinish(started.jobId);
+      } catch (e) {
+        const cur = get().dbBrowser;
+        if (cur) set({ dbBrowser: { ...cur, actionError: String(e) } });
+      }
+    },
+
+    dismissDbForceImport: () => {
+      const st = get().dbBrowser;
+      if (st) set({ dbBrowser: { ...st, forceImport: null } });
+    },
+
+    // ----- database export (F35) -------------------------------------------------
+
+    openDbExport: async () => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const form: ExportForm = {
+        path: null,
+        table: suggestTableName(meta.fileName),
+        mode: "create",
+        conflictPolicy: "abort",
+        confirmReplace: false,
+        overrides: {},
+      };
+      set({
+        dbExport: {
+          docId: meta.id,
+          docName: meta.fileName,
+          form,
+          preview: null,
+          previewLoading: false,
+          previewError: null,
+          jobId: null,
+          processed: 0,
+          total: null,
+          result: null,
+          error: null,
+        },
+      });
+      // First preview immediately (empty target = default mapping + conversion
+      // scan); a target is only required to actually run the write.
+      await get().previewDbExport();
+    },
+
+    closeDbExport: () => {
+      if (dbPreviewTimer !== null) {
+        clearTimeout(dbPreviewTimer);
+        dbPreviewTimer = null;
+      }
+      const st = get().dbExport;
+      if (st?.jobId != null) void api.cancelJob(st.jobId).catch(() => undefined);
+      set({ dbExport: null });
+    },
+
+    patchDbExportForm: (patch) => {
+      const st = get().dbExport;
+      if (!st) return;
+      // Invalidate the current preview synchronously: it was computed for the
+      // OLD form and must not stay actionable against the patched one. Bumping
+      // the token makes any preview invoke already in flight fail its staleness
+      // guard when it resolves, so an earlier response cannot repopulate a
+      // preview for the previous path/mapping. Clearing `preview` disables the
+      // Export button until a fresh preview for the new form lands (the
+      // debounced refresh below), so a user can never start an export whose
+      // blockers/failure counts were measured against a different spec.
+      dbPreviewToken++;
+      set({
+        dbExport: {
+          ...st,
+          form: { ...st.form, ...patch },
+          preview: null,
+          previewLoading: true,
+          previewError: null,
+          result: null,
+          error: null,
+        },
+      });
+      if (dbPreviewTimer !== null) clearTimeout(dbPreviewTimer);
+      dbPreviewTimer = setTimeout(() => {
+        dbPreviewTimer = null;
+        void get().previewDbExport();
+      }, 300);
+    },
+
+    chooseDbExportTarget: async (create) => {
+      const st = get().dbExport;
+      if (!st) return;
+      const chosen = create
+        ? await saveFileDialog({
+            defaultPath: `${suggestTableName(st.docName)}.sqlite`,
+            filters: DB_FILE_FILTERS,
+          })
+        : await openFileDialog({ multiple: false, filters: DB_FILE_FILTERS });
+      if (typeof chosen !== "string") return;
+      // Picking a brand-new file forces create mode (append/replace need an
+      // existing table).
+      const patch: Partial<ExportForm> = create
+        ? { path: chosen, mode: "create" }
+        : { path: chosen };
+      get().patchDbExportForm(patch);
+    },
+
+    previewDbExport: async () => {
+      const st = get().dbExport;
+      if (!st) return;
+      const token = ++dbPreviewToken;
+      set({ dbExport: { ...st, previewLoading: true, previewError: null } });
+      try {
+        const preview = await api.dbExportPreview(st.docId, buildSpec(st.form));
+        // Ignore a stale response (a newer edit superseded this one).
+        const cur = get().dbExport;
+        if (!cur || cur.docId !== st.docId || token !== dbPreviewToken) return;
+        set({ dbExport: { ...cur, preview, previewLoading: false } });
+      } catch (e) {
+        const cur = get().dbExport;
+        if (!cur || cur.docId !== st.docId || token !== dbPreviewToken) return;
+        set({
+          dbExport: { ...cur, preview: null, previewLoading: false, previewError: String(e) },
+        });
+      }
+    },
+
+    runDbExport: async () => {
+      const st = get().dbExport;
+      if (!st || st.jobId != null || !st.preview) return;
+      set({ dbExport: { ...st, error: null, result: null } });
+      try {
+        const jobId = await api.startDbExport(st.docId, st.preview.revision, buildSpec(st.form));
+        set((s) =>
+          s.dbExport ? { dbExport: { ...s.dbExport, jobId, processed: 0, total: null } } : {},
+        );
+        consumeEarlyFinish(jobId);
+      } catch (e) {
+        set((s) => (s.dbExport ? { dbExport: { ...s.dbExport, error: String(e) } } : {}));
+      }
+    },
+
+    cancelDbExport: async () => {
+      const jobId = get().dbExport?.jobId;
+      if (jobId != null) await api.cancelJob(jobId).catch(() => undefined);
     },
 
     exportJson: async (options, scope) => {

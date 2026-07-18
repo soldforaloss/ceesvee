@@ -168,9 +168,31 @@ pub struct JobCtx {
     finished: AtomicBool,
 }
 
+/// A cheap, `'static` handle onto one job's cancellation flag, for callbacks
+/// that cannot borrow the [`JobCtx`] (the F35 SQLite progress handler is
+/// installed with a `'static` closure that outlives any borrow).
+#[derive(Clone)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    /// A token that can never be cancelled (for callers without a job).
+    pub fn never() -> CancelToken {
+        CancelToken(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 impl JobCtx {
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// A `'static` view of this job's cancellation flag (see [`CancelToken`]).
+    pub fn cancel_token(&self) -> CancelToken {
+        CancelToken(Arc::clone(&self.cancel))
     }
 
     /// Fail with [`AppError::Cancelled`] if cancellation was requested.

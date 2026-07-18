@@ -89,6 +89,22 @@ function staticCommands(): AppCommand[] {
       run: () => void state().openExcelDialog(),
     },
     {
+      id: "file.openDatabase",
+      title: "Open database…",
+      keywords: ["sqlite", "db", "database", "table", "sql", "browse", "import"],
+      category: "File",
+      allowInEditable: true,
+      run: () => void state().openDatabaseDialog(),
+    },
+    {
+      id: "file.exportDatabase",
+      title: "Export to database…",
+      keywords: ["sqlite", "db", "database", "table", "sql", "write", "create", "append"],
+      category: "Export",
+      unavailableReason: needsDoc,
+      run: () => void state().openDbExport(),
+    },
+    {
       id: "file.save",
       title: "Save",
       keywords: ["write", "persist"],

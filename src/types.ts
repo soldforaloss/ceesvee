@@ -2699,3 +2699,176 @@ export interface AnnotationsExport {
   tags?: TagDef[];
   entries?: unknown[];
 }
+
+// ===========================================================================
+// Local database browser (F35) — mirrors `src-tauri/src/db_browser.rs` and
+// `src-tauri/src/db_export.rs`. SQLite databases ONLY this cycle; DuckDB is
+// deliberately out of scope (its bundled C++ library cannot build on the
+// low-memory MinGW dev machine). Every read goes through the SafeQueryEngine's
+// read-only, authorizer-guarded connections; the ONE write path is export.
+// ===========================================================================
+
+/** One column of a table/view in the schema browser. */
+export interface DbColumnInfo {
+  name: string;
+  /** Declared SQL type, verbatim (may be empty). */
+  declType: string;
+  notnull: boolean;
+  defaultValue: string | null;
+  /** 1-based position within the primary key, when part of it. */
+  pkPosition: number | null;
+}
+
+/** One index on a table (`origin`: "c" CREATE INDEX, "u" UNIQUE, "pk"). */
+export interface DbIndexInfo {
+  name: string;
+  unique: boolean;
+  origin: string;
+  partial: boolean;
+  /** Indexed column names; `null` for rowid/expression members. */
+  columns: (string | null)[];
+}
+
+/** One foreign-key constraint. */
+export interface DbForeignKey {
+  /** Referenced table. */
+  table: string;
+  /** Local column names. */
+  columns: string[];
+  /** Referenced column names (`null` = implicit primary key). */
+  refColumns: (string | null)[];
+  onUpdate: string;
+  onDelete: string;
+}
+
+/** One table or view. */
+export interface DbObjectInfo {
+  name: string;
+  /** "table" or "view". */
+  kind: "table" | "view";
+  withoutRowid: boolean;
+  columns: DbColumnInfo[];
+  /** Primary-key column names in key order (empty for views). */
+  primaryKey: string[];
+  indexes: DbIndexInfo[];
+  foreignKeys: DbForeignKey[];
+  rowEstimate: number;
+  /** Whether `rowEstimate` is exact (small objects) or an estimate. */
+  rowEstimateExact: boolean;
+}
+
+/** Everything the schema browser shows for one database. */
+export interface DbSchemaInfo {
+  objects: DbObjectInfo[];
+  /** `PRAGMA data_version` at capture time (per-connection baseline). */
+  dataVersion: number;
+  /** SHA-256 over the full `sqlite_master` definition set. */
+  schemaHash: string;
+}
+
+/** A registered browser session: the id to address it plus its schema. */
+export interface DbSessionInfo {
+  sessionId: number;
+  path: string;
+  schema: DbSchemaInfo;
+}
+
+/** A bounded preview window; cells keep SQL `NULL` distinct (`null`, not ""). */
+export interface DbPreview {
+  columns: string[];
+  rows: (string | null)[][];
+  truncated: boolean;
+}
+
+/** What changed outside CEESVEE since the baseline was captured. */
+export interface DbRefreshStatus {
+  rowsChanged: boolean;
+  schemaChanged: boolean;
+}
+
+/** The three database export modes. */
+export type DbExportMode = "create" | "append" | "replace";
+
+/** Explicit primary-key / uniqueness conflict policy for an export. */
+export type DbConflictPolicy = "abort" | "skip" | "replace";
+
+/** The five writable SQL column types (the mapping editor's closed set). */
+export type DbSqlType = "TEXT" | "INTEGER" | "REAL" | "NUMERIC" | "BOOLEAN";
+
+/**
+ * One per-column override sent with a {@link DbExportSpec}. Keyed by the STABLE
+ * column id (F12). Unlisted columns get defaults; ALL document columns export.
+ */
+export interface DbColumnMapIn {
+  columnId: string;
+  /** SQL column name (default: the document header, disambiguated). */
+  sqlName?: string | null;
+  /** SQL type (default: from the declared F31 schema, TEXT fallback). Ignored
+   * in append mode — the existing table's declared types win. */
+  sqlType?: DbSqlType | null;
+  /** Part of the new table's PRIMARY KEY (create/replace only). */
+  primaryKey?: boolean;
+}
+
+/** Everything the export dialog sends: target, mode and per-column overrides. */
+export interface DbExportSpec {
+  /** Target database file (created for `create` mode when missing). */
+  path: string;
+  table: string;
+  mode: DbExportMode;
+  mappings: DbColumnMapIn[];
+  conflictPolicy: DbConflictPolicy;
+  /** Must be `true` for `replace` mode — the API-level confirmation record. */
+  confirmReplace: boolean;
+}
+
+/** One resolved column mapping in an export preview. */
+export interface DbExportColumn {
+  columnId: string;
+  /** Document header. */
+  name: string;
+  sqlName: string;
+  sqlType: DbSqlType;
+  primaryKey: boolean;
+  /** Append mode: the existing target column's declared type (verbatim). */
+  targetDeclType: string | null;
+}
+
+/** One conversion-failure sample. `row` is the 0-based data row index. */
+export interface DbConversionFailure {
+  row: number;
+  /** SQL column name of the failing mapping. */
+  column: string;
+  /** The offending cell text, clipped. */
+  value: string;
+  reason: string;
+}
+
+/** The resolved mapping + validation + conversion-failure preview. */
+export interface DbExportPreview {
+  /** Document revision the preview was computed against; echo it on apply. */
+  revision: number;
+  tableExists: boolean;
+  /** Row estimate for the existing target table (replace confirmation UI). */
+  targetRows: number | null;
+  columns: DbExportColumn[];
+  /** Blocking problems (append incompatibilities, existing table in create
+   * mode, …). Empty = the write can proceed. */
+  blocking: string[];
+  /** Bounded conversion-failure samples. */
+  failures: DbConversionFailure[];
+  /** Exact failure count within the scanned range. */
+  failureCount: number;
+  rowsScanned: number;
+  /** Whether the scan covered the whole document. */
+  scanComplete: boolean;
+}
+
+/** What a finished export did. */
+export interface DbExportResult {
+  table: string;
+  mode: string;
+  rowsWritten: number;
+  /** Rows skipped by the "skip" conflict policy. */
+  rowsSkipped: number;
+}

@@ -15,6 +15,8 @@ import { CommandPalette } from "./components/CommandPalette";
 import { CompareDialog } from "./components/CompareDialog";
 import { CopyAsDialog } from "./components/CopyAsDialog";
 import { CrossValDialog } from "./components/CrossValDialog";
+import { DatabaseDialog } from "./components/DatabaseDialog";
+import { DbExportDialog } from "./components/DbExportDialog";
 import { PasteSpecialDialog } from "./components/PasteSpecialDialog";
 import { PiiDialog } from "./components/PiiDialog";
 import { DedupDialog } from "./components/DedupDialog";
@@ -92,6 +94,8 @@ export default function App() {
   const jsonImportPath = useStore((s) => s.jsonImport?.path ?? null);
   const columnarOpenPath = useStore((s) => s.columnarOpen?.path ?? null);
   const excelImportPath = useStore((s) => s.excelImport?.path ?? null);
+  const dbBrowserOpen = useStore((s) => s.dbBrowser != null);
+  const dbExportOpen = useStore((s) => s.dbExport != null);
   const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
   const changesOpen = useStore((s) => s.changesOpen);
   const annotationsPanelOpen = useStore((s) => s.annotationsPanelOpen);
@@ -354,6 +358,8 @@ export default function App() {
       {columnarOpenPath && <ParquetInspectDialog key={columnarOpenPath} />}
       {activeModal === "excelExport" && <ExcelExportDialog onClose={() => setModal(null)} />}
       {excelImportPath && <ExcelOpenDialog key={excelImportPath} />}
+      {dbBrowserOpen && <DatabaseDialog />}
+      {dbExportOpen && <DbExportDialog />}
       <CommandPalette />
       <CellEditorDialog />
       <NoteEditorDialog />

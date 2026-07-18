@@ -132,6 +132,13 @@ import type {
   HighlightWindow,
   CellExplanation,
   HighlightReportFormat,
+  DbSessionInfo,
+  DbSchemaInfo,
+  DbPreview,
+  DbRefreshStatus,
+  DbExportSpec,
+  DbExportPreview,
+  DbExportResult,
 } from "../types";
 
 export const openFile = (path: string, options?: OpenOptions) =>
@@ -1472,3 +1479,60 @@ export const annotationsLoadSidecar = (docId: number, sourcePath: string) =>
  * deletes the sidecar. */
 export const annotationsSaveSidecar = (docId: number, sourcePath: string) =>
   invoke<void>("annotations_save_sidecar", { docId, sourcePath });
+
+// ----- local database browser (F35) -----------------------------------------
+// SQLite databases ONLY this cycle (DuckDB is out of scope — its bundled C++
+// library cannot build on the low-memory MinGW dev machine). Picking a file in
+// the OS dialog IS the user's approval: `dbOpen` (and a successful `startDbExport`)
+// join the path to the SafeQueryEngine's approved-source registry, and nothing
+// else is readable. Every read goes through a read-only, authorizer-guarded
+// connection; export is the one deliberate write path.
+
+/** Open a SQLite database file for browsing (schema + previews). Registers a
+ * pinned read-only session and approves the path. */
+export const dbOpen = (path: string) => invoke<DbSessionInfo>("db_open", { path });
+
+/** Close a browser session (drops its pinned connection). */
+export const dbClose = (sessionId: number) => invoke<void>("db_close", { sessionId });
+
+/** Re-read the full schema (after accepting a refresh prompt); rebases the
+ * session's external-change baseline. */
+export const dbSchema = (sessionId: number) => invoke<DbSchemaInfo>("db_schema", { sessionId });
+
+/** Bounded preview rows for one table or view (NULL kept distinct as `null`). */
+export const dbPreview = (sessionId: number, object: string, limit?: number) =>
+  invoke<DbPreview>("db_preview", { sessionId, object, limit: limit ?? null });
+
+/** Cheap change probe for a browser session: did rows or schema change outside
+ * CEESVEE since the baseline? */
+export const dbRefreshProbe = (sessionId: number) =>
+  invoke<DbRefreshStatus>("db_refresh_probe", { sessionId });
+
+/** Open a table/view as an indexed READ-ONLY document (cancellable job; the
+ * table is never materialised). */
+export const startDbOpenTable = (sessionId: number, object: string) =>
+  invoke<IndexedOpenStart>("start_db_open_table", { sessionId, object });
+
+/** Import a table/view into a fully editable document (cancellable job, bounded
+ * by a memory check; `force` imports anyway). */
+export const startDbImportTable = (sessionId: number, object: string, force: boolean) =>
+  invoke<IndexedOpenStart>("start_db_import_table", { sessionId, object, force });
+
+/** Change probe for an open database-backed DOCUMENT (not a browser session). */
+export const dbDocRefreshProbe = (docId: number) =>
+  invoke<DbRefreshStatus>("db_doc_refresh_probe", { docId });
+
+/** Mapping + conversion-failure preview for exporting a document into SQLite.
+ * Picking the target file is the user's approval (like {@link dbOpen}). */
+export const dbExportPreview = (docId: number, spec: DbExportSpec) =>
+  invoke<DbExportPreview>("db_export_preview", { docId, spec });
+
+/** Start the export as a cancellable background job (kind `dbExport`). Guarded
+ * by `expectedRevision` (echoed from the preview). Resolves with the job id;
+ * fetch the outcome with {@link dbExportReport} after `job-finished`. */
+export const startDbExport = (docId: number, expectedRevision: number, spec: DbExportSpec) =>
+  invoke<number>("start_db_export", { docId, expectedRevision, spec });
+
+/** Fetch (and consume) the report of a finished export job. */
+export const dbExportReport = (jobId: number) =>
+  invoke<DbExportResult>("db_export_report", { jobId });
