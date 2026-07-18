@@ -40,6 +40,8 @@ import { Close } from "./components/Icons";
 import { JoinDialog } from "./components/JoinDialog";
 import { JsonExportDialog } from "./components/JsonExportDialog";
 import { JsonImportDialog } from "./components/JsonImportDialog";
+import { ColumnarExportDialog } from "./components/ColumnarExportDialog";
+import { ParquetInspectDialog } from "./components/ParquetInspectDialog";
 import { ProfilesDialog } from "./components/ProfilesDialog";
 import { ProfileSuggestionBar } from "./components/ProfileSuggestionBar";
 import { OpenModeDialog } from "./components/OpenModeDialog";
@@ -86,6 +88,7 @@ export default function App() {
   const activeModal = useStore((s) => s.activeModal);
   const setModal = useStore((s) => s.setModal);
   const jsonImportPath = useStore((s) => s.jsonImport?.path ?? null);
+  const columnarOpenPath = useStore((s) => s.columnarOpen?.path ?? null);
   const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
   const changesOpen = useStore((s) => s.changesOpen);
   const annotationsPanelOpen = useStore((s) => s.annotationsPanelOpen);
@@ -343,7 +346,9 @@ export default function App() {
       {activeModal === "highlight" && <HighlightRulesDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
       {activeModal === "jsonExport" && <JsonExportDialog onClose={() => setModal(null)} />}
+      {activeModal === "columnarExport" && <ColumnarExportDialog onClose={() => setModal(null)} />}
       {jsonImportPath && <JsonImportDialog key={jsonImportPath} />}
+      {columnarOpenPath && <ParquetInspectDialog key={columnarOpenPath} />}
       <CommandPalette />
       <CellEditorDialog />
       <NoteEditorDialog />

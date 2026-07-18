@@ -49,6 +49,15 @@ and faithful on large, real-world delimited files.**
   detects the shape, infers columns, counts missing vs explicit-null cells,
   and lets you flatten, preserve, join, or explode nested objects and
   arrays. JSON Lines opens read-only with bounded memory.
+- **Open Parquet / Arrow** — inspect an Apache Parquet, Arrow IPC file
+  (Feather v2), or Arrow IPC stream before opening: format, row and
+  row-group/batch counts, compression codec, the schema mapped to logical
+  types (with nested fields and timezones), and the editable-memory
+  estimate. Open read-only (indexed, bounded memory) or convert to editable;
+  nested list/map/struct fields take a per-field policy (keep as JSON,
+  explode into rows, or drop). Signed/unsigned 64-bit integers, exact
+  decimal precision/scale, timestamps with timezone, and null-vs-empty-string
+  all survive intact.
 - Auto-detect the **delimiter** (comma, tab, semicolon, pipe) with a manual /
   custom override — plus an **advanced import** for preambles, comment
   lines, custom quoting/escaping, multi-row headers, and footers.
@@ -106,6 +115,12 @@ and faithful on large, real-world delimited files.**
   array of arrays, or JSON Lines; typed columns emit real numbers and
   booleans, nested objects rebuild from dotted-path columns, and duplicate
   output paths are rejected before writing.
+- **Export as Parquet / Arrow** — write any export scope to Apache Parquet
+  (uncompressed, Snappy, or Zstd, with a configurable row-group size), an
+  Arrow IPC file (Feather v2), or an Arrow IPC stream. Typed export maps each
+  column's declared logical type to the matching arrow type (preserving 64-bit
+  integer widths, decimal precision/scale, and timestamp timezones); cells
+  that can't be represented are written as NULL and reported per column.
 
 **Reliability**
 

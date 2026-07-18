@@ -46,6 +46,20 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   later Save can never overwrite the binary source with CSV — converting an
   open columnar document to editable now detaches it from its file the same
   way), scoped export, and the export report.
+- **Parquet & Arrow interop — UI** (F32, frontend): opening a `.parquet` /
+  `.arrow` / `.feather` / `.ipc` file (drag-and-drop, "Open file…", or the
+  new "Open Parquet/Arrow…" command) shows an inspect dialog — container
+  format (noting Feather v2 = Arrow IPC file), row and row-group/batch
+  counts, compression codec, the schema mapped to F31 logical types with
+  nested fields indented and timezones shown, and the editable-memory
+  estimate — then lets you open read-only (indexed, bounded memory) or
+  convert to editable behind a memory warning. Complex list/map/struct
+  fields get a per-field policy picker (keep as JSON, explode into rows, or
+  drop); exploding forces an editable open and is limited to one field. A
+  new "Export as Parquet/Arrow…" dialog adds a format + Parquet
+  compression/row-group-size + typed-vs-verbatim choice to the scoped export
+  flow and, on completion, surfaces the per-column count of cells that
+  couldn't be represented under the declared types and were written as NULL.
 - **Row bookmarks, tags & notes** (F40): mark and annotate records without
   touching the source data. Star or flag a row, apply multiple named tags
   (a per-document tag namespace with usage counts), and attach a row note or

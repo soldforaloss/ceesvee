@@ -55,6 +55,10 @@ import type {
   JsonExportOptions,
   JsonImportOptions,
   JsonImportPreview,
+  ColumnarInspection,
+  ColumnarOpenOptions,
+  ColumnarExportOptions,
+  ColumnarExportReport,
   FileFingerprint,
   FileProfile,
   FilterGroup,
@@ -1153,6 +1157,58 @@ export const jsonExport = (
   scope: ExportScope,
   expectedRevision: number,
 ) => invoke<number>("json_export", { docId, path, options, scope, expectedRevision });
+
+// ----- Parquet / Arrow interop (F32) ---------------------------------------
+
+/**
+ * Inspect a Parquet / Arrow IPC file BEFORE any open: container format, row
+ * and row-group/batch counts, columns mapped to the F31 logical types,
+ * compression codecs, nested (complex) fields, and the editable-memory
+ * estimate with its decision flag. Reads metadata only; opens nothing.
+ */
+export const columnarInspect = (path: string) =>
+  invoke<ColumnarInspection>("columnar_inspect", { path });
+
+/**
+ * Open a Parquet / Arrow file as an indexed READ-ONLY document (windowed
+ * columnar reads behind the same grid/filter/export machinery as an F10
+ * indexed CSV). Runs under the "openIndexed" job kind, so the existing
+ * completion path adds the tab; the document registers under the returned
+ * docId when the job finishes. Explode policies are rejected here.
+ */
+export const columnarOpenIndexed = (path: string, options?: ColumnarOpenOptions) =>
+  invoke<IndexedOpenStart>("columnar_open_indexed", { path, options });
+
+/**
+ * Open a Parquet / Arrow file straight into a fully editable in-memory
+ * document, honouring every complex-field policy including exploding one list
+ * column into rows. Re-runs the memory estimate first; pass `force` after an
+ * explicit user decision. Opens UNSAVED with no path (Save must not overwrite
+ * the binary source with CSV bytes).
+ */
+export const columnarOpenEditable = (path: string, options: ColumnarOpenOptions, force: boolean) =>
+  invoke<IndexedOpenStart>("columnar_open_editable", { path, options, force });
+
+/**
+ * Start a scoped, typed export to Parquet (uncompressed/Snappy/Zstd) or Arrow
+ * IPC file/stream as a cancellable "export" job. The scope resolves and the
+ * revision is checked BEFORE the job spawns (the invoke rejects); everything
+ * streams through the atomic-save pipeline, so failure/cancel removes the
+ * staging file and never touches an existing destination. Fetch the outcome
+ * with {@link getColumnarExportReport} after the `job-finished` event.
+ */
+export const columnarExport = (
+  docId: number,
+  path: string,
+  options: ColumnarExportOptions,
+  scope: ExportScope,
+  expectedRevision: number,
+) => invoke<number>("columnar_export", { docId, path, options, scope, expectedRevision });
+
+/** The report of a finished columnar export (rows, bytes, per-column
+ * invalid-cell counts), by its job id. */
+export const getColumnarExportReport = (jobId: number) =>
+  invoke<ColumnarExportReport | null>("get_columnar_export_report", { jobId });
 
 // ----- project workspaces (F37) ---------------------------------------------
 // The ProjectStore is THE persistence boundary: typed, versioned sections are
