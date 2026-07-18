@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import type {
   DocumentMeta,
@@ -22,11 +22,14 @@ import {
   gatingWarnings,
   hasBlockingSources,
   mintSourceId,
+  nextProjectOpenStep,
   orderTabsForPlan,
   panelsFromLayout,
   pathKey,
+  projectDirty,
   projectSnapshot,
   projectSnapshotsEqual,
+  setCaseSensitivePaths,
   statusDisplay,
   type PanelLayout,
   type SourceViewsSection,
@@ -92,10 +95,23 @@ function entry(
 const layout: PanelLayout = { diagnostics: false, explorer: false, changes: false };
 
 describe("pathKey", () => {
+  // The test runner defaults to case-insensitive (no "linux" UA); each
+  // sensitivity test restores that default so ordering never leaks.
+  afterEach(() => setCaseSensitivePaths(false));
+
   it("normalises separators and case for identity comparison", () => {
     expect(pathKey("C:\\data\\A.csv")).toBe(pathKey("c:/data/a.csv"));
     expect(pathKey("C:/data/a.csv/")).toBe("c:/data/a.csv");
     expect(pathKey("C:\\data\\a.csv")).not.toBe(pathKey("C:\\data\\b.csv"));
+  });
+
+  it("keeps case on a case-sensitive filesystem (Linux): A.csv ≠ a.csv", () => {
+    setCaseSensitivePaths(true);
+    // Separators and trailing slashes still normalise, but case is preserved so
+    // genuinely distinct files are never collapsed to one source id.
+    expect(pathKey("/data/A.csv")).toBe("/data/A.csv");
+    expect(pathKey("/data/A.csv")).not.toBe(pathKey("/data/a.csv"));
+    expect(pathKey("/data\\sub/")).toBe("/data/sub");
   });
 });
 
@@ -351,6 +367,41 @@ describe("buildViewsSection", () => {
     ).toEqual([]);
   });
 
+  it("preserves project-owned views for an OPEN source when no profile carries them", () => {
+    // Opening a project reapplies its views without importing them into a file
+    // profile, so `viewsForTab` is empty even though the source is open. The
+    // first save must keep the project's own saved views (and active view)
+    // instead of overwriting them with an empty list.
+    const tabs = [meta({ id: 1, path: "C:\\data\\a.csv" })];
+    const existing: SourceViewsSection[] = [
+      { sourceId: "src-1", views: [nv("v1"), nv("v2")], activeViewId: "v1" },
+    ];
+    const section = buildViewsSection(
+      sources,
+      tabs,
+      existing,
+      () => [], // no matching profile → no live views
+      (tab) => (tab.id === 1 ? "v1" : null),
+    );
+    expect(section).toEqual([
+      { sourceId: "src-1", views: [nv("v1"), nv("v2")], activeViewId: "v1" },
+    ]);
+  });
+
+  it("never emits an active view id that no saved view backs", () => {
+    // Empty live views + a dangling active id must NOT yield {views:[], active:id}.
+    const tabs = [meta({ id: 1, path: "C:\\data\\a.csv" })];
+    expect(
+      buildViewsSection(
+        sources,
+        tabs,
+        [],
+        () => [],
+        () => "ghost",
+      ),
+    ).toEqual([]);
+  });
+
   it("drops preserved views for a source the project no longer references", () => {
     const existing: SourceViewsSection[] = [
       { sourceId: "gone", views: [nv("x")], activeViewId: "x" },
@@ -451,6 +502,27 @@ describe("projectSnapshot + deriveProjectDirty", () => {
   });
 });
 
+describe("projectDirty", () => {
+  const tabs = [meta({ id: 1, path: "C:\\data\\1.csv" })];
+
+  it("is dirty when the backend already holds unsaved changes, even if the snapshot matches", () => {
+    // A relink/removal applied during open leaves the backend dirty while the
+    // snapshot equals its just-captured baseline — must still report dirty.
+    const base = projectSnapshot(tabs, 1, layout);
+    const clean = projectSnapshot(tabs, 1, layout);
+    expect(deriveProjectDirty(base, clean)).toBe(false);
+    expect(projectDirty(true, base, clean)).toBe(true);
+  });
+
+  it("falls back to snapshot drift when the backend is clean", () => {
+    const base = projectSnapshot(tabs, 1, layout);
+    expect(projectDirty(false, base, projectSnapshot(tabs, 1, layout))).toBe(false);
+    expect(projectDirty(false, base, projectSnapshot(tabs, 1, { ...layout, explorer: true }))).toBe(
+      true,
+    );
+  });
+});
+
 describe("orderTabsForPlan", () => {
   it("orders tabs to match the plan, appending extras", () => {
     const tabs = [
@@ -476,3 +548,28 @@ function planEntry2(path: string): PlanEntry {
     activeViewId: null,
   };
 }
+
+describe("nextProjectOpenStep", () => {
+  it("waits while a source is still deferred (never overwrites the pending decision)", () => {
+    expect(nextProjectOpenStep(["a", "b"], true)).toEqual({ kind: "wait" });
+    // Even with an empty queue, a deferral in flight must not finalize early.
+    expect(nextProjectOpenStep([], true)).toEqual({ kind: "wait" });
+  });
+
+  it("opens the next source and returns the shrunken queue when nothing is deferred", () => {
+    expect(nextProjectOpenStep(["a", "b", "c"], false)).toEqual({
+      kind: "open",
+      path: "a",
+      remaining: ["b", "c"],
+    });
+    expect(nextProjectOpenStep(["only"], false)).toEqual({
+      kind: "open",
+      path: "only",
+      remaining: [],
+    });
+  });
+
+  it("finalizes only once the queue has drained and nothing is deferred", () => {
+    expect(nextProjectOpenStep([], false)).toEqual({ kind: "finalize" });
+  });
+});

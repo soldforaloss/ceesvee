@@ -1747,3 +1747,14 @@ export interface ProjectOpenPlan {
   removedSourceIds: string[];
   skippedSourceIds: string[];
 }
+
+/**
+ * An in-progress project open, driven one source at a time (F37). A source that
+ * routes through a deferred flow (large-file decision, archive extraction, JSON
+ * import) pauses the queue; `remaining` holds the source paths not yet opened so
+ * the open resumes — and only then finalizes the baseline — once it settles.
+ */
+export interface ProjectOpenPending {
+  plan: ProjectOpenPlan;
+  remaining: string[];
+}

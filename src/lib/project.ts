@@ -45,15 +45,41 @@ export interface ProjectSnapshot {
 }
 
 /**
- * Normalize a filesystem path for identity comparison. Windows paths compare
- * case-insensitively and treat `\` and `/` alike; trailing separators are
- * dropped. Used to match open documents against saved sources.
+ * Whether the host filesystem compares paths case-INSENSITIVELY. Windows and
+ * the default macOS volume do; Linux — which the app also ships for — does not,
+ * where `/data/A.csv` and `/data/a.csv` are genuinely different files. Detected
+ * once from the webview's platform (see `detectCaseSensitivePaths`), overridable
+ * via `setCaseSensitivePaths` for an explicit startup probe or from tests.
+ */
+let caseSensitivePaths = detectCaseSensitivePaths();
+
+function detectCaseSensitivePaths(): boolean {
+  // WebKitGTK / WebView2 / WKWebView all name the OS in the UA string; only
+  // Linux is case-sensitive. Anything without a recognizable UA (the Node test
+  // runner) defaults to case-insensitive, preserving the historical behavior.
+  const ua = typeof navigator !== "undefined" ? (navigator.userAgent ?? "") : "";
+  return /linux/i.test(ua);
+}
+
+/**
+ * Override the detected filesystem case sensitivity. `true` compares paths
+ * exactly (case-sensitive filesystems, e.g. Linux); `false` folds case
+ * (Windows / macOS). Exposed for an authoritative startup probe and for tests.
+ */
+export function setCaseSensitivePaths(sensitive: boolean): void {
+  caseSensitivePaths = sensitive;
+}
+
+/**
+ * Normalize a filesystem path for identity comparison: `\` and `/` are treated
+ * alike and trailing separators dropped. Case is folded ONLY on case-insensitive
+ * filesystems — lowercasing everywhere would collapse distinct files on Linux
+ * (`A.csv` vs `a.csv`), corrupting source ids, tab order and per-file view state.
+ * Used to match open documents against saved sources.
  */
 export function pathKey(path: string): string {
-  return path
-    .replace(/[\\/]+/g, "/")
-    .replace(/\/+$/, "")
-    .toLowerCase();
+  const normalized = path.replace(/[\\/]+/g, "/").replace(/\/+$/, "");
+  return caseSensitivePaths ? normalized : normalized.toLowerCase();
 }
 
 /**
@@ -114,6 +140,23 @@ export function deriveProjectDirty(
 ): boolean {
   if (!baseline) return false;
   return !projectSnapshotsEqual(baseline, current);
+}
+
+/**
+ * Whether the open project has unsaved changes, combining BOTH sources of truth.
+ * The backend owns its own dirty flag: applying a relink or removal while opening
+ * a project (`project_open_apply` with a `Locate`/`Remove` resolution) mutates
+ * the persisted content, so `plan.meta.dirty` is already true before the user
+ * touches anything. The snapshot comparison cannot see that — the baseline is
+ * captured immediately after opening — so it must be OR-ed with the backend flag,
+ * otherwise a relink/removal is treated as clean and silently lost on close/quit.
+ */
+export function projectDirty(
+  backendDirty: boolean,
+  baseline: ProjectSnapshot | null,
+  current: ProjectSnapshot,
+): boolean {
+  return backendDirty || deriveProjectDirty(baseline, current);
 }
 
 // ----- open-dialog status mapping ---------------------------------------------
@@ -418,12 +461,27 @@ export function buildViewsSection(
   for (const src of sources) {
     const tab = tabByPath.get(pathKey(src.path));
     if (!tab) continue;
-    const views = viewsForTab(tab);
-    const activeViewId = activeViewForTab(tab);
+    seen.add(src.id);
+    const prior = existing.find((e) => e.sourceId === src.id);
+    // Prefer the live profile's views, but never DROP the project's own saved
+    // views: opening a project reapplies its views without importing them into a
+    // matching file profile, so `viewsForTab` is empty for a project-owned
+    // source when the user has no global profile carrying them. Falling back to
+    // the prior saved section keeps those definitions instead of overwriting
+    // them with an empty list on the first save.
+    const liveViews = viewsForTab(tab);
+    const views = liveViews.length > 0 ? liveViews : (prior?.views ?? []);
+    // Keep an active view id only when it actually names one of the saved views
+    // (prefer the live selection, else the project's prior one), so a captured
+    // section can never carry an `activeViewId` that points at nothing.
+    const candidateActive = activeViewForTab(tab) ?? prior?.activeViewId ?? null;
+    const activeViewId =
+      candidateActive != null && views.some((v) => v.id === candidateActive)
+        ? candidateActive
+        : null;
     if (views.length > 0 || activeViewId != null) {
       out.push({ sourceId: src.id, views, activeViewId });
     }
-    seen.add(src.id);
   }
   // Preserve saved views for still-referenced sources that aren't open.
   const referenced = new Set(sources.map((s) => s.id));
@@ -467,4 +525,29 @@ export function orderTabsForPlan(
     if (!taken.has(t.id)) ordered.push(t.id);
   }
   return ordered;
+}
+
+// ----- queued project open ----------------------------------------------------
+
+/** The next move for a queued project open (see `nextProjectOpenStep`). */
+export type ProjectOpenStep =
+  | { kind: "open"; path: string; remaining: string[] }
+  | { kind: "wait" }
+  | { kind: "finalize" };
+
+/**
+ * Decide the next move when driving a project open one source at a time. While a
+ * source is still resolving through a DEFERRED flow — the large-file editable/
+ * indexed decision, archive extraction, or the JSON import dialog — the queue
+ * must WAIT: issuing the next open would overwrite the single pending decision,
+ * and finalizing now would capture a baseline that omits the not-yet-opened tab
+ * (immediately dirtying the just-opened project and skipping its saved view).
+ * Only once nothing is deferred does it open the next source, or finalize when
+ * the queue has drained.
+ */
+export function nextProjectOpenStep(remaining: string[], deferred: boolean): ProjectOpenStep {
+  if (deferred) return { kind: "wait" };
+  if (remaining.length === 0) return { kind: "finalize" };
+  const [path, ...rest] = remaining;
+  return { kind: "open", path, remaining: rest };
 }

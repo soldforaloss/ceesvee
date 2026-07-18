@@ -106,7 +106,16 @@ export default function App() {
         unProgress = fn;
       })
       .catch(() => undefined);
-    void onJobFinished((f) => void useStore.getState().handleJobFinished(f))
+    void onJobFinished(
+      (f) =>
+        // After the job settles (it may add a tab), resume a queued project open
+        // (F37) that paused on this deferred source; `advanceProjectOpen` is a
+        // no-op unless an open is pending and nothing is still deferred.
+        void useStore
+          .getState()
+          .handleJobFinished(f)
+          .finally(() => useStore.getState().advanceProjectOpen()),
+    )
       .then((fn) => {
         unFinished = fn;
       })
