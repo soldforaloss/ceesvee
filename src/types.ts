@@ -426,11 +426,28 @@ export interface PiiFinding {
   samples: string[];
 }
 
+/**
+ * A column the data dictionary (F38) declares confidential or restricted,
+ * folded into the PII scan preflight even without a pattern hit.
+ */
+export interface SensitivityFlag {
+  column: number;
+  columnId: string;
+  displayName?: string;
+  /** "confidential" or "restricted". */
+  sensitivity: string;
+  /** Whether a detector also matched this column in the same scan. */
+  hasPatternHit: boolean;
+}
+
 export interface PiiReport {
   revision: number;
   scannedRows: number;
   totalMatches: number;
   findings: PiiFinding[];
+  /** F38: dictionary-declared confidential/restricted columns, flagged
+   * regardless of pattern hits so the preflight cannot miss them. */
+  sensitivityFlags: SensitivityFlag[];
 }
 
 /** Redaction actions (F28) — previewed, one undo step each. */
@@ -1746,4 +1763,168 @@ export interface ProjectOpenPlan {
   activeTab: string | null;
   removedSourceIds: string[];
   skippedSourceIds: string[];
+}
+
+// ----- data dictionary (F38) ------------------------------------------------
+
+/** The analytical role a column plays (mirrors the Rust `FieldRole`). */
+export type FieldRole = "identifier" | "dimension" | "measure" | "timestamp" | "label";
+
+/**
+ * Data-sensitivity classification, ordered least → most sensitive. Confidential
+ * and restricted columns feed the F28 PII preflight (mirrors `Sensitivity`).
+ */
+export type Sensitivity = "public" | "internal" | "confidential" | "restricted";
+
+/**
+ * One column's documentation (F38). Every descriptive field is optional; the
+ * entry is keyed by the STABLE column ID (F12), never by position or header, so
+ * it survives renames and reorders. Optional fields are omitted by the backend
+ * when unset; `allowedValues` is omitted when empty.
+ */
+export interface DictionaryField {
+  columnId: string;
+  /** Human-friendly name (the technical header stays the source of truth). */
+  displayName?: string;
+  description?: string;
+  role?: FieldRole;
+  /** Unit of measure ("USD", "ms", "kg"). */
+  unit?: string;
+  /** Where the values originate (system of record, upstream table). */
+  source?: string;
+  sensitivity?: Sensitivity;
+  /** Enumerated permitted values, when the column is categorical. */
+  allowedValues?: string[];
+  example?: string;
+  /** Data owner / steward. */
+  owner?: string;
+  notes?: string;
+}
+
+/**
+ * Every documentable field, as a closed set: the merge/conflict key and the
+ * F08 required-documentation profile-rule key (mirrors `DictionaryFieldKey`).
+ */
+export type DictionaryFieldKey =
+  | "displayName"
+  | "description"
+  | "role"
+  | "unit"
+  | "source"
+  | "sensitivity"
+  | "allowedValues"
+  | "example"
+  | "owner"
+  | "notes";
+
+/**
+ * One column in the dictionary editor (F38): technical name + inferred F31 type
+ * prefilled, the stored entry when documented (an empty prefill otherwise).
+ */
+export interface DictionaryEntryView {
+  columnId: string;
+  /** Current header — the technical name shown/prefilled in the editor. */
+  columnName: string;
+  columnIndex: number;
+  /** Declared/inferred logical type from F31, when a schema entry exists. */
+  logicalType?: LogicalType;
+  field: DictionaryField;
+  /** Whether the user has actually documented this column. */
+  documented: boolean;
+}
+
+/**
+ * A documented entry whose column no longer exists (F38): reported after a
+ * delete, kept until explicitly discarded, re-attached if the column returns.
+ */
+export interface OrphanEntry {
+  columnId: string;
+  /** Best-effort label (display name, else the column ID). */
+  label: string;
+  field: DictionaryField;
+}
+
+/**
+ * The full dictionary surface for the front end (F38). `dictionaryRevision` is
+ * the metadata revision (moves on documentation edits only) used to guard
+ * edits; `revision` is the ordinary document revision, which those edits never
+ * move (documentation is metadata and never dirties the source).
+ */
+export interface DictionaryView {
+  dictionaryRevision: number;
+  revision: number;
+  entries: DictionaryEntryView[];
+  orphans: OrphanEntry[];
+}
+
+/** The three documentation export formats (F38). */
+export type DictionaryFormat = "json" | "markdown" | "csv";
+
+/** How imported entries are matched to current columns (F38). */
+export type MergeMatchBy = "columnId" | "columnName" | "auto";
+
+/**
+ * A single field-level disagreement between an existing entry and an incoming
+ * one, requiring explicit resolution before the import can replace it (F38).
+ */
+export interface FieldConflict {
+  columnId: string;
+  /** Current technical name, for display. */
+  columnName: string;
+  field: DictionaryFieldKey;
+  /** Existing value (display form). */
+  existing: string;
+  /** Incoming value (display form). */
+  incoming: string;
+}
+
+/**
+ * The plan a `preview_dictionary_import` produces (F38): what a merge would do
+ * and which conflicts block it. Computed against `dictionaryRevision`, echoed
+ * back on apply and rejected if it has since moved.
+ */
+export interface MergePlan {
+  dictionaryRevision: number;
+  matchBy: MergeMatchBy;
+  /** Number of imported entries matched to a current column. */
+  matchedColumns: number;
+  /** Column IDs that would gain a brand-new entry. */
+  newEntries: string[];
+  /** Field additions that apply with no conflict (existing value was blank). */
+  cleanAdditions: number;
+  /** Disagreements needing explicit resolution. */
+  conflicts: FieldConflict[];
+  /** Imported entries (by name/ID label) that matched no current column. */
+  unmatched: string[];
+}
+
+/** Which side of a conflict wins (F38). */
+export type ConflictChoice = "keepExisting" | "takeIncoming";
+
+/** One explicit per-field resolution (F38). */
+export interface FieldResolution {
+  columnId: string;
+  field: DictionaryFieldKey;
+  choice: ConflictChoice;
+}
+
+/**
+ * How the import resolves conflicts (F38). `perField` MUST cover every reported
+ * conflict; a missing one fails the apply (conflicts are never silently
+ * dropped). Mirrors the Rust `MergeResolution` internally-tagged enum.
+ */
+export type MergeResolution =
+  | { type: "keepAllExisting" }
+  | { type: "takeAllIncoming" }
+  | { type: "perField"; resolutions: FieldResolution[] };
+
+/** The outcome returned after applying a dictionary import (F38). */
+export interface DictionaryImportOutcome {
+  matchedColumns: number;
+  newEntries: number;
+  updatedEntries: number;
+  fieldsAdded: number;
+  conflictsResolved: number;
+  unmatched: string[];
+  view: DictionaryView;
 }
