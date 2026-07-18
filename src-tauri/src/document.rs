@@ -703,6 +703,7 @@ impl Document {
             backing: Backing::Columnar(handle),
             archive: None,
             archive_guard: None,
+            display_name: None,
         }
     }
 
