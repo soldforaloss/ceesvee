@@ -8,58 +8,40 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Parquet & Arrow interop — read engine** (F32, backend): open typed
-  columnar datasets — Apache Parquet, Arrow IPC files (Feather v2 is the
-  Arrow IPC file format) and Arrow IPC streams — preserving types and nulls.
-  Inspection reports row count, columns mapped to the F31 logical types,
-  row-group/batch count, compression codecs, nested fields and an
-  editable-memory estimate before anything is opened. Large files open
-  through an indexed read-only columnar backing (windowed reads over row
-  groups / record batches with a bounded decoded-block cache) so the grid,
-  filters and export work unchanged; convert-to-editable runs behind an
-  explicit memory check and preserves the null-vs-empty-string distinction
-  by assigning collision-free per-column null tokens. Signed/unsigned 64-bit
-  integers, exact decimal precision+scale, floats, booleans, dates and
-  timestamps (with time-zone metadata mapped onto the column schema) all
-  round-trip as canonical text; structs flatten to stable path-based names,
-  and lists/maps follow an explicit policy (preserve as JSON, explode into
-  rows on editable opens, or reject the field). Equality and range filters
-  on numeric/date columns of indexed parquet documents skip row groups via
-  their statistics, with identical results to a full scan. (UI lands in the
-  follow-up stage.)
-- **Parquet & Arrow interop — typed export & commands** (F32, backend):
-  export any scope (all rows, the filtered view, selected rows / columns /
-  range) to Apache Parquet (uncompressed, Snappy or Zstd, with a
-  configurable row-group size), an Arrow IPC file (= Feather v2) or an Arrow
-  IPC stream, as a cancellable job through the atomic-save pipeline. Typed
-  export maps each column's declared F31 logical type to the matching arrow
-  type — integers as Int64 (or UInt64 when the data needs it, so `u64::MAX`
-  round-trips losslessly), decimals as Decimal128 with an exactly unified
-  precision/scale, dates as Date32, datetimes as microsecond (or, when
-  sub-microsecond digits exist, nanosecond) timestamps with the schema's
-  time zone preserved — while null tokens and columnar NULLs export as real
-  nulls, distinct from empty strings. Cells that cannot be represented
-  export as NULL and are counted into a per-column warning report; columns
-  without a schema export as text verbatim. New commands: inspect before
-  open, open indexed (read-only), open editable (with complex-field
-  policies and the explicit memory check; the document opens unsaved so a
-  later Save can never overwrite the binary source with CSV — converting an
-  open columnar document to editable now detaches it from its file the same
-  way), scoped export, and the export report.
-- **Parquet & Arrow interop — UI** (F32, frontend): opening a `.parquet` /
+- **Parquet & Arrow interoperability** (palette → "Open Parquet/Arrow…" and
+  "Export as Parquet/Arrow…"): open and export typed columnar datasets —
+  Apache Parquet, Arrow IPC files (Feather v2 is the Arrow IPC file format),
+  and Arrow IPC streams — preserving types and nulls. Opening a `.parquet` /
   `.arrow` / `.feather` / `.ipc` file (drag-and-drop, "Open file…", or the
-  new "Open Parquet/Arrow…" command) shows an inspect dialog — container
-  format (noting Feather v2 = Arrow IPC file), row and row-group/batch
-  counts, compression codec, the schema mapped to F31 logical types with
-  nested fields indented and timezones shown, and the editable-memory
-  estimate — then lets you open read-only (indexed, bounded memory) or
-  convert to editable behind a memory warning. Complex list/map/struct
-  fields get a per-field policy picker (keep as JSON, explode into rows, or
-  drop); exploding forces an editable open and is limited to one field. A
-  new "Export as Parquet/Arrow…" dialog adds a format + Parquet
-  compression/row-group-size + typed-vs-verbatim choice to the scoped export
-  flow and, on completion, surfaces the per-column count of cells that
-  couldn't be represented under the declared types and were written as NULL.
+  command) first shows an inspect dialog: container format, row and
+  row-group/batch counts, compression codec, the schema mapped to the F31
+  logical types (nested fields indented, timezones shown), and an
+  editable-memory estimate — before anything is loaded. Choose read-only
+  (an indexed columnar backing with windowed reads over row groups / record
+  batches and a bounded decoded-block cache, so the grid, filters, and
+  export work with bounded memory on multi-gigabyte files) or convert to
+  editable behind an explicit memory check. Signed and unsigned 64-bit
+  integers (so `u64::MAX` round-trips losslessly), exact decimal
+  precision+scale, floats, booleans, dates, timestamps with their time-zone
+  metadata, and UTF-8 strings all survive intact, and a NULL stays distinct
+  from an empty string end to end (editable opens preserve the distinction
+  through collision-free per-column null tokens). Structs flatten to stable
+  path-based column names; each list/map/struct field takes an explicit
+  per-field policy (keep as JSON, explode into rows on an editable open, or
+  drop). Equality and range filters on numeric/date columns of indexed
+  parquet documents skip whole row groups using their statistics, with
+  results identical to a full scan. Export any scope (all rows, the filtered
+  view, selected rows / columns / range) to Parquet (uncompressed, Snappy,
+  or Zstd, with a configurable row-group size), an Arrow IPC file, or an
+  Arrow IPC stream, as a cancellable job through the atomic-save pipeline;
+  typed export maps each column's declared logical type to the matching
+  arrow type (Int64/UInt64, Decimal128 with unified precision/scale, Date32,
+  microsecond or nanosecond timestamps carrying the schema's time zone),
+  while null tokens and columnar NULLs export as real nulls distinct from
+  empty strings. Cells that cannot be represented under the declared types
+  are written as NULL and counted into a per-column warning report; columns
+  without a schema export as text verbatim. A columnar document opens
+  unsaved so a later Save can never overwrite the binary source with CSV.
 - **Row bookmarks, tags & notes** (F40): mark and annotate records without
   touching the source data. Star or flag a row, apply multiple named tags
   (a per-document tag namespace with usage counts), and attach a row note or
