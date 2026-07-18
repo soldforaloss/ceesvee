@@ -6,7 +6,7 @@
 //!   rectangular);
 //! * `headers.len()` is the authoritative column count.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::analyze;
@@ -248,7 +248,37 @@ impl SummaryAccumulator {
     }
 }
 
-/// How a document's rows are stored (F10, F32).
+/// Pluggable read-only row provider behind [`Backing::Virtual`] (F35 database
+/// tables). Implementations serve bounded window reads out of an external
+/// store (a SQLite table paged by rowid/keyset) without ever materialising
+/// the full row set; cells narrow the store's missing values (SQL `NULL`) to
+/// empty strings, matching the document contract that every cell is present.
+pub trait VirtualRows: Send + Sync {
+    /// Total data rows, fixed at open time. External growth/shrink is
+    /// surfaced through [`VirtualRows::refresh_probe`] and read errors, never
+    /// as a silently changing length.
+    fn n_rows(&self) -> usize;
+
+    /// Read rows `[start, end)` (the caller clamps to `n_rows`), each padded
+    /// to the column count. Must return exactly `end - start` rows or error.
+    fn read_rows(&self, start: usize, end: usize) -> AppResult<Vec<Vec<String>>>;
+
+    /// Whether the external store changed since open, as
+    /// `(rows_changed, schema_changed)`; `None` when the provider cannot
+    /// tell. Never mutates the store.
+    fn refresh_probe(&self) -> AppResult<Option<(bool, bool)>> {
+        Ok(None)
+    }
+}
+
+/// Rows fetched per block while visiting a [`Backing::Virtual`] range
+/// (matches the F10 index's visit block size).
+const VIRTUAL_VISIT_BLOCK: usize = 4096;
+/// Scattered virtual reads coalesce indices whose gap is at most this many
+/// records into one contiguous read (matches the F10 index).
+const VIRTUAL_COALESCE_GAP: usize = 64;
+
+/// How a document's rows are stored (F10, F32, F35).
 pub enum Backing {
     /// Fully materialised and mutable (the default).
     Memory,
@@ -260,6 +290,9 @@ pub enum Backing {
     /// plane renders columnar NULL as an empty cell while the handle keeps
     /// the null-vs-empty distinction for export and conversion.
     Columnar(crate::parquet_arrow::ColumnarHandle),
+    /// Read-only rows served by a pluggable provider (F35 database tables).
+    /// Like `Indexed`: `rows` stays empty and every mutation fails.
+    Virtual(Box<dyn VirtualRows>),
 }
 
 /// An open document.
@@ -363,6 +396,10 @@ pub struct Document {
     /// reads it directly (editable documents parse and release the file).
     #[allow(dead_code)] // held for its Drop effect
     archive_guard: Option<IndexDirGuard>,
+    /// Display label for documents without a `path` (F35 database tables:
+    /// "db.sqlite → table"). Takes precedence over the path-derived name in
+    /// [`Document::meta`]; cleared by Save As like the archive origin.
+    display_name: Option<String>,
 }
 
 impl Document {
@@ -438,6 +475,7 @@ impl Document {
             backing: Backing::Memory,
             archive: None,
             archive_guard: None,
+            display_name: None,
         }
     }
 
@@ -488,6 +526,7 @@ impl Document {
             backing: Backing::Memory,
             archive: None,
             archive_guard: None,
+            display_name: None,
         }
     }
 
@@ -545,6 +584,63 @@ impl Document {
             backing: Backing::Indexed(handle),
             archive: None,
             archive_guard: None,
+            display_name: None,
+        }
+    }
+
+    /// Build a read-only document over a virtual row provider (F35 database
+    /// tables). SQL column names are a real header row; the provider narrows
+    /// SQL `NULL` to empty cells (the document contract has no missing slot).
+    pub fn from_virtual(
+        id: u64,
+        display_name: String,
+        headers: Vec<String>,
+        backing: Box<dyn VirtualRows>,
+    ) -> Document {
+        let n_cols = headers.len();
+        Document {
+            id,
+            path: None,
+            headers,
+            rows: Vec::new(),
+            has_header_row: true,
+            delimiter: b',',
+            encoding_name: "UTF-8".to_string(),
+            had_bom: false,
+            line_ending: if cfg!(windows) {
+                LineEnding::Crlf
+            } else {
+                LineEnding::Lf
+            },
+            dirty_cells: HashSet::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            undo_meta: Vec::new(),
+            redo_meta: Vec::new(),
+            next_op_id: 0,
+            journal: None,
+            follow: false,
+            follow_range_from: None,
+            saved_marker: 0,
+            column_ids: positional_column_ids(n_cols),
+            next_column_id: n_cols as u64,
+            filter_rows: None,
+            view_sort: Vec::new(),
+            filter_view: None,
+            revision: 1,
+            col_revisions: vec![1; n_cols],
+            filter_revision: 1,
+            import_info: ImportInfo::default(),
+            fingerprint: None,
+            schema: crate::schema::DocumentSchema::default(),
+            schema_revision: 0,
+            schema_issues: Vec::new(),
+            dictionary: crate::dictionary::Dictionary::default(),
+            dictionary_revision: 0,
+            backing: Backing::Virtual(backing),
+            archive: None,
+            archive_guard: None,
+            display_name: Some(display_name),
         }
     }
 
@@ -621,6 +717,7 @@ impl Document {
             Backing::Memory => self.rows.len(),
             Backing::Indexed(handle) => handle.n_data_records(),
             Backing::Columnar(handle) => handle.n_rows(),
+            Backing::Virtual(rows) => rows.n_rows(),
         }
     }
 
@@ -846,6 +943,10 @@ impl Document {
         match self.backing {
             Backing::Memory => "editable",
             Backing::Indexed(_) | Backing::Columnar(_) => "indexedReadOnly",
+            // Database-backed documents (F35) report the same wire name so
+            // every existing read-only affordance in the front end applies
+            // unchanged; a dedicated meta flag can distinguish them later.
+            Backing::Virtual(_) => "indexedReadOnly",
         }
     }
 
@@ -873,6 +974,22 @@ impl Document {
                 handle.filter_scan_ranges(spec, &|col| self.column_schema_at(col).cloned())
             }
             _ => None,
+        }
+    }
+
+    /// Set the tab label used while the document has no path (F35 imports:
+    /// "db.sqlite → table"). Save As replaces it with the file name.
+    pub fn set_display_name(&mut self, name: impl Into<String>) {
+        self.display_name = Some(name.into());
+    }
+
+    /// F35: whether a database-backed document's external store changed
+    /// since it was opened, as `(rows_changed, schema_changed)`. `None` for
+    /// every other backing.
+    pub fn virtual_refresh_probe(&self) -> AppResult<Option<(bool, bool)>> {
+        match &self.backing {
+            Backing::Virtual(rows) => rows.refresh_probe(),
+            _ => Ok(None),
         }
     }
 
@@ -915,6 +1032,26 @@ impl Document {
             }
             Backing::Indexed(handle) => handle.visit(range, f),
             Backing::Columnar(handle) => handle.visit(range, f),
+            Backing::Virtual(rows) => {
+                let end = range.end.min(rows.n_rows());
+                let mut start = range.start.min(end);
+                while start < end {
+                    let block_end = (start + VIRTUAL_VISIT_BLOCK).min(end);
+                    let block = rows.read_rows(start, block_end)?;
+                    if block.len() != block_end - start {
+                        return Err(AppError::Other(
+                            "the database changed on disk; refresh the document".into(),
+                        ));
+                    }
+                    for (i, row) in block.iter().enumerate() {
+                        if !f(start + i, row)? {
+                            return Ok(());
+                        }
+                    }
+                    start = block_end;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -939,6 +1076,50 @@ impl Document {
             }
             Backing::Indexed(handle) => handle.visit_at(indices, f),
             Backing::Columnar(handle) => handle.visit_at(indices, f),
+            Backing::Virtual(rows) => {
+                // Mirror the F10 index: fetch each distinct row once per
+                // chunk, coalescing nearby indices into one windowed read,
+                // then emit in CALLER order.
+                let n = rows.n_rows();
+                for chunk in indices.chunks(VIRTUAL_VISIT_BLOCK) {
+                    if let Some(&bad) = chunk.iter().find(|&&i| i >= n) {
+                        return Err(AppError::invalid(format!("row {bad} is out of range")));
+                    }
+                    let mut sorted: Vec<usize> = chunk.to_vec();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    let mut fetched: HashMap<usize, Vec<String>> =
+                        HashMap::with_capacity(sorted.len());
+                    let mut run_start = 0usize;
+                    while run_start < sorted.len() {
+                        let mut run_end = run_start;
+                        while run_end + 1 < sorted.len()
+                            && sorted[run_end + 1] - sorted[run_end] <= VIRTUAL_COALESCE_GAP
+                        {
+                            run_end += 1;
+                        }
+                        let lo = sorted[run_start];
+                        let hi = sorted[run_end];
+                        let block = rows.read_rows(lo, hi + 1)?;
+                        if block.len() != hi + 1 - lo {
+                            return Err(AppError::Other(
+                                "the database changed on disk; refresh the document".into(),
+                            ));
+                        }
+                        for &want in &sorted[run_start..=run_end] {
+                            fetched.insert(want, block[want - lo].clone());
+                        }
+                        run_start = run_end + 1;
+                    }
+                    for &i in chunk {
+                        let row = fetched.get(&i).expect("fetched above");
+                        if !f(i, row)? {
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1336,16 +1517,22 @@ impl Document {
     fn summary_scan_len(&self) -> usize {
         match self.backing {
             Backing::Memory => self.n_rows(),
-            Backing::Indexed(_) | Backing::Columnar(_) => self.n_rows().min(INDEXED_SUMMARY_SAMPLE),
+            Backing::Indexed(_) | Backing::Columnar(_) | Backing::Virtual(_) => {
+                self.n_rows().min(INDEXED_SUMMARY_SAMPLE)
+            }
         }
     }
 
     pub fn meta(&self) -> DocumentMeta {
         let file_name = self
-            .path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().to_string())
+            .display_name
+            .clone()
+            .or_else(|| {
+                self.path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+            })
             .or_else(|| {
                 // Archive-backed documents (F17) have no path; show where
                 // they came from instead of "Untitled".
@@ -1400,6 +1587,8 @@ impl Document {
             // document; the extracted temp (if any) is no longer needed.
             self.archive = None;
             self.archive_guard = None;
+            // Same for a database-table label (F35): the file name wins now.
+            self.display_name = None;
         }
         self.saved_marker = self.undo_stack.len();
         self.dirty_cells.clear();

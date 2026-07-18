@@ -61,6 +61,12 @@ parquet = { version = "59", default-features = false, features = ["arrow", "snap
 # no extra chrono feature is needed on the writer).
 calamine = { version = "0.36", features = ["dates"] }
 rust_xlsxwriter = "0.96"
+# Local database browser (F35) + SafeQueryEngine (F36): SQLite ONLY this
+# cycle — DuckDB is out of scope (the bundled libduckdb C++ build does not
+# fit the 6 GB dev machine). `vtab` exposes open documents as read-only
+# virtual tables; `hooks` provides the authorizer + progress handler the
+# SafeQueryEngine is built on.
+rusqlite = { version = "0.40", features = ["bundled", "vtab", "hooks"] }
 
 # Single-instance is desktop-only: it forwards a second "Open with" launch
 # (and its file argument) to the already-running window instead of spawning a
