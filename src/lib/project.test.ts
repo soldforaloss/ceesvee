@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type {
+  AnnotationsExport,
   DocumentMeta,
   NamedView,
   PlanEntry,
@@ -9,7 +10,9 @@ import type {
   SourceStatus,
 } from "../types";
 import {
+  annotationsExportIsEmpty,
   availableOnlyChoices,
+  buildAnnotationsSection,
   buildLayoutSection,
   buildResolutions,
   buildSources,
@@ -29,6 +32,7 @@ import {
   projectSnapshotsEqual,
   statusDisplay,
   type PanelLayout,
+  type SourceAnnotationsSection,
   type SourceViewsSection,
 } from "./project";
 
@@ -379,6 +383,64 @@ describe("buildViewsSection", () => {
     for (const key of ["cells", "rows", "records", "values", "cellValues"]) {
       expect(json.includes(`"${key}"`)).toBe(false);
     }
+  });
+});
+
+describe("buildAnnotationsSection (F40)", () => {
+  const sources: ProjectSource[] = [
+    { id: "src-1", path: "C:\\data\\a.csv" },
+    { id: "src-2", path: "C:\\data\\b.csv" },
+  ];
+  const exp = (over: Partial<AnnotationsExport> = {}): AnnotationsExport => ({
+    version: 1,
+    entries: [{ handle: 0 }],
+    ...over,
+  });
+
+  it("annotationsExportIsEmpty ignores version but honours content and config", () => {
+    expect(annotationsExportIsEmpty({ version: 1 })).toBe(true);
+    expect(annotationsExportIsEmpty({ version: 1, entries: [], tags: [] })).toBe(true);
+    expect(annotationsExportIsEmpty(exp())).toBe(false);
+    expect(annotationsExportIsEmpty({ version: 1, tags: [{ name: "keep" }] })).toBe(false);
+    expect(annotationsExportIsEmpty({ version: 1, author: "Dana" })).toBe(false);
+    expect(annotationsExportIsEmpty({ version: 1, keySpec: { columns: ["c0"] } })).toBe(false);
+  });
+
+  it("captures each open source's export and preserves closed ones", () => {
+    const tabs = [meta({ id: 1, path: "C:\\data\\a.csv" })]; // only a.csv is open
+    const existing: SourceAnnotationsSection[] = [
+      { sourceId: "src-2", annotations: exp({ author: "prior" }) },
+    ];
+    const section = buildAnnotationsSection(sources, tabs, existing, (tab) =>
+      tab.id === 1 ? exp({ author: "live" }) : null,
+    );
+    expect(section).toEqual([
+      { sourceId: "src-1", annotations: exp({ author: "live" }) },
+      // A referenced-but-closed source keeps its previously-saved annotations.
+      { sourceId: "src-2", annotations: exp({ author: "prior" }) },
+    ]);
+  });
+
+  it("omits an open source whose annotations are all cleared (no stale fallback)", () => {
+    const tabs = [meta({ id: 1, path: "C:\\data\\a.csv" })];
+    // The source WAS saved before, but its live store is now empty.
+    const existing: SourceAnnotationsSection[] = [
+      { sourceId: "src-1", annotations: exp({ author: "stale" }) },
+    ];
+    const section = buildAnnotationsSection(sources, tabs, existing, () => ({ version: 1 }));
+    expect(section).toEqual([]);
+  });
+
+  it("drops preserved annotations for a source the project no longer references", () => {
+    const existing: SourceAnnotationsSection[] = [{ sourceId: "gone", annotations: exp() }];
+    expect(buildAnnotationsSection(sources, [], existing, () => null)).toEqual([]);
+  });
+
+  it("keys the section by source id, never by path (no on-disk locations leaked)", () => {
+    const tabs = [meta({ id: 1, path: "C:\\data\\a.csv" })];
+    const section = buildAnnotationsSection(sources, tabs, [], () => exp());
+    expect(section.map((s) => s.sourceId)).toEqual(["src-1"]);
+    expect(JSON.stringify(section).includes("C:\\\\data")).toBe(false);
   });
 });
 

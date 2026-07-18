@@ -1645,6 +1645,61 @@ mod tests {
         assert_eq!(report.orphaned.len(), 1);
     }
 
+    #[test]
+    fn discard_orphans_removes_only_orphaned_entries() {
+        let s = source(&[("1", "Ada"), ("2", "Bob"), ("3", "Cy")]);
+        let mut store = AnnotationStore::default();
+        // Ada (record 0): star + tag + a row note. Cy (record 2): a row note.
+        store
+            .edit_row_marks(
+                &s,
+                0,
+                &RowMarkPatch {
+                    star: Some(true),
+                    add_tags: vec!["keep".into()],
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .set_row_note(&s, 0, Some("hold".into()), None, None)
+            .unwrap();
+        store
+            .set_row_note(&s, 2, Some("stale".into()), None, None)
+            .unwrap();
+        assert_eq!(store.rows.len(), 2);
+
+        // Delete Cy: its record anchor can no longer re-find "3,Cy" anywhere, so
+        // it orphans, while Ada still resolves at record 0.
+        let deleted = source(&[("1", "Ada"), ("2", "Bob")]);
+        let report = store.rematch_report(&deleted, None).unwrap();
+        assert_eq!(report.matched, 1);
+        assert_eq!(report.orphaned.len(), 1);
+
+        let before = store.revision();
+        let removed = store.discard_orphans(&deleted, None).unwrap();
+        assert_eq!(removed, 1, "only the orphaned entry is discarded");
+        assert!(
+            store.revision() > before,
+            "a real removal bumps the revision"
+        );
+
+        // Ada survives untouched — marks, tag and note all intact.
+        assert_eq!(store.rows.len(), 1);
+        let ada = store.rows.values().next().unwrap();
+        assert!(ada.star);
+        assert_eq!(ada.tags, vec!["keep"]);
+        assert_eq!(ada.note.as_ref().unwrap().text, "hold");
+
+        // A second pass with nothing orphaned is a no-op: nothing removed and the
+        // revision is held (so an idle "discard orphans" never dirties the store).
+        let steady = store.revision();
+        let removed = store.discard_orphans(&deleted, None).unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(store.revision(), steady, "a no-op discard never bumps");
+    }
+
     // ----- entry merging + pruning + notes ---------------------------------
 
     #[test]

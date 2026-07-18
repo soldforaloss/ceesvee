@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { DictionaryView, DocumentMeta } from "../types";
+import type { AnnotationsView, DictionaryView, DocumentMeta, ProjectMeta } from "../types";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), save: vi.fn() }));
 vi.mock("@tauri-apps/api/window", () => ({
@@ -21,6 +21,13 @@ vi.mock("../lib/tauri", () => ({
   openArchiveDocument: vi.fn(),
   discardArchive: vi.fn(),
   applyDictionaryImport: vi.fn(),
+  // F40 annotation persistence (sidecar vs project).
+  annotationsEditRow: vi.fn(),
+  annotationsSaveSidecar: vi.fn().mockResolvedValue(undefined),
+  annotationsLoadSidecar: vi.fn(),
+  annotationsView: vi.fn(),
+  annotationsGetExport: vi.fn(),
+  annotationsLoadExport: vi.fn().mockResolvedValue(undefined),
 }));
 
 import * as api from "../lib/tauri";
@@ -562,5 +569,85 @@ describe("dictionary import stale-plan guard (F38)", () => {
     // (docId, path, matchBy, resolution, expectedDictionaryRevision)
     expect(call[4]).toBe(7);
     expect(call[4]).not.toBe(9);
+  });
+});
+
+describe("annotation persistence: sidecar vs project (F40)", () => {
+  const annView = (rev: number): AnnotationsView => ({
+    annotationsRevision: rev,
+    revision: 1,
+    tags: [],
+    matched: 0,
+    ambiguous: 0,
+    orphaned: 0,
+    entries: [],
+  });
+
+  const project = (): ProjectMeta => ({
+    path: "C:/proj/work.ceesveeproj",
+    name: "work",
+    dirty: false,
+    revision: 1,
+    formatVersion: "1",
+    appVersion: "0.4.0",
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useStore.setState({
+      tabs: [meta(1)],
+      activeId: 1,
+      project: null,
+      annotationsView: annView(0),
+      error: null,
+    });
+    vi.mocked(api.annotationsEditRow).mockResolvedValue(annView(1));
+  });
+
+  it("writes the sidecar on an edit when NO project is open", async () => {
+    const ok = await useStore.getState().applyRowMarks([0], { star: true });
+    expect(ok).toBe(true);
+    expect(api.annotationsEditRow).toHaveBeenCalled();
+    expect(api.annotationsSaveSidecar).toHaveBeenCalledWith(1, "C:/data/doc-1.csv");
+  });
+
+  it("does NOT touch the sidecar on an edit when a project IS open", async () => {
+    useStore.setState({ project: project() });
+    const ok = await useStore.getState().applyRowMarks([0], { star: true });
+    expect(ok).toBe(true);
+    // The edit still lands in the registry (captured into the project on save),
+    // but the per-source sidecar is never written — the two are exclusive.
+    expect(api.annotationsEditRow).toHaveBeenCalled();
+    expect(api.annotationsSaveSidecar).not.toHaveBeenCalled();
+  });
+
+  it("hydrates the sidecar when an INDEXED open finishes", async () => {
+    useStore.setState({
+      tabs: [],
+      activeId: null,
+      project: null,
+      indexing: {
+        jobId: 41,
+        docId: 9,
+        kind: "openIndexed",
+        path: "C:/data/doc-9.csv",
+        processed: 0,
+        total: null,
+      },
+    });
+    vi.mocked(api.getMeta).mockResolvedValue(meta(9, "indexedReadOnly"));
+    vi.mocked(api.annotationsLoadSidecar).mockResolvedValue(annView(0));
+
+    await useStore.getState().handleJobFinished({
+      jobId: 41,
+      docId: 9,
+      kind: "openIndexed",
+      status: "done",
+      error: null,
+    });
+
+    // The large read-only document reads its existing sidecar on open, so a
+    // later edit merges instead of overwriting an empty store onto it.
+    expect(api.annotationsLoadSidecar).toHaveBeenCalledWith(9, "C:/data/doc-9.csv");
   });
 });

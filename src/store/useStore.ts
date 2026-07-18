@@ -25,6 +25,7 @@ import { suggestJsonFileName } from "../lib/jsonExport";
 import { isLegacyEncoding } from "../lib/save";
 import {
   availableOnlyChoices,
+  buildAnnotationsSection,
   buildLayoutSection,
   buildResolutions,
   buildSources,
@@ -38,6 +39,7 @@ import {
   projectSnapshot,
   type PanelLayout,
   type ProjectSnapshot,
+  type SourceAnnotationsSection,
   type SourceChoice,
   type SourceViewsSection,
 } from "../lib/project";
@@ -108,6 +110,7 @@ import type {
   MergeMatchBy,
   MergePlan,
   MergeResolution,
+  AnnotationsExport,
   AnnotationsView,
   AnnotationPredicate,
   AnnotationExportFormat,
@@ -1334,6 +1337,13 @@ function applyThemeClass(theme: ThemePref) {
 export const useStore = create<Store>((set, get) => {
   // ----- internal helpers -------------------------------------------------
 
+  // True only while a project open is applying its plan (F40). During that
+  // window the per-source sidecar must never be read — the project's own
+  // `annotations` section is authoritative — but `get().project` is not set
+  // until the plan finishes, so this flag bridges the gap for the fire-and-
+  // forget sidecar hydration that `openPath` kicks off mid-plan.
+  let openingProject = false;
+
   const activeMeta = (): DocumentMeta | null => {
     const { tabs, activeId } = get();
     return tabs.find((t) => t.id === activeId) ?? null;
@@ -1697,14 +1707,20 @@ export const useStore = create<Store>((set, get) => {
   };
 
   /**
-   * Persist a document's annotations to its `.ceesvee-notes.json` sidecar
-   * (F40), fire-and-forget. The sidecar is the durable store; an empty store
-   * deletes it (the backend handles that). A path-less document (new/derived)
-   * has nowhere to write, so this is a no-op there. Write failures are
-   * swallowed — they surface on the next explicit save/export instead of
-   * interrupting an annotation edit.
+   * Persist a document's annotations after an edit (F40), fire-and-forget.
+   *
+   * The two backing stores are mutually exclusive per the spec's migration
+   * rule: when a PROJECT is open the annotations live in the project's
+   * `annotations` section (captured into the ProjectStore on the next project
+   * save, exactly like tabs/layout/views — never in the sidecar), so this is a
+   * no-op. With no project open the durable store is the source's
+   * `.ceesvee-notes.json` sidecar; an empty store deletes it (the backend
+   * handles that). A path-less document (new/derived) has nowhere to write, so
+   * this is a no-op there too. Write failures are swallowed — they surface on
+   * the next explicit save/export instead of interrupting an annotation edit.
    */
   const persistAnnotationSidecar = (docId: number, path: string | null) => {
+    if (get().project) return;
     if (!path) return;
     void api.annotationsSaveSidecar(docId, path).catch(() => undefined);
   };
@@ -1886,9 +1902,10 @@ export const useStore = create<Store>((set, get) => {
   };
 
   /**
-   * Push the live sources/tabs/layout/views into the backend ProjectStore (THE
-   * persistence boundary). Reuses existing source ids by path so ids stay
-   * stable across saves. Captures configuration only — never cell data.
+   * Push the live sources/tabs/layout/views/annotations into the backend
+   * ProjectStore (THE persistence boundary). Reuses existing source ids by path
+   * so ids stay stable across saves. Captures configuration only — never cell
+   * data (the annotations envelope references rows by identity + content hash).
    * Schemas, recipes, joins, comparisons and row keys are NOT captured from the
    * live session this cycle; they round-trip when a template or existing
    * project file carries them (see CHANGELOG for the deferred scope).
@@ -1897,14 +1914,20 @@ export const useStore = create<Store>((set, get) => {
     const s = get();
     const docs = s.tabs.filter((t) => t.path);
     const fingerprints: Record<number, FileFingerprint | null> = {};
+    const exports: Record<number, AnnotationsExport | null> = {};
     await Promise.all(
       docs.map(async (t) => {
         fingerprints[t.id] = await api.getFileFingerprint(t.id).catch(() => null);
+        // F40: the backend registry is the live source of truth; pull each open
+        // document's export envelope so the project absorbs its annotations.
+        exports[t.id] = await api.annotationsGetExport(t.id).catch(() => null);
       }),
     );
     const state = await api.projectGet().catch(() => null);
     const existingSources = state?.sections.sources ?? [];
     const existingViews = (state?.sections.views as SourceViewsSection[] | undefined) ?? [];
+    const existingAnnotations =
+      (state?.sections.annotations as SourceAnnotationsSection[] | undefined) ?? [];
     const sources = buildSources(s.tabs, existingSources, fingerprints);
     const views = buildViewsSection(
       sources,
@@ -1914,10 +1937,17 @@ export const useStore = create<Store>((set, get) => {
       (tab) =>
         tab.id === s.activeId ? s.activeViewId : (s.uiStates[tab.id]?.activeViewId ?? null),
     );
+    const annotations = buildAnnotationsSection(
+      sources,
+      s.tabs,
+      existingAnnotations,
+      (tab) => exports[tab.id] ?? null,
+    );
     await api.projectSetSection("sources", sources);
     await api.projectSetSection("tabs", buildTabsSection(sources, s.tabs, s.activeId));
     await api.projectSetSection("layout", buildLayoutSection(currentPanels(s)));
     await api.projectSetSection("views", views);
+    await api.projectSetSection("annotations", annotations);
   };
 
   /**
@@ -1928,8 +1958,15 @@ export const useStore = create<Store>((set, get) => {
    * joins, comparisons or exports.
    */
   const applyProjectPlan = async (plan: ProjectOpenPlan) => {
-    for (const entry of plan.entries) {
-      await get().openPath(entry.path);
+    // Suppress the per-source sidecar hydration `openPath` fires while the plan
+    // is applying — the project's `annotations` section (loaded below) wins.
+    openingProject = true;
+    try {
+      for (const entry of plan.entries) {
+        await get().openPath(entry.path);
+      }
+    } finally {
+      openingProject = false;
     }
     // Restore saved tab order (project docs first, extras appended).
     set((s) => {
@@ -1938,18 +1975,32 @@ export const useStore = create<Store>((set, get) => {
       const tabs = order.map((id) => byId.get(id)).filter((t): t is DocumentMeta => !!t);
       return { tabs };
     });
+    const state = await api.projectGet().catch(() => null);
     // Restore the saved panel layout (front-end config only; runs nothing).
-    const panels = panelsFromLayout(
-      await api
-        .projectGet()
-        .then((state) => state?.sections.layout ?? null)
-        .catch(() => null),
-    );
+    const panels = panelsFromLayout(state?.sections.layout ?? null);
     set((s) => ({
       diagnosticsOpen: panels.diagnostics,
       changesOpen: panels.changes,
       explorer: { ...s.explorer, open: panels.explorer },
     }));
+
+    const findTab = (path: string) =>
+      get().tabs.find((t) => t.path && pathKey(t.path) === pathKey(path));
+
+    // F40: hydrate each opened source's annotations FROM THE PROJECT SECTION
+    // (authoritative over any sidecar), by matching the section's stable source
+    // id to the plan entry that opened the tab. A source still pending a
+    // large-file decision or archive extraction has no tab yet — it is skipped,
+    // mirroring the view-reapply gate below.
+    const savedAnnotations =
+      (state?.sections.annotations as SourceAnnotationsSection[] | undefined) ?? [];
+    const bySourceId = new Map(savedAnnotations.map((a) => [a.sourceId, a]));
+    for (const entry of plan.entries) {
+      const saved = bySourceId.get(entry.sourceId);
+      const tab = saved ? findTab(entry.path) : undefined;
+      if (!saved || !tab) continue;
+      await api.annotationsLoadExport(tab.id, saved.annotations).catch(() => undefined);
+    }
 
     // Reapply each opened source's saved view against ITS OWN document. A
     // source still pending a large-file decision or archive extraction has no
@@ -1957,8 +2008,6 @@ export const useStore = create<Store>((set, get) => {
     // active. applyNamedView targets the active document, so switch to each
     // source's tab first; the saved active tab is done LAST so the session ends
     // focused on it.
-    const findTab = (path: string) =>
-      get().tabs.find((t) => t.path && pathKey(t.path) === pathKey(path));
     const reapplyOrder = [
       ...plan.entries.filter((e) => e.sourceId !== plan.activeTab),
       ...plan.entries.filter((e) => e.sourceId === plan.activeTab),
@@ -1986,6 +2035,9 @@ export const useStore = create<Store>((set, get) => {
       projectOpen: null,
       projectOpenChoices: {},
     });
+    // Refresh the annotations surface for the now-active document from the
+    // registry the project section just populated.
+    void get().loadAnnotations();
   };
 
   return {
@@ -2546,6 +2598,7 @@ export const useStore = create<Store>((set, get) => {
           const meta = await api.getMeta(started.docId);
           set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta], busy: false }));
           pushRecent(decision.path);
+          void get().hydrateAnnotationsFromSidecar(meta.id, meta.path);
           return;
         }
         const meta = await api.openFile(decision.path, { forceInMemory: true });
@@ -3438,8 +3491,14 @@ export const useStore = create<Store>((set, get) => {
 
     hydrateAnnotationsFromSidecar: async (docId, sourcePath) => {
       try {
-        const view = sourcePath
-          ? await api.annotationsLoadSidecar(docId, sourcePath)
+        // With a project open (or one mid-open), the project's `annotations`
+        // section is authoritative — never let the per-source sidecar clobber
+        // it (F40 migration rule: the project absorbs the sidecar on save).
+        // Fall back to a plain registry view so the grid indicators still
+        // refresh without reading — or overwriting — the sidecar.
+        const useSidecar = !!sourcePath && !openingProject && !get().project;
+        const view = useSidecar
+          ? await api.annotationsLoadSidecar(docId, sourcePath as string)
           : await api.annotationsView(docId);
         if (get().activeId === docId) set({ annotationsView: view });
       } catch {
@@ -4275,6 +4334,10 @@ export const useStore = create<Store>((set, get) => {
           const meta = await api.getMeta(started.docId);
           set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] }));
           pushRecent(path);
+          // F40: hydrate annotations from the extracted file's sidecar so a
+          // later edit merges into any existing notes instead of overwriting
+          // an empty store on top of them.
+          void get().hydrateAnnotationsFromSidecar(meta.id, meta.path);
         } catch (e) {
           set({ error: String(e) });
         }
@@ -4300,6 +4363,13 @@ export const useStore = create<Store>((set, get) => {
           if (finished.kind === "openIndexed") {
             set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] }));
             if (indexing.path) pushRecent(indexing.path);
+            // F40: hydrate annotations from the source's sidecar. Indexed
+            // (F10) opens land here too; without this an annotation edit on a
+            // large read-only document would overwrite its existing sidecar
+            // with an otherwise-empty store. Skipped for the in-place
+            // convert/reindex cases below — the doc id (and its registry
+            // store) is stable across those.
+            void get().hydrateAnnotationsFromSidecar(meta.id, meta.path);
             // F12: restore the matching profile's last-selected view (works
             // on indexed documents — layout, filter and view sort are all
             // non-destructive).
