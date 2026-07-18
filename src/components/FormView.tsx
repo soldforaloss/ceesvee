@@ -14,6 +14,8 @@ import {
   isDraftDirty,
   layoutSections,
   parseGoto,
+  recordViewCurrent,
+  recordViewToken,
   removeGroup,
   saveBlocked,
   stepRecord,
@@ -127,8 +129,11 @@ export function FormView() {
   const loadAnnotations = useStore((s) => s.loadAnnotations);
 
   const [view, setView] = useState<RecordView | null>(null);
+  // The (document, row) token the loaded `view` answered to — compared against
+  // the live target below to detect the window after a navigation / tab switch
+  // where the async refetch has not yet replaced the previous record's fields.
+  const [viewToken, setViewToken] = useState<string | null>(null);
   const [validation, setValidation] = useState<DraftValidation | null>(null);
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [rawMode, setRawMode] = useState(false);
@@ -140,10 +145,24 @@ export function FormView() {
   const docId = meta?.id ?? null;
   const revision = meta?.revision;
   const dataVersion = useStore((s) => s.dataVersion);
+  // Schema/dictionary edits move independently of the document revision and
+  // dataVersion (setColumnSchema only refreshes schemaInfo; dictionary edits
+  // only refresh dictionaryView), so the fetch effect watches them explicitly —
+  // otherwise the joined field labels, formats and validity badges go stale.
+  const schemaRevision = useStore((s) => s.schemaInfo?.schemaRevision ?? null);
+  const dictionaryRevision = useStore((s) => s.dictionaryView?.dictionaryRevision ?? null);
   const { row, draft, draftRevision, layout } = record;
   const fields = view?.fields ?? [];
   const dirty = isDraftDirty(fields, draft);
   const readOnly = view?.readOnly ?? meta?.backing === "indexedReadOnly";
+
+  // The record the form now points at, and whether the loaded `view` still
+  // belongs to it. A navigation (or a switch to another document/tab) moves the
+  // target before the async `fetch_record` resolves; until it does, the view is
+  // stale and the form must NOT render its editable fields or commit against it
+  // (that would write the draft onto the previous record — the P1 bug).
+  const viewTarget = docId != null ? recordViewToken(docId, row) : null;
+  const current = recordViewCurrent(viewToken, viewTarget);
 
   // The resolved F40 annotation for the record on show (matched entries are
   // keyed by absolute row — the same coordinate `fetch_record` reads at). Drives
@@ -162,19 +181,23 @@ export function FormView() {
     const clamped = clampRecord(row, meta?.rowCount ?? 0);
     if (clamped === null) {
       setView(null);
+      setViewToken(null);
       return;
     }
     if (clamped !== row) {
       setRow(clamped);
       return;
     }
+    // The identity this fetch answers to — stamped onto the view on resolve so a
+    // superseded-but-uncancelled result can never masquerade as current.
+    const token = recordViewToken(docId, row);
     let cancelled = false;
-    setLoading(true);
     api
       .fetchRecord(docId, row)
       .then((v) => {
         if (cancelled) return;
         setView(v);
+        setViewToken(token);
         setError(null);
         // A draft started at an earlier revision may have been remapped by a
         // filter/sort/data change under it — discard it rather than risk the
@@ -188,16 +211,17 @@ export function FormView() {
           setNotice("The document changed — the unsaved draft was discarded.");
         }
       })
-      .catch((e) => !cancelled && setError(String(e)))
-      .finally(() => !cancelled && setLoading(false));
+      .catch((e) => !cancelled && setError(String(e)));
     return () => {
       cancelled = true;
     };
     // draft/draftRevision intentionally excluded: this refetches on document
     // movement, not on every keystroke (the draft is compared inside).
-    // dataVersion catches structural/dictionary refreshes that reload the grid.
+    // dataVersion catches structural refreshes that reload the grid;
+    // schema/dictionary revisions catch metadata-only edits (declared type,
+    // format, dictionary label) that repaint fields without moving the revision.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, docId, row, revision, dataVersion]);
+  }, [open, docId, row, revision, dataVersion, schemaRevision, dictionaryRevision]);
 
   // ---- pre-check the draft (debounced) --------------------------------------
   useEffect(() => {
@@ -236,7 +260,10 @@ export function FormView() {
   const blocked = saveBlocked(validation);
 
   const commit = useCallback(async (): Promise<boolean> => {
-    if (!view || blocked) return false;
+    // `current` gates the write: if the loaded view is stale (a navigation or
+    // tab switch is mid-refetch), refuse rather than commit `view.displayRow` —
+    // which is still the PREVIOUS record — under a revision that may coincide.
+    if (!view || blocked || !current) return false;
     const edits = changedFields(view.fields, draft);
     if (edits.length === 0) return true;
     // Guard the commit with the revision the fields were READ at (view.revision).
@@ -250,7 +277,7 @@ export function FormView() {
       return false;
     }
     return result === "saved" || result === "noop";
-  }, [view, blocked, draft, saveDraft]);
+  }, [view, blocked, current, draft, saveDraft]);
 
   // Navigate to a visible record, honouring the unsaved-draft preference.
   const navigate = useCallback(
@@ -361,8 +388,10 @@ export function FormView() {
         </form>
       </div>
 
-      {/* Row bookmarks/tags/notes strip (F40): mark the whole record. */}
-      {!noRecords && view && (
+      {/* Row bookmarks/tags/notes strip (F40): mark the whole record. Gated on
+          `current` so a mid-refetch stale view never pairs the previous
+          record's marks with the newly-targeted row's actions. */}
+      {current && view && (
         <RowAnnotationStrip
           entry={entry}
           onStar={() => void applyRowMarks([row], { star: !(entry?.star ?? false) })}
@@ -387,12 +416,15 @@ export function FormView() {
 
       {/* Fields */}
       <div className={`min-h-0 flex-1 overflow-y-auto px-3 ${dense ? "py-2" : "py-3"}`}>
-        {loading && fields.length === 0 ? (
-          <p className="py-6 text-center text-xs text-zinc-400">Loading record…</p>
-        ) : noRecords ? (
+        {noRecords ? (
           <p className="py-6 text-center text-xs text-zinc-400">
             This view has no records{meta.filtered ? " (the filter matches nothing)" : ""}.
           </p>
+        ) : !current ? (
+          // Stale/absent view: a fetch for the current record is in flight. Show
+          // loading rather than the previous record's editable fields, so no
+          // edit can be started (or saved) against a row the form has left.
+          <p className="py-6 text-center text-xs text-zinc-400">Loading record…</p>
         ) : (
           <div className={dense ? "space-y-3" : "space-y-4"}>
             {sections.map((section, i) => (
@@ -461,7 +493,7 @@ export function FormView() {
           <div className="flex items-center gap-2">
             <button
               onClick={() => void commit()}
-              disabled={!dirty || blocked}
+              disabled={!dirty || blocked || !current}
               className="flex-1 rounded bg-violet-600 px-2 py-1.5 font-medium text-white hover:bg-violet-500 disabled:opacity-40"
             >
               Save draft

@@ -187,6 +187,12 @@ pub struct AppSettings {
     /// F16: journals older than this are swept at startup.
     #[serde(default = "default_recovery_retention")]
     pub recovery_retention_days: u32,
+    /// F41: when navigating between records with unsaved field edits, save the
+    /// draft automatically instead of prompting. A strict-invalid draft still
+    /// prompts (it cannot be committed). Persisted here so the record form's
+    /// checkbox survives a restart / settings reload, like every other pref.
+    #[serde(default)]
+    pub auto_save_record_on_navigate: bool,
 }
 
 fn default_recovery_retention() -> u32 {
@@ -201,6 +207,7 @@ impl Default for AppSettings {
             shortcut_overrides: std::collections::HashMap::new(),
             recovery_enabled: false,
             recovery_retention_days: default_recovery_retention(),
+            auto_save_record_on_navigate: false,
         }
     }
 }
@@ -732,6 +739,45 @@ mod tests {
             Some(&Some("mod+shift+s".to_string()))
         );
         assert_eq!(loaded.shortcut_overrides.get("edit.redo"), Some(&None));
+    }
+
+    #[test]
+    fn auto_save_record_on_navigate_round_trips_and_defaults_off() {
+        let dir = tempfile::tempdir().unwrap();
+        // A pre-F41 settings file (no autoSaveRecordOnNavigate key) still loads,
+        // and the preference defaults to off (prompt on navigate).
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            br#"{"version":1,"profiles":[]}"#,
+        )
+        .unwrap();
+        let loaded = load_settings(dir.path());
+        assert!(
+            !loaded.auto_save_record_on_navigate,
+            "absent key defaults to off"
+        );
+
+        // Enabling it persists across a save/load cycle (the bug: the frontend
+        // key was dropped by serde because the Rust struct had no field, so the
+        // checkbox reverted after a restart).
+        let settings = AppSettings {
+            auto_save_record_on_navigate: true,
+            ..Default::default()
+        };
+        save_settings(dir.path(), &settings).unwrap();
+        let loaded = load_settings(dir.path());
+        assert!(
+            loaded.auto_save_record_on_navigate,
+            "the preference survives a restart / settings reload"
+        );
+
+        // It serializes under the camelCase key the frontend AppSettings shape
+        // reads, so the round trip is end-to-end and not just Rust-internal.
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(
+            json.contains("\"autoSaveRecordOnNavigate\":true"),
+            "serialized under the camelCase key the frontend reads"
+        );
     }
 
     #[test]
