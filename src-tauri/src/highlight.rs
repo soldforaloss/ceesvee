@@ -557,9 +557,22 @@ impl MatchSet {
     }
 }
 
-/// Project raw geometry through a target into a cached match set.
-fn project(raw: RawMatches, target: &HighlightTarget, doc: &Document) -> MatchSet {
-    match target {
+/// Project raw geometry through a rule's target into a cached match set.
+///
+/// A `columns` target decorates the named target columns. How the raw cell
+/// matches map onto them depends on whether the condition carried its OWN
+/// column scope:
+///
+/// * **cell-scoped condition** (its own `column_id`) — the condition column is a
+///   row *decider*, and its matches live in that column, not the target columns.
+///   Each matched ROW is projected across the target columns, so
+///   "status = overdue → highlight Amount" decorates the Amount cell of every
+///   overdue row rather than being filtered out for not living in Amount.
+/// * **no condition column** — the predicate ran on the target columns
+///   themselves (see [`predicate_columns`]), so only the cells that actually
+///   matched are kept.
+fn project(raw: RawMatches, rule: &HighlightRule, doc: &Document) -> MatchSet {
+    match &rule.target {
         HighlightTarget::Row => {
             let mut rows: Vec<usize> = match raw {
                 RawMatches::Rows(rows) => rows,
@@ -581,24 +594,38 @@ fn project(raw: RawMatches, target: &HighlightTarget, doc: &Document) -> MatchSe
         HighlightTarget::Columns { column_ids } => {
             let cols = resolve_column_ids(doc, column_ids);
             let cells = match raw {
+                RawMatches::Cells(cells) if rule.condition_column_id().is_some() => {
+                    // Cross-column projection: the match is in the (separate)
+                    // condition column, so decorate the target columns of each
+                    // matched row.
+                    let mut rows: Vec<usize> = cells.into_iter().map(|(r, _)| r).collect();
+                    rows.sort_unstable();
+                    rows.dedup();
+                    expand_rows_over_columns(&rows, &cols)
+                }
+                // Predicate ran on the target columns: keep the matched cells.
                 RawMatches::Cells(cells) => cells
                     .into_iter()
                     .filter(|(_, c)| cols.contains(c))
                     .collect(),
-                // Expand each matched row across the targeted columns.
-                RawMatches::Rows(rows) => {
-                    let mut out = Vec::with_capacity(rows.len() * cols.len());
-                    for r in rows {
-                        for &c in &cols {
-                            out.push((r, c));
-                        }
-                    }
-                    out
-                }
+                // A row-level condition: expand each matched row across the
+                // targeted columns.
+                RawMatches::Rows(rows) => expand_rows_over_columns(&rows, &cols),
             };
             MatchSet::Cells(group_cells(cells))
         }
     }
+}
+
+/// Expand each row across `cols` into `(row, col)` cells.
+fn expand_rows_over_columns(rows: &[usize], cols: &[usize]) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(rows.len() * cols.len());
+    for &r in rows {
+        for &c in cols {
+            out.push((r, c));
+        }
+    }
+    out
 }
 
 /// Group `(row, col)` pairs into a row → sorted-columns map.
@@ -984,7 +1011,7 @@ fn evaluate_rule(
                 .unwrap_or_default(),
         ),
     };
-    Ok(project(raw, &rule.target, doc))
+    Ok(project(raw, rule, doc))
 }
 
 /// Absolute rows for a diagnostics condition: one issue when `issue_id` is
@@ -2062,6 +2089,56 @@ mod tests {
         );
         // Row 0: a=x, c=x → (0,0),(0,2); row 1: c=y no, a=y no.
         assert_eq!(cells_of(&eval(&d, &r)), vec![(0, 0), (0, 2)]);
+        let _ = c1;
+    }
+
+    #[test]
+    fn columns_target_projects_from_a_separate_condition_column() {
+        // "status = overdue → highlight amount": the condition is scoped to its
+        // OWN column (status, index 0) but the target is a DIFFERENT column
+        // (amount, index 1). Each matched ROW must decorate the target column,
+        // not be dropped for living in the (separate) condition column.
+        let d = doc("status,amount\noverdue,10\nok,20\noverdue,30");
+        let status = col_id(&d, 0);
+        let amount = col_id(&d, 1);
+        let r = rule(
+            "r",
+            HighlightCondition::Equals {
+                column_id: Some(status),
+                value: "overdue".into(),
+                case_sensitive: false,
+            },
+            HighlightTarget::Columns {
+                column_ids: vec![amount],
+            },
+        );
+        // Rows 0 and 2 match on status → decorate their amount cell (col 1).
+        assert_eq!(cells_of(&eval(&d, &r)), vec![(0, 1), (2, 1)]);
+    }
+
+    #[test]
+    fn columns_target_with_decider_column_covers_every_target_column() {
+        // A cell-scoped condition whose column is ALSO one of several target
+        // columns still projects across the whole target set for matched rows:
+        // the condition decides the row, the target decides the painted columns.
+        let d = doc("a,b,c\nhit,1,2\nno,3,4\nhit,5,6");
+        let (c0, c1, c2) = (col_id(&d, 0), col_id(&d, 1), col_id(&d, 2));
+        let r = rule(
+            "r",
+            HighlightCondition::Equals {
+                column_id: Some(c0.clone()),
+                value: "hit".into(),
+                case_sensitive: false,
+            },
+            HighlightTarget::Columns {
+                column_ids: vec![c0, c2],
+            },
+        );
+        // Rows 0 and 2 match; decorate their a (0) and c (2) cells, not b (1).
+        assert_eq!(
+            cells_of(&eval(&d, &r)),
+            vec![(0, 0), (0, 2), (2, 0), (2, 2)]
+        );
         let _ = c1;
     }
 

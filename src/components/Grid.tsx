@@ -208,6 +208,15 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   const highlightRuleCount = useStore((s) => s.highlight.rules.length);
   const highlightRuleCountRef = useRef(highlightRuleCount);
   highlightRuleCountRef.current = highlightRuleCount;
+  // F42: analysis-backed highlight conditions read the diagnostics (F02),
+  // cross-column (F27) and outlier (F30) reports. A completed/updated scan moves
+  // the report's revision WITHOUT bumping `dataVersion` or `highlightVersion`,
+  // so track those revisions to re-run the invalidate+refetch effect below.
+  // (Annotation edits and changed-since-save are folded in there via
+  // `annotationsView.annotationsRevision` and `meta.dirty`.)
+  const diagnosticsRevision = useStore((s) => s.diagnostics[docId]?.report?.revision ?? -1);
+  const crossvalRevision = useStore((s) => s.crossval.report?.revision ?? -1);
+  const outlierRevision = useStore((s) => s.outlier.report?.revision ?? -1);
 
   // Detected type per column (defaults to text until summaries load).
   const columnKinds = useMemo<ColumnKind[]>(() => {
@@ -249,6 +258,10 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   // note corners. `cellNoteIndex` is the record -> {column ids with a note} map
   // consulted per cell in the custom draw.
   const annotationsView = useStore((s) => s.annotationsView);
+  // F42: F40 bookmark/flag/tag conditions read the resolved annotation marks;
+  // an annotation edit moves this revision without a data change, so it feeds
+  // the highlight invalidation effect below.
+  const annotationsRevision = annotationsView?.annotationsRevision ?? -1;
   const recordIndex = useMemo(() => buildRecordIndex(annotationsView), [annotationsView]);
   const cellNoteIndex = useMemo(() => {
     const map = new Map<number, Set<string>>();
@@ -402,10 +415,14 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     [loadHighlightPage],
   );
 
-  // Invalidate the decoration cache when the document, its data, or its rule
-  // set changes, then refetch the visible window. A rule edit bumps only
-  // `highlightVersion`, so unrelated data stays cached (the row cache is
-  // untouched here — only the decorations are recomputed).
+  // Invalidate the decoration cache when the document, its data, its rule set,
+  // OR any non-data highlight input changes, then refetch the visible window. A
+  // rule edit bumps only `highlightVersion`, so unrelated data stays cached (the
+  // row cache is untouched here — only the decorations are recomputed). The
+  // extra deps cover conditions whose results change while the visible page
+  // stays cached: F40 annotation edits (annotationsRevision), the analysis
+  // reports (diagnostics/cross-column/outlier revisions) and changed-since-save
+  // after a save clears the dirty set (`meta.dirty` flips false).
   useEffect(() => {
     highlightGen.current += 1;
     highlightCache.current.clear();
@@ -428,7 +445,18 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     // `generation` is bumped by the row-cache invalidation effect below on the
     // same [docId, dataVersion] change, so an in-flight highlight fetch from a
     // prior generation is dropped there too.
-  }, [docId, dataVersion, highlightVersion, highlightRuleCount, loadHighlightRange]);
+  }, [
+    docId,
+    dataVersion,
+    highlightVersion,
+    highlightRuleCount,
+    annotationsRevision,
+    diagnosticsRevision,
+    crossvalRevision,
+    outlierRevision,
+    meta.dirty,
+    loadHighlightRange,
+  ]);
 
   // Invalidate the cache when the document or its data changes structurally,
   // then refetch the visible window (loadPage's `updateCells` repaints them).

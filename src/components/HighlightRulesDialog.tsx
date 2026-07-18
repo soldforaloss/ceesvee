@@ -156,6 +156,17 @@ export function HighlightRulesDialog({ onClose }: { onClose: () => void }) {
     }
   };
 
+  const clearAll = () => {
+    // Clearing every rule must also drop the in-progress draft and its pending
+    // debounced persist — otherwise a later flush (on dialog close) or edit
+    // would resurrect the rule the user just cleared. Mirror `remove`: cancel
+    // the persister (don't flush) and reset the selection.
+    persister.cancel();
+    void clearRules();
+    setSelectedId(null);
+    setDraft(null);
+  };
+
   const patchDraft = (patch: Partial<HighlightRule>) =>
     setDraft((d) => (d ? { ...d, ...patch } : d));
 
@@ -250,7 +261,7 @@ export function HighlightRulesDialog({ onClose }: { onClose: () => void }) {
             </button>
             {rules.length > 0 && (
               <button
-                onClick={() => void clearRules()}
+                onClick={clearAll}
                 className="rounded px-2 py-1 text-xs text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-500/10"
               >
                 Clear all
