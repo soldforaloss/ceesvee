@@ -3210,8 +3210,16 @@ pub fn apply_facets(
         &diagnostics_cache,
         &crossval_cache,
     )?;
-    let rows = crate::facets::matching_rows(&doc, &config, &inputs)?;
-    doc.set_filter(rows)?;
+    match crate::facets::narrowing_rows(&doc, &config, &inputs)? {
+        Some(rows) => doc.set_filter(rows)?,
+        // A selection is active, but every active facet is unresolved (e.g. a
+        // saved view referencing a deleted column, or a status facet with no
+        // cached scan). Applying `matching_rows` here would pass every row and
+        // install an all-rows filter that falsely marks the document filtered.
+        // Clear the facet-driven view instead — the facet result already reports
+        // the facet as unresolved, and it must not narrow anything.
+        None => doc.clear_filter()?,
+    }
     Ok(doc.meta())
 }
 

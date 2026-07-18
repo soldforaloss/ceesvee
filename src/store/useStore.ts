@@ -184,6 +184,11 @@ let summariesTimer: ReturnType<typeof setTimeout> | null = null;
 // Debounce timer for the (backend-computed) facet counts + row view (F39), so a
 // burst of value toggles coalesces into one apply+compute round-trip.
 let facetsTimer: ReturnType<typeof setTimeout> | null = null;
+// Monotonic request token for facet syncs (F39). Each `syncFacets` captures the
+// value it bumped this to; after every await it re-checks that it is still the
+// newest in-flight sync and bails otherwise, so a slower response for an older
+// selection can never call `reloadDoc`/write results on top of a newer one.
+let facetSyncSeq = 0;
 
 /** Find-match cap for indexed read-only documents (F10). */
 export const INDEXED_FIND_LIMIT = 5000;
@@ -7038,6 +7043,11 @@ export const useStore = create<Store>((set, get) => {
       const dedup = dedupContext?.spec ?? null;
       const dedupScope = dedupContext?.scope ?? null;
       const active = anyFacetActive(config);
+      // Claim the newest-sync token before any await. A later sync (a newer
+      // selection) bumps this again; each await below re-checks it so a stale
+      // response for an older config can't clobber the newer one.
+      const token = ++facetSyncSeq;
+      const superseded = () => facetSyncSeq !== token || get().activeId !== meta.id;
       set((s) => ({ facets: { ...s.facets, loading: true, error: null } }));
       try {
         // 1. Drive the grid row view — but only touch the filter when a facet is
@@ -7047,6 +7057,9 @@ export const useStore = create<Store>((set, get) => {
         let working = meta;
         if (active || facets.applied) {
           const applied = await api.applyFacets(meta.id, config, meta.revision, dedup, dedupScope);
+          // A newer selection started syncing while applyFacets was in flight:
+          // drop this response so it can't apply an older config's row view.
+          if (superseded()) return;
           reloadDoc(applied);
           working = applied;
         }
@@ -7058,11 +7071,14 @@ export const useStore = create<Store>((set, get) => {
           dedup,
           dedupScope,
         );
-        if (get().activeId !== meta.id) return; // active doc changed underneath us
+        if (superseded()) return; // newer sync (or doc switch) owns the state now
         set((s) => ({
           facets: { ...s.facets, results, applied: active, loading: false, error: null },
         }));
       } catch (e) {
+        // Only the newest sync owns the loading/error state; a superseded sync
+        // that errors (e.g. a stale-revision rejection) must stay silent.
+        if (facetSyncSeq !== token) return;
         set((s) => ({ facets: { ...s.facets, loading: false, error: String(e) } }));
       }
     },

@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { AnnotationsView, DictionaryView, DocumentMeta, ProjectMeta } from "../types";
+import type {
+  AnnotationsView,
+  DictionaryView,
+  DocumentMeta,
+  FacetConfig,
+  FacetResultSet,
+  ProjectMeta,
+} from "../types";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), save: vi.fn() }));
 vi.mock("@tauri-apps/api/window", () => ({
@@ -28,6 +35,9 @@ vi.mock("../lib/tauri", () => ({
   annotationsView: vi.fn(),
   annotationsGetExport: vi.fn(),
   annotationsLoadExport: vi.fn().mockResolvedValue(undefined),
+  // F39 facets: apply drives the row view, compute returns cross-filtered counts.
+  applyFacets: vi.fn(),
+  computeFacets: vi.fn(),
 }));
 
 import * as api from "../lib/tauri";
@@ -649,5 +659,118 @@ describe("annotation persistence: sidecar vs project (F40)", () => {
     // The large read-only document reads its existing sidecar on open, so a
     // later edit merges instead of overwriting an empty store onto it.
     expect(api.annotationsLoadSidecar).toHaveBeenCalledWith(9, "C:/data/doc-9.csv");
+  });
+});
+
+describe("facet sync stale-response guard (F39)", () => {
+  interface Deferred<T> {
+    promise: Promise<T>;
+    resolve: (value: T) => void;
+  }
+  function deferred<T>(): Deferred<T> {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+  // Flush microtasks so a syncFacets awaiting a just-resolved deferred can run
+  // its next step before we resolve the following one.
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  function textConfig(id: string, value: string): FacetConfig {
+    return {
+      facets: [
+        {
+          id,
+          kind: "text",
+          columnId: "c0",
+          selection: { mode: "include", values: [value], range: {} },
+          pinned: false,
+          collapsed: false,
+        },
+      ],
+    };
+  }
+
+  function resultSet(matchedRows: number): FacetResultSet {
+    return {
+      revision: 2,
+      matchedRows,
+      totalRows: 100,
+      scannedRows: 100,
+      sampled: false,
+      facets: [],
+    };
+  }
+
+  const initialFacetsState = {
+    open: true,
+    config: { facets: [] } as FacetConfig,
+    results: null,
+    loading: false,
+    error: null,
+    applied: false,
+    dedupContext: null,
+  };
+
+  beforeEach(() => {
+    vi.mocked(api.applyFacets).mockReset();
+    vi.mocked(api.computeFacets).mockReset();
+    useStore.setState({
+      tabs: [meta(1)],
+      activeId: 1,
+      facets: { ...initialFacetsState },
+    });
+  });
+
+  it("drops a slower response for an older selection instead of clobbering the newer one", async () => {
+    const applyDeferreds: Deferred<DocumentMeta>[] = [];
+    const computeDeferreds: Deferred<FacetResultSet>[] = [];
+    vi.mocked(api.applyFacets).mockImplementation(() => {
+      const d = deferred<DocumentMeta>();
+      applyDeferreds.push(d);
+      return d.promise;
+    });
+    vi.mocked(api.computeFacets).mockImplementation(() => {
+      const d = deferred<FacetResultSet>();
+      computeDeferreds.push(d);
+      return d.promise;
+    });
+
+    // Sync A (selection "NYC") starts and blocks in applyFacets.
+    useStore.setState({
+      facets: { ...useStore.getState().facets, config: textConfig("f", "NYC") },
+    });
+    const syncA = useStore.getState().syncFacets();
+
+    // The user changes the selection to "LA"; sync B starts and blocks too.
+    useStore.setState({ facets: { ...useStore.getState().facets, config: textConfig("f", "LA") } });
+    const syncB = useStore.getState().syncFacets();
+
+    expect(applyDeferreds).toHaveLength(2);
+
+    // Newer sync B resolves fully first (fast backend for the newer config).
+    const metaB: DocumentMeta = { ...meta(1), revision: 2 };
+    applyDeferreds[1].resolve(metaB);
+    await flush();
+    const resultsB = resultSet(11);
+    computeDeferreds[0].resolve(resultsB);
+    await syncB;
+
+    // State now reflects B.
+    expect(useStore.getState().facets.results).toEqual(resultsB);
+    expect(useStore.getState().facets.applied).toBe(true);
+    expect(useStore.getState().tabs[0].revision).toBe(2);
+
+    // Now the STALE sync A finally returns from applyFacets. It must bail: no
+    // reloadDoc (revision stays B's 2, not A's 99) and no compute call for A.
+    const metaA: DocumentMeta = { ...meta(1), revision: 99 };
+    applyDeferreds[0].resolve(metaA);
+    await syncA;
+
+    expect(useStore.getState().tabs[0].revision).toBe(2); // A did not clobber
+    expect(useStore.getState().facets.results).toEqual(resultsB); // still B
+    expect(api.computeFacets).toHaveBeenCalledTimes(1); // A bailed before compute
   });
 });

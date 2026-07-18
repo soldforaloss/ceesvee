@@ -639,6 +639,31 @@ pub fn matching_rows(
     inputs: &FacetInputs,
 ) -> AppResult<Vec<usize>> {
     let built = build_facets(doc, config, inputs)?;
+    scan_matching(doc, &built)
+}
+
+/// Like [`matching_rows`], but returns `None` when no facet actually narrows the
+/// population — i.e. every *active* selection is unresolved (a deleted column, or
+/// an unavailable status input). `FacetConfig::any_active` can be true in that
+/// case, yet the only honest row view is "no facet filter": returning `Some(all
+/// rows)` would falsely mark the document filtered. Callers use `None` to leave
+/// the existing view / clear the facet filter instead of installing an all-rows
+/// one. When at least one facet resolves, the unresolved ones simply pass every
+/// row and the resolved ones do the narrowing.
+pub fn narrowing_rows(
+    doc: &Document,
+    config: &FacetConfig,
+    inputs: &FacetInputs,
+) -> AppResult<Option<Vec<usize>>> {
+    let built = build_facets(doc, config, inputs)?;
+    if !built.iter().any(|b| b.narrows) {
+        return Ok(None);
+    }
+    Ok(Some(scan_matching(doc, &built)?))
+}
+
+/// Full-document scan collecting the absolute indices every built facet admits.
+fn scan_matching(doc: &Document, built: &[BuiltFacet]) -> AppResult<Vec<usize>> {
     let mut out = Vec::new();
     doc.visit_rows(0..doc.n_rows(), &mut |i, row| {
         if built.iter().all(|b| b.eval.passes(i, row)) {
@@ -692,6 +717,11 @@ struct BuiltFacet {
     column_id: Option<String>,
     mode: FacetMode,
     eval: Eval,
+    /// This facet actually narrows the population: it carries an active
+    /// selection AND resolved (has a real evaluator). An active-but-unresolved
+    /// facet — a deleted column or an unavailable status input — is `false`, so
+    /// it is never mistaken for an all-rows constraint.
+    narrows: bool,
 }
 
 enum Eval {
@@ -736,12 +766,14 @@ fn build_facets(
     for spec in &config.facets {
         let mode = spec.selection.mode;
         let eval = build_eval(doc, spec, inputs)?;
+        let narrows = spec.selection_is_active() && !matches!(eval, Eval::Unresolved);
         out.push(BuiltFacet {
             id: spec.id.clone(),
             kind: spec.kind,
             column_id: spec.column_id.clone(),
             mode,
             eval,
+            narrows,
         });
     }
     Ok(out)
@@ -1446,18 +1478,19 @@ fn convert_facet(spec: &FacetSpec, col: Option<usize>) -> Result<Option<FilterNo
                     nodes,
                 })))
             } else {
-                // Complement of a range: below min OR above max.
-                let mut nodes = Vec::new();
-                if let Some(lo) = min {
-                    nodes.push(condition(col, FilterOp::Lt, lo, false));
-                }
-                if let Some(hi) = max {
-                    nodes.push(condition(col, FilterOp::Gt, hi, false));
-                }
-                Ok(Some(FilterNode::Group(FilterGroup {
-                    conjunction: Conjunction::Or,
-                    nodes,
-                })))
+                // Exclude keeps every row the include predicate rejects: not just
+                // the parseable out-of-range cells, but also the blank/null/invalid
+                // ones (the facet negates `parses && in range`). A `< min OR > max`
+                // filter can only ever match parseable, out-of-range cells — the
+                // filter engine's typed comparisons never match blank/invalid — so
+                // emitting it would silently drop the blank/unparseable rows the
+                // facet keeps. There is no filter op for "not a valid number/date",
+                // so report the exclusion as lossy instead of inverting semantics.
+                Err(
+                    "exclude-mode number/date ranges have no exact filter equivalent \
+                     (they also keep blank and unparseable cells)"
+                        .into(),
+                )
             }
         }
         FacetKind::Nullability => {
@@ -1998,6 +2031,44 @@ mod tests {
     }
 
     #[test]
+    fn exclude_range_is_reported_lossy_not_inverted() {
+        // Number column with a blank cell (row 1); the second column keeps the
+        // blank line from being skipped as an all-empty row.
+        let d = doc("n,k\n10,a\n,b\n40,c\n");
+        let mut s = spec("n", FacetKind::Number, "c0");
+        s.selection = FacetSelection {
+            mode: FacetMode::Exclude,
+            values: vec![],
+            range: FacetRange {
+                min: Some("20".into()),
+                max: None,
+            },
+        };
+        let cfg = FacetConfig { facets: vec![s] };
+
+        // The exclude facet keeps every row that is NOT (parseable AND >= 20):
+        // the below-range 10 (row 0) AND the blank cell (row 1). 40 is dropped.
+        assert_eq!(
+            matching_rows(&d, &cfg, &FacetInputs::default()).unwrap(),
+            vec![0, 1]
+        );
+
+        // Converting must NOT emit a `< 20` filter — that would silently drop the
+        // blank row the facet keeps (typed comparisons never match blank/invalid).
+        // It reports the facet as lossy/dropped instead of inverting semantics.
+        let conv = to_filter_group(&d, &cfg);
+        assert!(
+            conv.filter.nodes.is_empty(),
+            "no inverted range filter is emitted for an exclude range"
+        );
+        let ids: HashSet<&str> = conv.dropped.iter().map(|d| d.id.as_str()).collect();
+        assert!(
+            ids.contains("n"),
+            "the exclude range is reported as dropped"
+        );
+    }
+
+    #[test]
     fn nullability_blank_converts_to_is_empty() {
         // The second column keeps the blank-cell row from being an all-empty
         // line, which the parser would skip entirely.
@@ -2027,6 +2098,44 @@ mod tests {
         assert_eq!(
             matching_rows(&d, &cfg, &FacetInputs::default()).unwrap(),
             vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn narrowing_rows_skips_apply_when_only_unresolved_facets_are_active() {
+        let d = sample_doc();
+        let mut cfg = FacetConfig {
+            facets: vec![spec("gone", FacetKind::Text, "c99")], // deleted column
+        };
+        cfg.facets[0].selection = include(&["NYC"]); // active, but unresolved
+
+        // `any_active` is true, yet nothing resolves to a real constraint, so
+        // apply must be a no-op (None) rather than an all-rows filter that would
+        // falsely mark the document filtered.
+        assert!(cfg.any_active());
+        assert_eq!(
+            narrowing_rows(&d, &cfg, &FacetInputs::default()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn narrowing_rows_applies_resolved_and_ignores_unresolved() {
+        let d = sample_doc();
+        let mut cfg = FacetConfig {
+            facets: vec![
+                spec("city", FacetKind::Text, "c0"),  // resolved -> narrows
+                spec("gone", FacetKind::Text, "c99"), // active but unresolved
+            ],
+        };
+        cfg.facets[0].selection = include(&["NYC"]); // city=NYC -> {0,1,4}
+        cfg.facets[1].selection = include(&["x"]); // unresolved: passes every row
+
+        // The resolved facet narrows; the unresolved one is ignored (not treated
+        // as an all-rows constraint that would wipe out the narrowing).
+        assert_eq!(
+            narrowing_rows(&d, &cfg, &FacetInputs::default()).unwrap(),
+            Some(vec![0, 1, 4])
         );
     }
 
