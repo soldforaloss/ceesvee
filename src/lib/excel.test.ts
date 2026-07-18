@@ -297,7 +297,7 @@ describe("sizingForScope", () => {
       columns: 4,
     });
     expect(sizingForScope("S", { type: "selectedColumns", columns: [0, 2] }, dims)).toMatchObject({
-      dataRows: 100,
+      dataRows: 30,
       columns: 2,
     });
     expect(
@@ -307,6 +307,21 @@ describe("sizingForScope", () => {
         dims,
       ),
     ).toMatchObject({ dataRows: 9, columns: 2 });
+  });
+
+  it("counts only the visible rows for selected columns under a filter", () => {
+    // A million-plus-row document filtered down to a subset within Excel's
+    // limit: exporting selected columns must size on the visible rows (what
+    // the backend writes), so the up-front limit check does not block it.
+    const filtered = {
+      totalRows: EXCEL_MAX_ROWS + 500,
+      visibleRows: 10,
+      columns: 4,
+      hasHeader: true,
+    };
+    const sizing = sizingForScope("S", { type: "selectedColumns", columns: [0, 2] }, filtered);
+    expect(sizing).toMatchObject({ dataRows: 10, columns: 2 });
+    expect(checkExportLimits([sizing])).toEqual([]);
   });
 });
 

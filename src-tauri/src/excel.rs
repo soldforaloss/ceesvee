@@ -581,7 +581,10 @@ pub fn inspect(path: &Path, ctx: Option<&JobCtx>) -> AppResult<WorkbookInfo> {
             name: meta.name.clone(),
             visibility: visibility_name(meta.visible).to_string(),
             kind: sheet_kind_name(meta.typ).to_string(),
-            has_data: range.is_some(),
+            // A worksheet with no used cells still yields `Some(range)` whose
+            // extents are empty; that is not importable data, so gate on the
+            // used dimensions rather than the mere presence of a range.
+            has_data: used_rows > 0 && used_cols > 0,
             start_row,
             start_col,
             used_rows,
@@ -2011,6 +2014,35 @@ mod tests {
         assert_eq!(rows[1], vec!["4".to_string(), "6".to_string()]);
     }
 
+    #[test]
+    fn forced_indexed_import_is_read_only_but_starts_unsaved() {
+        // `forceIndexed` spills to the read-only indexed backing. The result is
+        // still a brand-new document with no source CSV, so it must start dirty
+        // (closing warns, Save routes to Save As) rather than looking clean and
+        // silently dropping the just-imported data on close.
+        let (_dir, path) = book(|wb| {
+            let ws = wb.add_worksheet();
+            ws.set_name("Sheet1")?;
+            ws.write_string(0, 0, "id")?;
+            ws.write_string(0, 1, "name")?;
+            ws.write_number(1, 0, 1)?;
+            ws.write_string(1, 1, "Ada")?;
+            Ok(())
+        });
+        let opts = ExcelImportOptions {
+            force_indexed: true,
+            ..sheet_opts("Sheet1")
+        };
+        let (_cache, doc) = import_grid(&path, &opts);
+        assert!(
+            !doc.is_editable(),
+            "forceIndexed opens the read-only backing"
+        );
+        assert!(doc.is_dirty(), "a fresh indexed import starts unsaved");
+        assert!(doc.meta().path.is_none(), "no source path yet");
+        assert_eq!(doc.n_rows(), 1);
+    }
+
     // ----- inspection ---------------------------------------------------------
 
     #[test]
@@ -2037,6 +2069,29 @@ mod tests {
         assert_eq!(data.merged_count, 1);
         let secret = info.sheets.iter().find(|s| s.name == "Secret").unwrap();
         assert_eq!(secret.visibility, "hidden");
+    }
+
+    #[test]
+    fn inspect_does_not_mark_an_empty_worksheet_as_having_data() {
+        // A blank first sheet must not look importable: calamine returns a
+        // `Some(range)` with empty extents for it, so `has_data` has to gate on
+        // the used dimensions, letting the chooser fall through to a real sheet.
+        let (_dir, path) = book(|wb| {
+            let blank = wb.add_worksheet();
+            blank.set_name("Blank")?;
+            let data = wb.add_worksheet();
+            data.set_name("Data")?;
+            data.write_string(0, 0, "id")?;
+            data.write_number(1, 0, 1)?;
+            Ok(())
+        });
+        let info = inspect(&path, None).unwrap();
+        let blank = info.sheets.iter().find(|s| s.name == "Blank").unwrap();
+        assert!(!blank.has_data, "an empty worksheet is not importable");
+        assert_eq!(blank.used_rows, 0);
+        assert_eq!(blank.used_cols, 0);
+        let data = info.sheets.iter().find(|s| s.name == "Data").unwrap();
+        assert!(data.has_data, "the populated worksheet has data");
     }
 
     // ----- export limits ------------------------------------------------------

@@ -350,7 +350,8 @@ export interface DocDimensions {
 /**
  * Project a scope onto a document to get the sheet's output size. Mirrors the
  * shape of `export_scope::resolve_scope`: `all` writes every row, `visibleRows`
- * the filtered/view rows, the selection scopes their own extents.
+ * and `selectedColumns` the filtered/view rows, and the row/range selections
+ * scope their own extents.
  */
 export function sizingForScope(name: string, scope: ExportScope, dims: DocDimensions): SheetSizing {
   switch (scope.type) {
@@ -366,9 +367,12 @@ export function sizingForScope(name: string, scope: ExportScope, dims: DocDimens
         hasHeader: dims.hasHeader,
       };
     case "selectedColumns":
+      // The backend exports the VISIBLE rows of the selected columns, so a
+      // filtered view whose subset fits Excel's limit must not be blocked on
+      // the unfiltered total.
       return {
         name,
-        dataRows: dims.totalRows,
+        dataRows: dims.visibleRows,
         columns: scope.columns.length,
         hasHeader: dims.hasHeader,
       };
