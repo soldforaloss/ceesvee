@@ -217,6 +217,21 @@ and faithful on large, real-world delimited files.**
   blanks, distinct counts (exact, or estimated once cardinality explodes), top
   values, numeric quartiles, date extremes, and text-length stats — over all
   rows or just the visible ones, with click-to-filter straight from the panel.
+- **Multi-facet exploration** — explore several dimensions at once, beyond the
+  single-column explorer: add facet panels for value counts (top-N with a
+  search box for high-cardinality columns), a numeric or date histogram with a
+  range selection, true/false, blank / null-token / invalid nullability, a
+  semantic type, or row-level status (diagnostics, validation, duplicate group,
+  and bookmarked / flagged / tagged). Several facets stay active at once — the
+  grid row view is the AND across panels and the OR (with a per-facet
+  include/exclude toggle) among the selected values inside one — and every
+  facet's counts recompute against the population filtered by all the _other_
+  facets (classic faceted search). Reorder, pin, collapse, or remove panels;
+  copy a facet's values and counts; save the facet configuration inside a named
+  view; and convert the active facets to the standard filter builder in one
+  step. Counts on a very large indexed document may be estimated from a leading
+  sample (marked as such) while the applied row filter stays exact; faceting
+  never dirties the document, and visible-row export respects the facet filter.
 - **File profiles** — save delimiter / encoding / header choices, expected
   columns, and validation rules (required, unique, type, regex, numeric range)
   under a name matched to file patterns; matching files suggest — or with
