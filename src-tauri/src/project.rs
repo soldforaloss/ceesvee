@@ -939,6 +939,7 @@ fn remove_source(sections: &mut ProjectSections, id: &str) {
     sections.views.retain(|v| v.source_id != id);
     sections.schemas.retain(|s| s.source_id != id);
     sections.row_keys.retain(|k| k.source_id != id);
+    sections.dictionary.retain(|d| d.source_id != id);
     sections
         .join_mappings
         .retain(|j| j.left_source_id != id && j.right_source_id != id);
@@ -1311,6 +1312,7 @@ fn strip_sources(sections: &mut ProjectSections) {
     sections.views.clear();
     sections.schemas.clear();
     sections.row_keys.clear();
+    sections.dictionary.clear();
     sections.join_mappings.clear();
     sections.comparisons.clear();
     for profile in &mut sections.profiles {
@@ -2160,6 +2162,37 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_source_prunes_its_dictionary_section() {
+        // A per-source dictionary is source-specific metadata (keyed by
+        // `source_id`), so removing a source must drop its dictionary entry the
+        // same way views/schemas/row-keys are cascaded — otherwise a later save
+        // or template would keep documentation for a source that no longer
+        // exists.
+        let dir = tempfile::tempdir().unwrap();
+        let (file, _, _) = full_project(dir.path());
+        let mut sections = file.sections;
+        // full_project documents srcA; document srcB too so the removal has a
+        // dictionary entry to prune while srcA's is left intact.
+        sections.dictionary.push(SourceDictionary {
+            source_id: "srcB".into(),
+            dictionary: a_dictionary(),
+        });
+        assert_eq!(sections.dictionary.len(), 2);
+
+        remove_source(&mut sections, "srcB");
+
+        assert_eq!(
+            sections.dictionary.len(),
+            1,
+            "srcB's dictionary section is dropped with the source"
+        );
+        assert_eq!(
+            sections.dictionary[0].source_id, "srcA",
+            "srcA's dictionary survives"
+        );
+    }
+
+    #[test]
     fn a_missing_source_without_a_resolution_cancels_the_whole_open() {
         let dir = tempfile::tempdir().unwrap();
         let (file, a, _b) = full_project(dir.path());
@@ -2235,6 +2268,7 @@ mod tests {
         assert_eq!(sections["views"], serde_json::json!([]));
         assert_eq!(sections["schemas"], serde_json::json!([]));
         assert_eq!(sections["rowKeys"], serde_json::json!([]));
+        assert_eq!(sections["dictionary"], serde_json::json!([]));
         assert_eq!(sections["joinMappings"], serde_json::json!([]));
         assert_eq!(sections["comparisons"], serde_json::json!([]));
         assert_eq!(sections["tabs"]["open"], serde_json::json!([]));
@@ -2344,6 +2378,7 @@ mod tests {
         let fresh = new_project(Some(&path)).unwrap();
         assert!(fresh.file.sections.sources.is_empty());
         assert!(fresh.file.sections.comparisons.is_empty());
+        assert!(fresh.file.sections.dictionary.is_empty());
         assert_eq!(fresh.file.sections.profiles.len(), 1);
     }
 
