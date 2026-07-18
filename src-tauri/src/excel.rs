@@ -1320,6 +1320,15 @@ fn write_typed(
             Ok(true)
         }
         CellState::Valid(TypedValue::Date(d)) => {
+            // Excel dates live in 1900..=9999. A schema-typed year outside that
+            // window (reachable when a custom input format parses a signed
+            // out-of-range year, e.g. `+67536-01-01`) must fall back to text —
+            // the `as u16` cast below truncates modulo 65536, which could
+            // otherwise pass rust_xlsxwriter's own 1900..=9999 check as a
+            // bogus-but-valid in-range date and silently corrupt the value.
+            if !(1900..=9999).contains(&d.year()) {
+                return Ok(false);
+            }
             match ExcelDateTime::from_ymd(d.year() as u16, d.month() as u8, d.day() as u8) {
                 Ok(edt) => {
                     ws.write_datetime_with_format(row, col, &edt, date_fmt)
@@ -1330,6 +1339,11 @@ fn write_typed(
             }
         }
         CellState::Valid(TypedValue::DateTime(dt)) => {
+            // Same 1900..=9999 guard as the date branch, before the `as u16`
+            // truncation, so an out-of-range year falls back to text.
+            if !(1900..=9999).contains(&dt.year()) {
+                return Ok(false);
+            }
             let built = ExcelDateTime::from_ymd(dt.year() as u16, dt.month() as u8, dt.day() as u8)
                 .and_then(|d| d.and_hms(dt.hour() as u16, dt.minute() as u8, dt.second() as f64));
             match built {
@@ -1655,6 +1669,77 @@ mod tests {
         assert_eq!(format_excel_datetime(&d1900), "2020-01-01");
         assert_eq!(format_excel_datetime(&d1904), "2024-01-02");
         assert_ne!(format_excel_datetime(&d1900), format_excel_datetime(&d1904));
+    }
+
+    /// A cell written as a raw serial number carrying a date number-format, so
+    /// calamine classifies it as a real `Data::DateTime` on the workbook epoch
+    /// (the path `write_datetime` cannot express — it refuses pre-1900 serials
+    /// like the leap-bug's serial 60).
+    fn date_cell(ws: &mut rust_xlsxwriter::Worksheet, row: u32, col: u16, serial: f64) {
+        let fmt = XFormat::new().set_num_format("yyyy-mm-dd");
+        ws.write_number_with_format(row, col, serial, &fmt).unwrap();
+    }
+
+    #[test]
+    fn real_date_cell_reproduces_1900_leap_bug_through_import() {
+        // Serial 60 is Excel's phantom 1900-02-29. Drive it through the FULL
+        // read pipeline (open_workbook → worksheet_range → data_to_cell →
+        // materialize → import), not just the isolated formatter.
+        let (_dir, path) = book(|wb| {
+            let ws = wb.add_worksheet();
+            ws.set_name("Sheet1")?;
+            ws.write_string(0, 0, "d")?;
+            date_cell(ws, 1, 0, 60.0);
+            date_cell(ws, 2, 0, 61.0);
+            Ok(())
+        });
+        let (_cache, doc) = import_grid(&path, &sheet_opts("Sheet1"));
+        assert_eq!(doc.headers(), &["d"]);
+        let rows = doc.fetch_rows(&[0, 1]).unwrap();
+        assert_eq!(rows[0][0], "1900-02-29", "phantom leap day survives import");
+        assert_eq!(rows[1][0], "1900-03-01");
+        // The column is inferred as a datetime and carries that schema.
+        assert_eq!(
+            doc.column_schema_at(0).map(|s| s.logical_type),
+            Some(LogicalType::Datetime),
+        );
+    }
+
+    #[test]
+    fn workbook_1904_epoch_is_plumbed_through_inspect_and_import() {
+        // Serial 43831 is 2020-01-01 under the default 1900 epoch.
+        let (dir, path) = book(|wb| {
+            let ws = wb.add_worksheet();
+            ws.set_name("Sheet1")?;
+            ws.write_string(0, 0, "d")?;
+            date_cell(ws, 1, 0, 43831.0);
+            Ok(())
+        });
+
+        // Baseline (default epoch): the flag is false and the date reads 2020.
+        let info0 = inspect(&path, None).unwrap();
+        assert!(!info0.has_1904_epoch);
+        let (_c0, doc0) = import_grid(&path, &sheet_opts("Sheet1"));
+        assert_eq!(doc0.fetch_rows(&[0]).unwrap()[0][0], "2020-01-01");
+
+        // Inject the 1904 epoch flag exactly as a 1904 workbook stores it
+        // (`<workbookPr date1904="1"/>`), leaving the serial untouched.
+        let patched = dir.path().join("book1904.xlsx");
+        patch_entry(&path, &patched, "xl/workbook.xml", |xml| {
+            assert!(xml.contains("<workbookPr"), "workbook.xml has a workbookPr");
+            xml.replace("<workbookPr", "<workbookPr date1904=\"1\"")
+        });
+
+        // The epoch flag is read from the real file …
+        let info = inspect(&patched, None).unwrap();
+        assert!(
+            info.has_1904_epoch,
+            "the 1904 epoch flag is plumbed from the workbook into WorkbookInfo"
+        );
+        // … and honoured, not shifted: the SAME serial now reads 1462 days
+        // later (2024-01-02), never silently re-interpreted on the 1900 epoch.
+        let (_c1, doc1) = import_grid(&patched, &sheet_opts("Sheet1"));
+        assert_eq!(doc1.fetch_rows(&[0]).unwrap()[0][0], "2024-01-02");
     }
 
     // ----- leading-zero text + type inference ---------------------------------
@@ -2085,6 +2170,54 @@ mod tests {
         assert_eq!(
             r.get_value((1, 2)).and_then(|d| d.as_date()),
             chrono::NaiveDate::from_ymd_opt(2020, 1, 15)
+        );
+    }
+
+    #[test]
+    fn typed_export_out_of_range_year_falls_back_to_text() {
+        // A custom input format can parse a signed year outside Excel's
+        // 1900..=9999 window. `67536 as u16 == 2000`, which would pass
+        // rust_xlsxwriter's own bounds check and write a bogus year-2000 date;
+        // the guard must instead fall back to text and preserve the source.
+        let mut d = doc_from("d\n+67536-01-01\n", true);
+        let ids = d.column_ids().to_vec();
+        let mut sch = ColumnSchema::new(ids[0].clone(), "d", LogicalType::Date);
+        sch.input_formats = Some(vec!["%Y-%m-%d".to_string()]);
+        // Precondition: the value really is a Valid Date under the format (chrono
+        // accepts signed out-of-range years), so the text fallback below is the
+        // year-guard's doing, not a mere parse failure.
+        assert!(
+            matches!(
+                schema::classify(Some("+67536-01-01"), &sch),
+                CellState::Valid(TypedValue::Date(_))
+            ),
+            "the out-of-range year must classify as a Valid Date"
+        );
+        d.set_column_schema(sch);
+        let revision = d.revision();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("oor.xlsx");
+        let sources = [SheetSource {
+            doc: &d,
+            name: "S".to_string(),
+            scope: ExportScope::All,
+            expected_revision: revision,
+            grid_widths_px: None,
+        }];
+        let opts = ExcelExportOptions {
+            typed: true,
+            ..Default::default()
+        };
+        let (_reg, c) = ctx();
+        export(&sources, &dest, &opts, &c).unwrap();
+
+        let mut wb: Xlsx<_> = cal_open(&dest).unwrap();
+        let r = wb.worksheet_range("S").unwrap();
+        // Preserved as text — NOT a truncated year-2000 date cell.
+        assert_eq!(
+            r.get_value((1, 0)),
+            Some(&Data::String("+67536-01-01".into()))
         );
     }
 

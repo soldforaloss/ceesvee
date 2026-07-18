@@ -4,6 +4,7 @@ import {
   buildImportOptions,
   defaultImportUi,
   defaultSource,
+  headerCandidateChips,
   isValidA1Range,
   sheetKindLabel,
   visibilityLabel,
@@ -238,7 +239,11 @@ export function ExcelOpenDialog() {
                 {(source?.kind === "sheet" || source?.kind === "namedRange") && (
                   <HeaderPicker
                     ui={ui}
-                    candidates={selectedSheet?.headerCandidates ?? []}
+                    candidates={headerCandidateChips(
+                      source,
+                      selectedSheet?.headerCandidates,
+                      ui.range,
+                    )}
                     onChange={patchUi}
                   />
                 )}

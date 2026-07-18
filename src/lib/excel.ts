@@ -87,6 +87,29 @@ export function buildImportOptions(source: ExcelSource, ui: ExcelImportUi): Exce
 }
 
 /**
+ * The detected header-row candidate offsets to surface as one-click chips.
+ *
+ * The backend computes these offsets relative to the sheet's whole used-range
+ * start (they index the rows the import reads when the WHOLE used range is
+ * scanned). As soon as a custom A1 sub-range is entered, the import reads from
+ * that sub-range's origin instead, so a sheet-relative candidate offset no
+ * longer lines up — applying it would mis-select the header row (or error).
+ * We therefore surface candidates only for a sheet source with no custom range
+ * (and never for a table/named-range source, whose header is intrinsic/fixed).
+ * The manual "Row N" control, whose index is region-relative by construction,
+ * still works against any chosen range.
+ */
+export function headerCandidateChips(
+  source: ExcelSource | null,
+  sheetCandidates: number[] | undefined,
+  rangeText: string,
+): number[] {
+  if (!source || source.kind !== "sheet") return [];
+  if (rangeText.trim() !== "") return [];
+  return sheetCandidates ?? [];
+}
+
+/**
  * Pick the source the chooser should select by default: the first visible
  * worksheet that has data, else the first worksheet with data, else the first
  * table (data beats an empty sheet), else the first worksheet, else null (an

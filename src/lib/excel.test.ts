@@ -10,6 +10,7 @@ import {
   EXCEL_MAX_COLS,
   EXCEL_MAX_ROWS,
   gridWidthsPx,
+  headerCandidateChips,
   isValidA1Range,
   outputColumnsForScope,
   sanitizeSheetName,
@@ -136,6 +137,32 @@ describe("defaultSource", () => {
 
   it("returns null for an empty workbook", () => {
     expect(defaultSource(workbook({}))).toBeNull();
+  });
+});
+
+// ----- detected header-row chips ---------------------------------------------
+
+describe("headerCandidateChips", () => {
+  it("surfaces the sheet's candidates for a whole-used-range sheet source", () => {
+    expect(headerCandidateChips({ kind: "sheet", name: "Data" }, [0, 2], "")).toEqual([0, 2]);
+    // Whitespace-only range still counts as "the whole used range".
+    expect(headerCandidateChips({ kind: "sheet", name: "Data" }, [1], "   ")).toEqual([1]);
+  });
+
+  it("hides candidates once a custom A1 range is entered (offsets no longer align)", () => {
+    // The candidate offsets are sheet-used-range-relative; a sub-range shifts
+    // the import origin, so applying them would mis-select the header row.
+    expect(headerCandidateChips({ kind: "sheet", name: "Data" }, [0, 2], "B5:F99")).toEqual([]);
+  });
+
+  it("never surfaces candidates for a table or named-range source", () => {
+    expect(headerCandidateChips({ kind: "table", name: "T" }, [0, 2], "")).toEqual([]);
+    expect(headerCandidateChips({ kind: "namedRange", name: "R" }, [0, 2], "")).toEqual([]);
+    expect(headerCandidateChips(null, [0, 2], "")).toEqual([]);
+  });
+
+  it("tolerates an undefined candidate list", () => {
+    expect(headerCandidateChips({ kind: "sheet", name: "Data" }, undefined, "")).toEqual([]);
   });
 });
 
