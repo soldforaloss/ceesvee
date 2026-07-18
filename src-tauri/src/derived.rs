@@ -23,6 +23,7 @@ const CELL_OVERHEAD: u64 = 32;
 
 pub struct DerivedDocumentBuilder {
     headers: Vec<String>,
+    has_header_row: bool,
     cache_root: PathBuf,
     budget: u64,
     rows: Vec<Vec<String>>,
@@ -43,6 +44,7 @@ impl DerivedDocumentBuilder {
     pub fn new(headers: Vec<String>, cache_root: PathBuf, budget: u64) -> DerivedDocumentBuilder {
         DerivedDocumentBuilder {
             headers,
+            has_header_row: true,
             cache_root,
             budget,
             rows: Vec::new(),
@@ -50,6 +52,20 @@ impl DerivedDocumentBuilder {
             row_count: 0,
             spill: None,
         }
+    }
+
+    /// Declare whether the supplied names are a real header row (`true`, the
+    /// default) or synthetic positional placeholders standing in for a
+    /// header-less source (`false`). When `false`, the names are used only as
+    /// internal column widths/labels and are NOT emitted as a header record, so
+    /// a document derived from a header-less source stays header-less — matching
+    /// the CSV export path, which honours
+    /// [`crate::tabular::TabularSource::has_header_row`]. Without this, the placeholder `Column N` labels
+    /// would leak into the derived document as a genuine header and reappear as
+    /// an extra line on the next save/export.
+    pub fn with_header_row(mut self, has_header_row: bool) -> DerivedDocumentBuilder {
+        self.has_header_row = has_header_row;
+        self
     }
 
     pub fn row_count(&self) -> usize {
@@ -88,7 +104,9 @@ impl DerivedDocumentBuilder {
         let mut writer = csv::WriterBuilder::new()
             .delimiter(b',')
             .from_writer(std::io::BufWriter::new(file));
-        writer.write_record(&self.headers)?;
+        if self.has_header_row {
+            writer.write_record(&self.headers)?;
+        }
         for row in self.rows.drain(..) {
             writer.write_record(&row)?;
         }
@@ -112,10 +130,12 @@ impl DerivedDocumentBuilder {
     ) -> AppResult<Document> {
         match self.spill {
             None => {
-                let mut records = Vec::with_capacity(self.rows.len() + 1);
-                records.push(self.headers.clone());
-                records.extend(self.rows);
                 let n_cols = self.headers.len();
+                let mut records = Vec::with_capacity(self.rows.len() + 1);
+                if self.has_header_row {
+                    records.push(self.headers.clone());
+                }
+                records.extend(self.rows);
                 let parsed = ParsedFile {
                     records,
                     n_cols,
@@ -125,7 +145,7 @@ impl DerivedDocumentBuilder {
                     uses_crlf: false,
                     import: ImportInfo::default(),
                 };
-                let mut doc = Document::from_parsed(doc_id, None, parsed, true);
+                let mut doc = Document::from_parsed(doc_id, None, parsed, self.has_header_row);
                 doc.mark_derived_unsaved();
                 Ok(doc)
             }
@@ -140,7 +160,7 @@ impl DerivedDocumentBuilder {
                 let settings = index::IndexSettings {
                     delimiter: Some(b','),
                     encoding: Some(encoding_rs::UTF_8),
-                    has_header_row: Some(true),
+                    has_header_row: Some(self.has_header_row),
                     chunk_size: 0,
                 };
                 let indexed = index::build_index(&path, &self.cache_root, &settings, progress)?;
@@ -237,6 +257,41 @@ mod tests {
         assert_eq!(rows[0][0], "he said \"hi\"");
         assert_eq!(rows[0][1], "two\nlines");
         assert_eq!(rows[1][0], "comma, inside");
+    }
+
+    #[test]
+    fn headerless_in_memory_output_omits_the_synthetic_header() {
+        // `with_header_row(false)` marks the supplied names as placeholders for
+        // a header-less source: they must NOT be written as a real header row.
+        let (_dir, b) = builder(SPILL_BUDGET);
+        let mut b = b.with_header_row(false);
+        b.push_row(vec!["1".into(), "x".into()]).unwrap();
+        b.push_row(vec!["2".into(), "y".into()]).unwrap();
+        assert!(!b.spilled());
+        let doc = b.finish(1, &mut |_| Ok(())).unwrap();
+        assert!(!doc.has_header_row(), "header-less provenance is preserved");
+        assert_eq!(doc.n_rows(), 2, "no row was consumed as a header");
+        assert_eq!(doc.rows()[0], vec!["1".to_string(), "x".to_string()]);
+        // Labels fall back to synthetic placeholders (never the input names).
+        assert_eq!(doc.headers(), &["Column 1", "Column 2"]);
+    }
+
+    #[test]
+    fn headerless_spilled_output_omits_the_synthetic_header() {
+        // The same must hold once the output spills to an indexed CSV: the
+        // spill file gets no header line and the index opens header-less.
+        let (_dir, b) = builder(1); // a tiny budget forces the spill immediately
+        let mut b = b.with_header_row(false);
+        for i in 0..30 {
+            b.push_row(vec![format!("{i}"), format!("v{i}")]).unwrap();
+        }
+        assert!(b.spilled());
+        let doc = b.finish(2, &mut |_| Ok(())).unwrap();
+        assert!(!doc.has_header_row(), "spilled output stays header-less");
+        assert_eq!(doc.n_rows(), 30, "the spill wrote no synthetic header line");
+        let rows = doc.fetch_rows(&[0, 29]).unwrap();
+        assert_eq!(rows[0], vec!["0".to_string(), "v0".to_string()]);
+        assert_eq!(rows[1], vec!["29".to_string(), "v29".to_string()]);
     }
 
     #[test]

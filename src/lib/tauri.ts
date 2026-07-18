@@ -71,6 +71,9 @@ import type {
   ReshapePreview,
   ReshapeSpec,
   RowsResponse,
+  SamplePreview,
+  SampleRequest,
+  SampleStart,
   ScopeCounts,
   SelectionStats,
   SemanticAction,
@@ -415,6 +418,26 @@ export const previewGroupBy = (docId: number, spec: GroupBySpec, expectedRevisio
 /** Run a group-by as a cancellable "derive" job into a NEW document (F22). */
 export const startGroupBy = (docId: number, spec: GroupBySpec, expectedRevision: number) =>
   invoke<IndexedOpenStart>("start_group_by", { docId, spec, expectedRevision });
+
+/**
+ * Preview a sampling/partitioning run (F48): resolves the seed, sizes the
+ * scope, and reports projected + exact per-output counts (plus a strata table
+ * and warnings). Read-only and revision-guarded; nothing is created.
+ */
+export const previewSample = (docId: number, request: SampleRequest, expectedRevision: number) =>
+  invoke<SamplePreview>("preview_sample", { docId, request, expectedRevision });
+
+/**
+ * Run a sampling/partitioning operation as a cancellable job (F48). `seed` is
+ * the value surfaced by `previewSample` — pass it back for reproducibility.
+ * Outputs become NEW derived documents (the returned `docIds`) or CSV files.
+ */
+export const startSample = (
+  docId: number,
+  request: SampleRequest,
+  seed: number,
+  expectedRevision: number,
+) => invoke<SampleStart>("start_sample", { docId, request, seed, expectedRevision });
 
 /** Cardinality preview of a join — creates nothing (F21). */
 export const previewJoin = (

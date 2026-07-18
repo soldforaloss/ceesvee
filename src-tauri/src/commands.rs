@@ -51,6 +51,9 @@ use crate::recipe::{self, BatchOptions, BatchReport, RecipeCache};
 use crate::reopen::{self, CurrentInterpretation};
 use crate::repair::{self, RepairPreview, RepairSpec};
 use crate::reshape::{self, ReshapePreview, ReshapeSpec};
+use crate::sampling::{
+    self, SampleDestination, SamplePlan, SamplePreview, SampleRequest, SampleStart,
+};
 use crate::schema::{ColumnSchema, DocumentSchema, SchemaIssue};
 use crate::schema_ops::{
     self, CellEditValidation, ConvertPreview, InvalidSampleReport, SchemaImportOutcome, SchemaInfo,
@@ -61,6 +64,7 @@ use crate::semantic::{
 };
 use crate::settings::{self, AppSettings, FileProfile, ProfileValidation};
 use crate::state::{AppState, PendingFiles, SharedDocument};
+use crate::tabular::DocumentSource;
 use crate::transform::{self, TransformErrorPolicy, TransformPreview, TransformSpec};
 use crate::{
     encoding, export, export_scope, filter as filter_mod, find as find_mod, index, json_export,
@@ -2226,6 +2230,131 @@ pub async fn start_join(
         .await;
     });
     Ok(IndexedOpenStart { job_id, doc_id })
+}
+
+/// Preview a sampling/partitioning run (F48): resolves the seed (drawing a
+/// crypto-random one when none is supplied), sizes the scope, and reports both
+/// the projected and the exact per-output counts (plus a strata table and any
+/// warnings). Read-only and revision-guarded; nothing is created.
+#[tauri::command]
+pub async fn preview_sample(
+    doc_id: u64,
+    request: SampleRequest,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<SamplePreview> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+        let source = DocumentSource::new(&doc);
+        let universe = sampling::universe_for(&doc, request.scope);
+        sampling::preview(&source, &universe, &request, doc.revision(), None)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Run a sampling/partitioning operation as a cancellable job (F48). `seed` is
+/// the value surfaced by [`preview_sample`] — pass it back for reproducibility.
+/// Outputs become NEW derived documents (the returned `doc_ids`, registered
+/// only once the whole job succeeds so a cancel leaves nothing behind) or CSV
+/// files with an optional manifest (a cancel removes every committed file).
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn start_sample(
+    doc_id: u64,
+    request: SampleRequest,
+    seed: u64,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<SampleStart> {
+    let handle = doc_handle(&state, doc_id)?;
+    let n_outputs = match &request.plan {
+        SamplePlan::Sampling(_) => 1,
+        SamplePlan::Partitioning(spec) => spec.parts.len(),
+    };
+    let derived = matches!(request.destination, SampleDestination::DerivedDocuments);
+    let cache_root = index_cache_root(&app)?;
+
+    // Reserve the output document ids up front (derived destination only).
+    let doc_ids: Vec<u64> = if derived {
+        let mut guard = lock(&state)?;
+        (0..n_outputs).map(|_| guard.alloc_id()).collect()
+    } else {
+        Vec::new()
+    };
+
+    let job_doc = doc_ids.first().copied().or(Some(doc_id));
+    let ctx = jobs.begin_for_app(&app, "sample", job_doc);
+    let job_id = ctx.id;
+    let app_for_job = app.clone();
+    let doc_ids_for_job = doc_ids.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            use tauri::Manager;
+            let source_doc = handle.read().map_err(poisoned)?;
+            source_doc.check_revision(expected_revision)?;
+            let source = DocumentSource::new(&source_doc);
+            let universe = sampling::universe_for(&source_doc, request.scope);
+            let total = universe.len();
+            let plan = sampling::plan_for(&source, &universe, &request, seed, Some(ctx))?;
+            match &request.destination {
+                SampleDestination::DerivedDocuments => {
+                    let (docs, _manifest) = sampling::execute_to_derived(
+                        &source,
+                        &plan.outputs,
+                        &doc_ids_for_job,
+                        cache_root,
+                        seed,
+                        request.scope,
+                        request.order,
+                        total,
+                        &plan.method_label,
+                        ctx,
+                    )?;
+                    // The new documents are registered only after the whole job
+                    // succeeds, so a cancellation leaves nothing behind. The
+                    // source read guard (a different document's lock) is safe to
+                    // hold while taking the registry lock — no lock-order cycle.
+                    let registry = app_for_job.state::<Mutex<AppState>>();
+                    let mut guard = registry
+                        .lock()
+                        .map_err(|_| AppError::Other("internal state lock error".into()))?;
+                    for doc in docs {
+                        guard.insert(doc);
+                    }
+                    Ok(())
+                }
+                SampleDestination::Export {
+                    dir,
+                    base_name,
+                    options,
+                    write_manifest,
+                } => {
+                    sampling::execute_to_export(
+                        &source,
+                        &plan.outputs,
+                        Path::new(dir),
+                        base_name,
+                        options,
+                        *write_manifest,
+                        seed,
+                        request.scope,
+                        request.order,
+                        total,
+                        &plan.method_label,
+                        ctx,
+                    )?;
+                    Ok(())
+                }
+            }
+        })
+        .await;
+    });
+    Ok(SampleStart { job_id, doc_ids })
 }
 
 #[tauri::command]
