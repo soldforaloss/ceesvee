@@ -119,6 +119,10 @@ import type {
   RecordView,
   DraftField,
   DraftValidation,
+  HighlightRule,
+  HighlightWindow,
+  CellExplanation,
+  HighlightReportFormat,
 } from "../types";
 
 export const openFile = (path: string, options?: OpenOptions) =>
@@ -451,6 +455,61 @@ export const startSample = (
   seed: number,
   expectedRevision: number,
 ) => invoke<SampleStart>("start_sample", { docId, request, seed, expectedRevision });
+
+// ----- conditional highlighting (F42) ---------------------------------------
+// View-only decoration: none of these commands mutate the document, enter the
+// undo stack, or mark it dirty. Rules live per-document in the backend store;
+// the windowed query is priority-flattened server-side so the grid only ever
+// receives the visible window.
+
+/** The active highlight rules for a document (F42). */
+export const highlightListRules = (docId: number) =>
+  invoke<HighlightRule[]>("highlight_list_rules", { docId });
+
+/** Replace the whole active rule set (validated; e.g. applying a view) (F42). */
+export const highlightSetRules = (docId: number, rules: HighlightRule[]) =>
+  invoke<void>("highlight_set_rules", { docId, rules });
+
+/** Insert or replace ONE rule; invalidates only its own cache (F42). */
+export const highlightUpsertRule = (docId: number, rule: HighlightRule) =>
+  invoke<void>("highlight_upsert_rule", { docId, rule });
+
+/** Remove one rule (and its cache); resolves to whether it existed (F42). */
+export const highlightDeleteRule = (docId: number, ruleId: string) =>
+  invoke<boolean>("highlight_delete_rule", { docId, ruleId });
+
+/** Clear every highlight rule for a document (F42). */
+export const highlightClear = (docId: number) => invoke<void>("highlight_clear", { docId });
+
+/**
+ * Resolve decorations for one bounded DISPLAY window (F42), already
+ * priority-flattened to one winning decoration per cell. `col` in each painted
+ * cell is a PHYSICAL column index; `row` is a display row.
+ */
+export const highlightWindow = (docId: number, start: number, count: number) =>
+  invoke<HighlightWindow>("highlight_window", { docId, start, count });
+
+/** List every rule matching one cell, in winning (priority) order (F42).
+ *  `row` is a display row; `col` is a PHYSICAL column index. */
+export const highlightExplain = (docId: number, row: number, col: number) =>
+  invoke<CellExplanation>("highlight_explain", { docId, row, col });
+
+/** Per-rule live match counts (rule id → count), in store order (F42). */
+export const highlightCounts = (docId: number) =>
+  invoke<[string, number][]>("highlight_counts", { docId });
+
+/**
+ * Export a highlight match report (JSON or CSV) as a cancellable, atomic job
+ * (F42). Read-only — building the report never touches the document. Resolves
+ * with the job id.
+ */
+export const startHighlightReport = (
+  docId: number,
+  path: string,
+  format: HighlightReportFormat,
+  scope: ExportScope,
+  expectedRevision: number,
+) => invoke<number>("start_highlight_report", { docId, path, format, scope, expectedRevision });
 
 /** Cardinality preview of a join — creates nothing (F21). */
 export const previewJoin = (

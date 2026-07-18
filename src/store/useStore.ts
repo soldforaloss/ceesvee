@@ -121,6 +121,8 @@ import type {
   TagToColumnTarget,
   RecordLayout,
   DraftField,
+  HighlightRule,
+  HighlightReportFormat,
 } from "../types";
 import type { GatingWarning } from "../lib/project";
 import { clampRecord, type RecordDraft } from "../lib/recordForm";
@@ -171,6 +173,7 @@ export type ModalName =
   | "sampling"
   | "tagToColumn"
   | "annotationExport"
+  | "highlight"
   | "views";
 
 const FILE_FILTERS = [
@@ -624,6 +627,29 @@ const initialOutlier: OutlierState = {
   error: null,
 };
 
+/**
+ * Conditional-highlighting state (F42) for the ACTIVE document. The rules are a
+ * mirror of the backend's per-document store (which is the source of truth);
+ * `counts` are the live per-rule match totals shown in the dialog. View-only —
+ * nothing here ever dirties the document.
+ */
+export interface HighlightUiState {
+  rules: HighlightRule[];
+  /** Whether the rules have been fetched for the active document yet. */
+  loaded: boolean;
+  /** Per-rule live match count (rule id → count), or null before it loads. */
+  counts: Record<string, number> | null;
+  /** Last match-report export error, surfaced by the dialog. */
+  reportError: string | null;
+}
+
+const initialHighlight: HighlightUiState = {
+  rules: [],
+  loaded: false,
+  counts: null,
+  reportError: null,
+};
+
 /** A running canonical column-conversion job (F31), for the ACTIVE document. */
 export interface SchemaConvertState {
   jobId: number;
@@ -829,6 +855,11 @@ interface Store {
   crossval: CrossValState;
   /** Outlier-finder state (F30). */
   outlier: OutlierState;
+  /** Conditional-highlighting rules + counts (F42) for the active document. */
+  highlight: HighlightUiState;
+  /** Bumped whenever the active document's highlight rules change, so the grid
+   *  refetches its decoration window. */
+  highlightVersion: number;
   /** The ACTIVE document's explicit schema (F31), refreshed on load/edit. */
   schemaInfo: SchemaInfo | null;
   /** A running canonical column-conversion job (F31), if any. */
@@ -1076,6 +1107,22 @@ interface Store {
   loadCachedOutlierReport: () => Promise<void>;
   /** Filter to the rows holding flagged values. */
   applyOutlierFilter: () => Promise<boolean>;
+
+  // conditional highlighting (F42)
+  /** Fetch the active document's rules (+ counts) into the store. */
+  loadHighlightRules: () => Promise<void>;
+  /** Recompute the per-rule live match counts for the active document. */
+  loadHighlightCounts: () => Promise<void>;
+  /** Insert or replace one rule (backend-validated); never dirties the doc. */
+  upsertHighlightRule: (rule: HighlightRule) => Promise<void>;
+  /** Remove one rule by id. */
+  deleteHighlightRule: (ruleId: string) => Promise<void>;
+  /** Replace the whole active rule set (e.g. reorder / bulk edit). */
+  setHighlightRules: (rules: HighlightRule[]) => Promise<void>;
+  /** Remove every rule from the active document. */
+  clearHighlightRules: () => Promise<void>;
+  /** Export a highlight match report (JSON or CSV) over a scope. */
+  exportHighlightReport: (format: HighlightReportFormat, scope: ExportScope) => Promise<void>;
 
   // explicit schemas & typed columns (F31)
   /** Open the schema editor, optionally focused on one physical column. */
@@ -1515,6 +1562,10 @@ export const useStore = create<Store>((set, get) => {
       crossval: initialCrossVal,
       outlier: initialOutlier,
       pii: initialPii,
+      // F42: highlight rules are per-document (backend-owned); the Grid reloads
+      // them for the new tab, and the version bump refetches the paint window.
+      highlight: initialHighlight,
+      highlightVersion: s.highlightVersion + 1,
       // F31: the schema is per-document; the Grid reloads it for the new tab.
       schemaInfo: null,
       schemaConvert: null,
@@ -1700,7 +1751,17 @@ export const useStore = create<Store>((set, get) => {
       return;
     }
 
-    set(() => ({
+    // F42: the view's conditional-highlighting rules REPLACE the active set
+    // (a view is a complete way of looking — an older view with none clears
+    // them). View-only: pushing rules never dirties the document.
+    const highlightRules = (view.highlightRules ?? []).map((r) => ({ ...r }));
+    try {
+      await api.highlightSetRules(meta.id, highlightRules);
+    } catch (e) {
+      set({ error: String(e) });
+    }
+
+    set((s) => ({
       columnLayout: layoutIsTrivial(layout) ? null : layout,
       wrapText: view.wrapText,
       // REPLACE the width map: widths the view does not specify return to
@@ -1709,11 +1770,14 @@ export const useStore = create<Store>((set, get) => {
       columnWidths: widthsFromIds(view.columnWidths, ids),
       activeViewId: view.id,
       viewSortKeys: appliedSort,
+      highlight: { ...initialHighlight, rules: highlightRules, loaded: true },
+      highlightVersion: s.highlightVersion + 1,
       viewWarning:
         missing.length > 0
           ? `This view references ${missing.length} column${missing.length === 1 ? "" : "s"} that no longer exist (deleted or from an older file layout). The rest of the view was applied; the view itself is unchanged.`
           : null,
     }));
+    void get().loadHighlightCounts();
 
     if (persistLast && meta.path) {
       await persistViews(meta, (views) => views, view.id).catch(() => undefined);
@@ -2153,6 +2217,8 @@ export const useStore = create<Store>((set, get) => {
     semantic: initialSemantic,
     crossval: initialCrossVal,
     outlier: initialOutlier,
+    highlight: initialHighlight,
+    highlightVersion: 0,
     schemaInfo: null,
     schemaConvert: null,
     schemaScan: null,
@@ -2404,6 +2470,7 @@ export const useStore = create<Store>((set, get) => {
         layout: s.columnLayout,
         columnWidths: s.columnWidths,
         wrapText: s.wrapText,
+        highlightRules: s.highlight.rules,
       });
       try {
         await persistViews(meta, (views) => upsertView(views, view), view.id);
@@ -2430,6 +2497,7 @@ export const useStore = create<Store>((set, get) => {
         layout: s.columnLayout,
         columnWidths: s.columnWidths,
         wrapText: s.wrapText,
+        highlightRules: s.highlight.rules,
       });
       try {
         await persistViews(meta, (views) => upsertView(views, view), viewId);
@@ -3193,6 +3261,141 @@ export const useStore = create<Store>((set, get) => {
       } catch (e) {
         set((s) => ({ outlier: { ...s.outlier, error: String(e) } }));
         return false;
+      }
+    },
+
+    // ----- conditional highlighting (F42) ----------------------------------------
+
+    loadHighlightRules: async () => {
+      const id = get().activeId;
+      if (id == null) {
+        set({ highlight: initialHighlight });
+        return;
+      }
+      try {
+        const rules = await api.highlightListRules(id);
+        // A tab switch may have raced this fetch — only adopt for the live doc.
+        if (get().activeId !== id) return;
+        set((s) => ({ highlight: { ...s.highlight, rules, loaded: true } }));
+        await get().loadHighlightCounts();
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    loadHighlightCounts: async () => {
+      const id = get().activeId;
+      if (id == null) return;
+      try {
+        const pairs = await api.highlightCounts(id);
+        if (get().activeId !== id) return;
+        const counts: Record<string, number> = {};
+        for (const [ruleId, count] of pairs) counts[ruleId] = count;
+        set((s) => ({ highlight: { ...s.highlight, counts } }));
+      } catch {
+        // Counts are advisory; a failure leaves the last value in place.
+      }
+    },
+
+    upsertHighlightRule: async (rule) => {
+      const id = get().activeId;
+      if (id == null) return;
+      try {
+        await api.highlightUpsertRule(id, rule);
+        // Reflect the new/changed rule locally (append or replace by id).
+        set((s) => {
+          const rules = s.highlight.rules.some((r) => r.id === rule.id)
+            ? s.highlight.rules.map((r) => (r.id === rule.id ? rule : r))
+            : [...s.highlight.rules, rule];
+          return {
+            highlight: { ...s.highlight, rules, loaded: true },
+            highlightVersion: s.highlightVersion + 1,
+          };
+        });
+        await get().loadHighlightCounts();
+      } catch (e) {
+        // A validation failure means the rule was NOT stored — surface it and
+        // re-sync from the backend so the mirror never drifts.
+        set({ error: String(e) });
+        await get().loadHighlightRules();
+      }
+    },
+
+    deleteHighlightRule: async (ruleId) => {
+      const id = get().activeId;
+      if (id == null) return;
+      try {
+        await api.highlightDeleteRule(id, ruleId);
+        set((s) => ({
+          highlight: {
+            ...s.highlight,
+            rules: s.highlight.rules.filter((r) => r.id !== ruleId),
+          },
+          highlightVersion: s.highlightVersion + 1,
+        }));
+        await get().loadHighlightCounts();
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    setHighlightRules: async (rules) => {
+      const id = get().activeId;
+      if (id == null) return;
+      try {
+        await api.highlightSetRules(id, rules);
+        set((s) => ({
+          highlight: { ...s.highlight, rules, loaded: true },
+          highlightVersion: s.highlightVersion + 1,
+        }));
+        await get().loadHighlightCounts();
+      } catch (e) {
+        set({ error: String(e) });
+        await get().loadHighlightRules();
+      }
+    },
+
+    clearHighlightRules: async () => {
+      const id = get().activeId;
+      if (id == null) return;
+      try {
+        await api.highlightClear(id);
+        set((s) => ({
+          highlight: { ...s.highlight, rules: [], counts: {} },
+          highlightVersion: s.highlightVersion + 1,
+        }));
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    exportHighlightReport: async (format, scope) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const chosen = await saveFileDialog({
+        defaultPath: `${meta.fileName || "highlights"}.matches.${format}`,
+        filters: [
+          format === "json"
+            ? { name: "JSON", extensions: ["json"] }
+            : { name: "CSV", extensions: ["csv"] },
+          { name: "All files", extensions: ["*"] },
+        ],
+      });
+      if (!chosen) return;
+      set((s) => ({ highlight: { ...s.highlight, reportError: null } }));
+      try {
+        const jobId = await api.startHighlightReport(meta.id, chosen, format, scope, meta.revision);
+        const finished = await awaitJob(jobId);
+        if (finished.status === "failed") {
+          set((s) => ({
+            highlight: {
+              ...s.highlight,
+              reportError: finished.error ?? "match report export failed",
+            },
+          }));
+        }
+      } catch (e) {
+        set((s) => ({ highlight: { ...s.highlight, reportError: String(e) } }));
       }
     },
 

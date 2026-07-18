@@ -6,6 +6,7 @@ import type {
   DocumentMeta,
   FilterGroup,
   FilterNode,
+  HighlightRule,
   NamedView,
   SortKey,
   ViewSortKey,
@@ -84,6 +85,8 @@ export interface ViewSnapshotInput {
   layout: ColumnLayout | null;
   columnWidths: Record<number, number>;
   wrapText: boolean;
+  /** F42: the active document's conditional-highlighting rules, if any. */
+  highlightRules?: HighlightRule[];
 }
 
 /** Build a persistable NamedView from the current state. */
@@ -100,6 +103,7 @@ export function snapshotView(input: ViewSnapshotInput): NamedView {
     columnOrder: [...(input.layout?.columnOrder ?? [])],
     columnWidths: widthsToIds(input.columnWidths, ids),
     wrapText: input.wrapText,
+    highlightRules: (input.highlightRules ?? []).map((r) => ({ ...r })),
   };
 }
 
@@ -114,5 +118,10 @@ export function describeView(view: NamedView): string {
   if (view.pinnedColumnIds.length > 0) parts.push(`${view.pinnedColumnIds.length} pinned`);
   if (view.columnOrder.length > 0) parts.push("reordered");
   if (view.wrapText) parts.push("wrap");
+  if (view.highlightRules && view.highlightRules.length > 0) {
+    parts.push(
+      `${view.highlightRules.length} highlight${view.highlightRules.length === 1 ? "" : "s"}`,
+    );
+  }
   return parts.length > 0 ? parts.join(" · ") : "layout only";
 }

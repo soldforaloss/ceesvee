@@ -102,6 +102,10 @@ pub struct NamedView {
     pub column_widths: std::collections::HashMap<String, f64>,
     #[serde(default)]
     pub wrap_text: bool,
+    /// F42: conditional-highlighting rules saved with this view (view-only
+    /// decoration; carries no cell data).
+    #[serde(default)]
+    pub highlight_rules: Vec<crate::highlight::HighlightRule>,
 }
 
 /// A reusable description of a recurring file format.
@@ -165,6 +169,11 @@ pub struct FileProfile {
     /// validation issue.
     #[serde(default)]
     pub required_documentation: Vec<crate::dictionary::RequiredDocumentation>,
+
+    /// F42: conditional-highlighting rules applied to matching files (view-only
+    /// decoration; carries no cell data).
+    #[serde(default)]
+    pub highlight_rules: Vec<crate::highlight::HighlightRule>,
 }
 
 /// The persisted settings document.
@@ -529,6 +538,7 @@ mod tests {
             named_views: Vec::new(),
             last_view_id: None,
             required_documentation: Vec::new(),
+            highlight_rules: Vec::new(),
         }
     }
 
@@ -563,6 +573,7 @@ mod tests {
             column_order: vec!["c2".into(), "c1".into()],
             column_widths: std::collections::HashMap::from([("c1".to_string(), 240.0)]),
             wrap_text: true,
+            highlight_rules: Vec::new(),
         }];
         p.last_view_id = Some("v1".into());
         settings.profiles.push(p);
@@ -593,6 +604,56 @@ mod tests {
         assert_eq!(
             loaded.profiles[0].cross_rules,
             settings.profiles[0].cross_rules
+        );
+    }
+
+    #[test]
+    fn highlight_rules_round_trip_and_default_empty() {
+        use crate::highlight::{Decoration, HighlightCondition, HighlightRule, HighlightTarget};
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = AppSettings::default();
+        let mut p = profile();
+        // Default empty on both the F08 profile and its F12 views.
+        assert!(p.highlight_rules.is_empty());
+
+        let rule = HighlightRule {
+            id: "h1".into(),
+            name: "non-positive amount".into(),
+            condition: HighlightCondition::NumericRange {
+                column_id: Some("c1".into()),
+                min: None,
+                max: Some(0.0),
+                inclusive: true,
+            },
+            target: HighlightTarget::Row,
+            priority: 5,
+            decoration: Decoration::default(),
+            enabled: true,
+        };
+        p.highlight_rules = vec![rule.clone()];
+        p.named_views = vec![NamedView {
+            id: "v1".into(),
+            name: "flagged".into(),
+            filter: None,
+            filter_column_ids: Vec::new(),
+            sort_keys: Vec::new(),
+            hidden_column_ids: Vec::new(),
+            pinned_column_ids: Vec::new(),
+            column_order: Vec::new(),
+            column_widths: std::collections::HashMap::new(),
+            wrap_text: false,
+            highlight_rules: vec![rule],
+        }];
+        settings.profiles.push(p);
+        save_settings(dir.path(), &settings).unwrap();
+        let loaded = load_settings(dir.path());
+        assert_eq!(
+            loaded.profiles[0].highlight_rules,
+            settings.profiles[0].highlight_rules
+        );
+        assert_eq!(
+            loaded.profiles[0].named_views[0].highlight_rules,
+            settings.profiles[0].named_views[0].highlight_rules
         );
     }
 

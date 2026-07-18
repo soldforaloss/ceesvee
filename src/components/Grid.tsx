@@ -18,17 +18,25 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { buildRecordIndex, cellNoteColumns } from "../lib/annotations";
 import { SENSITIVITY_LABELS } from "../lib/dictionary";
 import { indicesToRanges } from "../lib/gridSelection";
-import { darkGridTheme, dirtyCellOverride, lightGridTheme } from "../lib/gridTheme";
+import {
+  darkGridTheme,
+  dirtyCellOverride,
+  highlightCellOverride,
+  lightGridTheme,
+} from "../lib/gridTheme";
+import { highlightAccent } from "../lib/highlight";
 import { formatCellValue, isNumericType } from "../lib/schema";
 import * as api from "../lib/tauri";
 import { physicalToDisplay, projectColumns } from "../lib/viewProjection";
 import { useStore } from "../store/useStore";
 import type {
+  CellExplanation,
   ColumnKind,
   ColumnSchema,
   DictionaryEntryView,
   DocumentMeta,
   LogicalType,
+  PaintedCell,
   RowAnnotationView,
   Sensitivity,
 } from "../types";
@@ -130,6 +138,17 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   const recordCache = useRef<Map<number, number | null>>(new Map());
   const inFlight = useRef<Set<number>>(new Set());
   const visibleRegion = useRef<Rectangle | null>(null);
+  // F42: winning decoration per painted cell, keyed by `${displayRow}:${physCol}`
+  // (highlight_window returns display rows and PHYSICAL columns). Fetched per
+  // page like row data and invalidated on data / rule changes.
+  const highlightCache = useRef<Map<string, PaintedCell>>(new Map());
+  const highlightPages = useRef<Set<number>>(new Set());
+  const highlightInFlight = useRef<Set<number>>(new Set());
+  // Bumped on every decoration-cache invalidation (data OR rule change); an
+  // in-flight highlight fetch from a prior generation must not write into the
+  // cleared cache. Separate from `generation` because a rule edit invalidates
+  // decorations without touching row data.
+  const highlightGen = useRef(0);
   // Bumped on every cache invalidation; an in-flight fetch from a previous
   // generation must not write its (now-stale) rows into the cleared cache.
   const generation = useRef(0);
@@ -160,6 +179,14 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     columnLabel: string;
     entry: RowAnnotationView | undefined;
   } | null>(null);
+  // F42: "explain highlighting" popover — the ordered list of rules matching a
+  // cell (display row, PHYSICAL col), anchored at the click point.
+  const [explainCell, setExplainCell] = useState<{
+    row: number;
+    col: number;
+    x: number;
+    y: number;
+  } | null>(null);
 
   const findMatches = useStore((s) => s.find.matches);
   const findIndex = useStore((s) => s.find.index);
@@ -175,6 +202,21 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   const columnLayout = useStore((s) => s.columnLayout);
   const wrapText = useStore((s) => s.wrapText);
   const autoFitRequest = useStore((s) => s.autoFitRequest);
+  // F42: bumped whenever the active document's highlight rules change; the
+  // number of active rules gates whether we fetch decorations at all.
+  const highlightVersion = useStore((s) => s.highlightVersion);
+  const highlightRuleCount = useStore((s) => s.highlight.rules.length);
+  const highlightRuleCountRef = useRef(highlightRuleCount);
+  highlightRuleCountRef.current = highlightRuleCount;
+  // F42: analysis-backed highlight conditions read the diagnostics (F02),
+  // cross-column (F27) and outlier (F30) reports. A completed/updated scan moves
+  // the report's revision WITHOUT bumping `dataVersion` or `highlightVersion`,
+  // so track those revisions to re-run the invalidate+refetch effect below.
+  // (Annotation edits and changed-since-save are folded in there via
+  // `annotationsView.annotationsRevision` and `meta.dirty`.)
+  const diagnosticsRevision = useStore((s) => s.diagnostics[docId]?.report?.revision ?? -1);
+  const crossvalRevision = useStore((s) => s.crossval.report?.revision ?? -1);
+  const outlierRevision = useStore((s) => s.outlier.report?.revision ?? -1);
 
   // Detected type per column (defaults to text until summaries load).
   const columnKinds = useMemo<ColumnKind[]>(() => {
@@ -216,6 +258,10 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   // note corners. `cellNoteIndex` is the record -> {column ids with a note} map
   // consulted per cell in the custom draw.
   const annotationsView = useStore((s) => s.annotationsView);
+  // F42: F40 bookmark/flag/tag conditions read the resolved annotation marks;
+  // an annotation edit moves this revision without a data change, so it feeds
+  // the highlight invalidation effect below.
+  const annotationsRevision = annotationsView?.annotationsRevision ?? -1;
   const recordIndex = useMemo(() => buildRecordIndex(annotationsView), [annotationsView]);
   const cellNoteIndex = useMemo(() => {
     const map = new Map<number, Set<string>>();
@@ -326,6 +372,92 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     [loadPage],
   );
 
+  // ----- windowed highlight decorations (F42) -----------------------------
+
+  // Fetch one page's worth of highlight decorations. Rides the same paging as
+  // row data so a million-row scroll only ever transfers the visible window,
+  // priority-flattened server-side (no per-cell IPC). Skipped entirely when the
+  // document has no rules.
+  const loadHighlightPage = useCallback(async (page: number) => {
+    if (highlightRuleCountRef.current === 0) return;
+    const id = docIdRef.current;
+    const gen = highlightGen.current;
+    if (highlightInFlight.current.has(page) || highlightPages.current.has(page)) return;
+    highlightInFlight.current.add(page);
+    try {
+      const win = await api.highlightWindow(id, page * PAGE, PAGE);
+      // Dropped if the doc / rules changed while this fetch was in flight.
+      if (gen !== highlightGen.current) return;
+      for (const cell of win.cells) highlightCache.current.set(`${cell.row}:${cell.col}`, cell);
+      highlightPages.current.add(page);
+      // Repaint the whole page's rows so getCellContent re-runs and picks up
+      // (or clears) decorations, in DISPLAY coordinates.
+      const cols = projectionRef.current.physical.length;
+      const updates: { cell: Item }[] = [];
+      for (let r = page * PAGE; r < page * PAGE + PAGE; r++) {
+        for (let c = 0; c < cols; c++) updates.push({ cell: [c, r] });
+      }
+      gridRef.current?.updateCells(updates);
+    } catch {
+      // Highlighting is best-effort decoration; a failure just leaves cells
+      // undecorated rather than surfacing an error over the grid.
+    } finally {
+      highlightInFlight.current.delete(page);
+    }
+  }, []);
+
+  const loadHighlightRange = useCallback(
+    (startRow: number, rowCount: number) => {
+      const firstPage = Math.max(0, Math.floor(startRow / PAGE));
+      const lastPage = Math.floor((startRow + Math.max(1, rowCount) - 1) / PAGE);
+      for (let p = firstPage; p <= lastPage; p++) void loadHighlightPage(p);
+    },
+    [loadHighlightPage],
+  );
+
+  // Invalidate the decoration cache when the document, its data, its rule set,
+  // OR any non-data highlight input changes, then refetch the visible window. A
+  // rule edit bumps only `highlightVersion`, so unrelated data stays cached (the
+  // row cache is untouched here — only the decorations are recomputed). The
+  // extra deps cover conditions whose results change while the visible page
+  // stays cached: F40 annotation edits (annotationsRevision), the analysis
+  // reports (diagnostics/cross-column/outlier revisions) and changed-since-save
+  // after a save clears the dirty set (`meta.dirty` flips false).
+  useEffect(() => {
+    highlightGen.current += 1;
+    highlightCache.current.clear();
+    highlightPages.current.clear();
+    highlightInFlight.current.clear();
+    const region = visibleRegion.current;
+    const start = region ? Math.max(0, region.y - PAGE) : 0;
+    const count = region ? region.height + 2 * PAGE : PAGE;
+    if (highlightRuleCount > 0) {
+      loadHighlightRange(start, count);
+    } else {
+      // Rules cleared: repaint the visible rows so any lingering tint is gone.
+      const cols = projectionRef.current.physical.length;
+      const updates: { cell: Item }[] = [];
+      const from = region ? Math.max(0, region.y) : 0;
+      const to = region ? region.y + region.height : PAGE;
+      for (let r = from; r < to; r++) for (let c = 0; c < cols; c++) updates.push({ cell: [c, r] });
+      if (updates.length > 0) gridRef.current?.updateCells(updates);
+    }
+    // `generation` is bumped by the row-cache invalidation effect below on the
+    // same [docId, dataVersion] change, so an in-flight highlight fetch from a
+    // prior generation is dropped there too.
+  }, [
+    docId,
+    dataVersion,
+    highlightVersion,
+    highlightRuleCount,
+    annotationsRevision,
+    diagnosticsRevision,
+    crossvalRevision,
+    outlierRevision,
+    meta.dirty,
+    loadHighlightRange,
+  ]);
+
   // Invalidate the cache when the document or its data changes structurally,
   // then refetch the visible window (loadPage's `updateCells` repaints them).
   useEffect(() => {
@@ -353,16 +485,20 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     // F40: re-resolve annotations against the (possibly reparsed) document so
     // the gutter indicators and the panel's review list stay in sync.
     void useStore.getState().loadAnnotations();
+    // F42: (re)load the active document's highlight rules + live match counts;
+    // an edit changes what the rules match, so counts refresh with the data.
+    void useStore.getState().loadHighlightRules();
   }, [docId, dataVersion]);
 
   const onVisibleRegionChanged = useCallback(
     (range: Rectangle) => {
       visibleRegion.current = range;
       loadRange(Math.max(0, range.y - PAGE), range.height + 2 * PAGE);
+      loadHighlightRange(Math.max(0, range.y - PAGE), range.height + 2 * PAGE);
       // Persist (debounced) so the position survives tab switches (F08).
       setScrollPosition(Math.max(0, range.y), Math.max(0, range.x));
     },
-    [loadRange, setScrollPosition],
+    [loadRange, loadHighlightRange, setScrollPosition],
   );
 
   // Column widths are keyed by position, so reset them when THIS document's
@@ -464,6 +600,15 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
       const schema = columnSchemas[phys];
       const displayData = schema ? formatCellValue(schema, value) : value;
       const numeric = schema ? isNumericType(schema.logicalType) : columnKinds[phys] === "number";
+      // F42: a highlight decoration (theme-aware tone tint + text style) wins
+      // the cell background over the plain dirty wash; a dirty cell with no
+      // decoration keeps the unsaved tint.
+      const painted = highlightCache.current.get(`${row}:${phys}`);
+      const themeOverride = painted
+        ? highlightCellOverride(painted.decoration, dark)
+        : isDirty
+          ? dirtyCellOverride
+          : undefined;
       return {
         kind: GridCellKind.Text,
         data: value,
@@ -471,13 +616,13 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         allowOverlay: !readOnly,
         allowWrapping: wrapText,
         contentAlign: numeric ? "right" : undefined,
-        themeOverride: isDirty ? dirtyCellOverride : undefined,
+        themeOverride,
       };
     },
-    // Cell data is read from refs; recreated when column types, schema, wrap
-    // or the projection change so cells re-render correctly. Structural
-    // refreshes still go through `updateCells`.
-    [columnKinds, columnSchemas, readOnly, wrapText, projection],
+    // Cell data is read from refs; recreated when column types, schema, wrap,
+    // the projection or the theme change so cells re-render correctly.
+    // Structural + decoration refreshes still go through `updateCells`.
+    [columnKinds, columnSchemas, readOnly, wrapText, projection, dark],
   );
 
   const onCellEdited = useCallback(
@@ -806,7 +951,20 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
           state={cellMenu}
           docId={meta.id}
           readOnly={readOnly}
+          hasHighlights={highlightRuleCount > 0}
+          onExplain={() => {
+            setExplainCell({ ...cellMenu });
+            setCellMenu(null);
+          }}
           onClose={() => setCellMenu(null)}
+        />
+      )}
+      {explainCell && (
+        <HighlightExplainPopover
+          docId={meta.id}
+          state={explainCell}
+          dark={dark}
+          onClose={() => setExplainCell(null)}
         />
       )}
     </div>
@@ -1002,6 +1160,8 @@ function CellContextMenu({
   state,
   docId,
   readOnly,
+  hasHighlights,
+  onExplain,
   onClose,
 }: {
   state: {
@@ -1016,6 +1176,8 @@ function CellContextMenu({
   };
   docId: number;
   readOnly: boolean;
+  hasHighlights: boolean;
+  onExplain: () => void;
   onClose: () => void;
 }) {
   const openCellEditor = useStore((s) => s.openCellEditor);
@@ -1123,6 +1285,109 @@ function CellContextMenu({
       <button className={item} onClick={() => void copyFull()}>
         Copy full value
       </button>
+      {hasHighlights && (
+        <button className={item} onClick={onExplain}>
+          Explain highlighting…
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * "Explain highlighting" popover (F42): the rules matching one cell in winning
+ * (priority) order — the first is what the grid paints; any others are what it
+ * beats. Fetched from the backend (the frontend only caches the visible
+ * window's winning decoration, not the full per-cell rule list).
+ */
+function HighlightExplainPopover({
+  docId,
+  state,
+  dark,
+  onClose,
+}: {
+  docId: number;
+  state: { row: number; col: number; x: number; y: number };
+  dark: boolean;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [data, setData] = useState<CellExplanation | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let live = true;
+    setLoading(true);
+    api
+      .highlightExplain(docId, state.row, state.col)
+      .then((res) => {
+        if (live) setData(res);
+      })
+      .catch(() => {
+        if (live) setData({ row: state.row, col: state.col, rules: [] });
+      })
+      .finally(() => {
+        if (live) setLoading(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [docId, state.row, state.col]);
+
+  useEffect(() => {
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      ref={ref}
+      className="fixed z-50 w-72 overflow-hidden rounded-lg border border-zinc-200 bg-white py-1.5 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-800"
+      style={{ left: state.x, top: state.y }}
+    >
+      <div className="border-b border-zinc-100 px-3 pb-1.5 text-xs font-medium text-zinc-500 dark:border-zinc-700/60 dark:text-zinc-400">
+        Highlighting for this cell
+      </div>
+      {loading ? (
+        <div className="px-3 py-2 text-xs text-zinc-500 dark:text-zinc-400">Checking rules…</div>
+      ) : data && data.rules.length > 0 ? (
+        <ul className="max-h-64 overflow-y-auto py-1">
+          {data.rules.map((r) => (
+            <li key={r.ruleId} className="flex items-center gap-2 px-3 py-1">
+              <span
+                className="h-3 w-3 shrink-0 rounded-sm"
+                style={{ backgroundColor: highlightAccent(r.decoration.tone, dark) }}
+              />
+              <span className="min-w-0 flex-1 truncate text-zinc-700 dark:text-zinc-200">
+                {r.decoration.icon ? `${r.decoration.icon} ` : ""}
+                {r.name || r.ruleId}
+              </span>
+              <span className="shrink-0 text-[11px] tabular-nums text-zinc-400 dark:text-zinc-500">
+                p{r.priority}
+              </span>
+              {r.winning && (
+                <span className="shrink-0 rounded bg-violet-100 px-1.5 py-0.5 text-[10px] font-medium text-violet-700 dark:bg-violet-500/20 dark:text-violet-200">
+                  wins
+                </span>
+              )}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <div className="px-3 py-2 text-xs text-zinc-500 dark:text-zinc-400">
+          No highlight rules match this cell.
+        </div>
+      )}
     </div>
   );
 }

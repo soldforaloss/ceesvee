@@ -40,6 +40,10 @@ use crate::dto::{
 use crate::error::{AppError, AppResult};
 use crate::follow::{self, FollowRegistry};
 use crate::groupby::{self, GroupByPreview, GroupBySpec};
+use crate::highlight::{
+    AnalysisContext, AnnotationMatches, CellExplanation, HighlightCondition, HighlightRule,
+    HighlightStore, HighlightWindow, MatchReport, ReportFormat,
+};
 use crate::job::JobRegistry;
 use crate::joins::{self, JoinPreview, JoinSpec};
 use crate::journal::{self, RecoverableSession};
@@ -938,6 +942,7 @@ pub fn close_document(
     append_cache: State<'_, AppendCache>,
     pii_cache: State<'_, PiiCache>,
     annotations: State<'_, AnnotationRegistry>,
+    highlight_store: State<'_, HighlightStore>,
     follows: State<'_, FollowRegistry>,
 ) -> AppResult<()> {
     // Closing a followed tab stops its watcher and releases the handle.
@@ -964,6 +969,7 @@ pub fn close_document(
     append_cache.remove(doc_id);
     pii_cache.remove(doc_id);
     annotations.remove(doc_id);
+    highlight_store.remove_doc(doc_id);
     Ok(())
 }
 
@@ -2753,6 +2759,271 @@ pub async fn start_sample(
         .await;
     });
     Ok(SampleStart { job_id, doc_ids })
+}
+
+// ----- conditional highlighting (F42) -----------------------------------------
+
+/// Whether any rule references an F40 annotation condition, so the annotation
+/// snapshot (and the rematch that resolves it) is built only when needed.
+fn needs_annotations(rules: &[HighlightRule]) -> bool {
+    rules.iter().any(|r| {
+        matches!(
+            r.condition,
+            HighlightCondition::Bookmarked
+                | HighlightCondition::Flagged
+                | HighlightCondition::Tagged { .. }
+        )
+    })
+}
+
+/// Translate the annotation store's resolved marks (absolute records) into the
+/// highlight evaluator's absolute row indices — the same identity the annotation
+/// row-filter uses (a matched record IS the current absolute row).
+fn annotation_matches_from(idx: annotations::MarkIndex) -> AnnotationMatches {
+    let to_rows = |records: Vec<u64>| records.into_iter().map(|r| r as usize).collect::<Vec<_>>();
+    AnnotationMatches {
+        revision: idx.revision,
+        starred: to_rows(idx.starred),
+        flagged: to_rows(idx.flagged),
+        tagged: idx
+            .tagged
+            .into_iter()
+            .map(|(tag, records)| (tag, to_rows(records)))
+            .collect(),
+    }
+}
+
+/// Snapshot the analysis caches a highlight query may consume (cloned so the
+/// evaluator never holds a cache lock while scanning). When a rule references
+/// F40 annotations, the resolved marks are attached too — memoized in the
+/// highlight store keyed by the (document, annotation) revisions, so a plain
+/// windowed scroll never re-runs the annotation rematch.
+#[allow(clippy::too_many_arguments)]
+fn analysis_context(
+    doc_id: u64,
+    doc: &Document,
+    rules: &[HighlightRule],
+    store: &State<'_, HighlightStore>,
+    annotations: &State<'_, AnnotationRegistry>,
+    diagnostics_cache: &State<'_, DiagnosticsCache>,
+    crossval_cache: &State<'_, CrossValCache>,
+    outlier_cache: &State<'_, OutlierCache>,
+) -> AppResult<AnalysisContext> {
+    let annotation_matches = if needs_annotations(rules) {
+        let annotation_revision = annotations.try_with(doc_id, |ann| Ok(ann.revision()))?;
+        let matches =
+            store.annotation_matches(doc_id, doc.revision(), annotation_revision, || {
+                let source = DocumentSource::new(doc);
+                let idx = annotations.try_with(doc_id, |ann| ann.mark_index(&source, None))?;
+                Ok(annotation_matches_from(idx))
+            })?;
+        Some(matches)
+    } else {
+        None
+    };
+    Ok(AnalysisContext {
+        outlier: outlier_cache.get(doc_id),
+        crossval: crossval_cache.get(doc_id),
+        diagnostics: diagnostics_cache.get(doc_id),
+        annotations: annotation_matches,
+    })
+}
+
+/// The active highlight rules for a document.
+#[tauri::command]
+pub fn highlight_list_rules(
+    doc_id: u64,
+    store: State<'_, HighlightStore>,
+) -> AppResult<Vec<HighlightRule>> {
+    store.list_rules(doc_id)
+}
+
+/// Replace the whole active rule set (e.g. applying a named view / profile).
+/// Each rule is validated (regex compile / range errors surfaced); unchanged
+/// rules keep their cached match sets.
+#[tauri::command]
+pub fn highlight_set_rules(
+    doc_id: u64,
+    rules: Vec<HighlightRule>,
+    store: State<'_, HighlightStore>,
+) -> AppResult<()> {
+    store.set_rules(doc_id, rules)
+}
+
+/// Insert or replace ONE rule; invalidates only its own cached match set.
+#[tauri::command]
+pub fn highlight_upsert_rule(
+    doc_id: u64,
+    rule: HighlightRule,
+    store: State<'_, HighlightStore>,
+) -> AppResult<()> {
+    store.upsert_rule(doc_id, rule)
+}
+
+/// Remove one rule (and its cache). Returns whether it existed.
+#[tauri::command]
+pub fn highlight_delete_rule(
+    doc_id: u64,
+    rule_id: String,
+    store: State<'_, HighlightStore>,
+) -> AppResult<bool> {
+    store.delete_rule(doc_id, &rule_id)
+}
+
+/// Clear every highlight rule for a document.
+#[tauri::command]
+pub fn highlight_clear(doc_id: u64, store: State<'_, HighlightStore>) -> AppResult<()> {
+    store.clear(doc_id)
+}
+
+/// Resolve decorations for one bounded display window, already priority-
+/// flattened server-side to one winning decoration per cell.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn highlight_window(
+    doc_id: u64,
+    start: usize,
+    count: usize,
+    state: Db<'_>,
+    store: State<'_, HighlightStore>,
+    annotations: State<'_, AnnotationRegistry>,
+    diagnostics_cache: State<'_, DiagnosticsCache>,
+    crossval_cache: State<'_, CrossValCache>,
+    outlier_cache: State<'_, OutlierCache>,
+) -> AppResult<HighlightWindow> {
+    let rules = store.list_rules(doc_id)?;
+    read_doc(&state, doc_id, |doc| {
+        let actx = analysis_context(
+            doc_id,
+            doc,
+            &rules,
+            &store,
+            &annotations,
+            &diagnostics_cache,
+            &crossval_cache,
+            &outlier_cache,
+        )?;
+        store.window(doc_id, doc, &actx, start, count)
+    })
+}
+
+/// List every rule matching one display cell, in winning (priority) order.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn highlight_explain(
+    doc_id: u64,
+    row: usize,
+    col: usize,
+    state: Db<'_>,
+    store: State<'_, HighlightStore>,
+    annotations: State<'_, AnnotationRegistry>,
+    diagnostics_cache: State<'_, DiagnosticsCache>,
+    crossval_cache: State<'_, CrossValCache>,
+    outlier_cache: State<'_, OutlierCache>,
+) -> AppResult<CellExplanation> {
+    let rules = store.list_rules(doc_id)?;
+    read_doc(&state, doc_id, |doc| {
+        let actx = analysis_context(
+            doc_id,
+            doc,
+            &rules,
+            &store,
+            &annotations,
+            &diagnostics_cache,
+            &crossval_cache,
+            &outlier_cache,
+        )?;
+        store.explain(doc_id, doc, &actx, row, col)
+    })
+}
+
+/// Per-rule live match counts (rule id → count), for the rules dialog.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn highlight_counts(
+    doc_id: u64,
+    state: Db<'_>,
+    store: State<'_, HighlightStore>,
+    annotations: State<'_, AnnotationRegistry>,
+    diagnostics_cache: State<'_, DiagnosticsCache>,
+    crossval_cache: State<'_, CrossValCache>,
+    outlier_cache: State<'_, OutlierCache>,
+) -> AppResult<Vec<(String, usize)>> {
+    let rules = store.list_rules(doc_id)?;
+    read_doc(&state, doc_id, |doc| {
+        let actx = analysis_context(
+            doc_id,
+            doc,
+            &rules,
+            &store,
+            &annotations,
+            &diagnostics_cache,
+            &crossval_cache,
+            &outlier_cache,
+        )?;
+        store.counts(doc_id, doc, &actx)
+    })
+}
+
+/// Export a highlight match report (JSON or CSV) atomically as a cancellable
+/// job. Read-only — building the report never touches the document.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn start_highlight_report(
+    doc_id: u64,
+    path: String,
+    format: ReportFormat,
+    scope: ExportScope,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+    store: State<'_, HighlightStore>,
+    annotations: State<'_, AnnotationRegistry>,
+    diagnostics_cache: State<'_, DiagnosticsCache>,
+    crossval_cache: State<'_, CrossValCache>,
+    outlier_cache: State<'_, OutlierCache>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    let rules = store.list_rules(doc_id)?;
+    // Resolve the analysis + annotation snapshot up front (against the current
+    // revision), so the off-thread report scans a stable, owned context.
+    let actx = {
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+        analysis_context(
+            doc_id,
+            &doc,
+            &rules,
+            &store,
+            &annotations,
+            &diagnostics_cache,
+            &crossval_cache,
+            &outlier_cache,
+        )?
+    };
+    // Register under the shared "export" kind so the running report is tracked
+    // in `fileJobs` and gets the StatusBar progress + Cancel control (and its
+    // cancel request actually reaches the row loop below via `ctx`).
+    let ctx = jobs.begin_for_app(&app, "export", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            doc.check_revision(expected_revision)?;
+            let report: MatchReport =
+                crate::highlight::build_report(rules, &doc, &actx, &scope, Some(ctx))?;
+            let bytes = crate::highlight::serialize_report(&report, format)?;
+            save_mod::atomic_write(Path::new(&path), BackupPolicy::None, |f| {
+                use std::io::Write;
+                f.write_all(&bytes)?;
+                Ok(bytes.len() as u64)
+            })?;
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
 }
 
 #[tauri::command]

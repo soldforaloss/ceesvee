@@ -773,6 +773,23 @@ function staticCommands(): AppCommand[] {
       run: () => openModal("views"),
     },
     {
+      id: "view.highlight",
+      title: "Conditional highlighting…",
+      keywords: [
+        "highlight",
+        "rules",
+        "colour",
+        "color",
+        "decorate",
+        "flag cells",
+        "conditional formatting",
+        "emphasis",
+      ],
+      category: "View",
+      unavailableReason: needsDoc,
+      run: () => openModal("highlight"),
+    },
+    {
       id: "view.saveViewAs",
       title: "Save current view as…",
       keywords: ["named view", "layout", "snapshot"],
