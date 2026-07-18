@@ -17,6 +17,7 @@ import { CopyAsDialog } from "./components/CopyAsDialog";
 import { CrossValDialog } from "./components/CrossValDialog";
 import { DatabaseDialog } from "./components/DatabaseDialog";
 import { DbExportDialog } from "./components/DbExportDialog";
+import { SqlWorkspaceDialog } from "./components/SqlWorkspaceDialog";
 import { PasteSpecialDialog } from "./components/PasteSpecialDialog";
 import { PiiDialog } from "./components/PiiDialog";
 import { DedupDialog } from "./components/DedupDialog";
@@ -96,6 +97,7 @@ export default function App() {
   const columnarOpenPath = useStore((s) => s.columnarOpen?.path ?? null);
   const excelImportPath = useStore((s) => s.excelImport?.path ?? null);
   const dbBrowserOpen = useStore((s) => s.dbBrowser != null);
+  const sqlWorkspaceOpen = useStore((s) => s.sqlWorkspace.open);
   const dbExportOpen = useStore((s) => s.dbExport != null);
   const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
   const changesOpen = useStore((s) => s.changesOpen);
@@ -361,6 +363,7 @@ export default function App() {
       {activeModal === "excelExport" && <ExcelExportDialog onClose={() => setModal(null)} />}
       {excelImportPath && <ExcelOpenDialog key={excelImportPath} />}
       {dbBrowserOpen && <DatabaseDialog />}
+      {sqlWorkspaceOpen && <SqlWorkspaceDialog />}
       {dbExportOpen && <DbExportDialog />}
       <CommandPalette />
       <CellEditorDialog />

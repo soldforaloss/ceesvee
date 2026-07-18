@@ -202,6 +202,12 @@ pub struct AppSettings {
     /// F16: journals older than this are swept at startup.
     #[serde(default = "default_recovery_retention")]
     pub recovery_retention_days: u32,
+    /// F36: SQL workspace query history, most recent first, capped at
+    /// [`crate::sql_workspace::SQL_HISTORY_CAP`]. Entries are DATA — loading
+    /// them never prepares or executes anything; re-running is always an
+    /// explicit user action.
+    #[serde(default)]
+    pub sql_history: Vec<crate::sql_workspace::SqlHistoryEntry>,
 }
 
 fn default_recovery_retention() -> u32 {
@@ -216,6 +222,7 @@ impl Default for AppSettings {
             shortcut_overrides: std::collections::HashMap::new(),
             recovery_enabled: false,
             recovery_retention_days: default_recovery_retention(),
+            sql_history: Vec::new(),
         }
     }
 }

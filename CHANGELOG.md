@@ -8,6 +8,39 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Sandboxed SQL query workspace** (F36; palette → "SQL workspace…"): query
+  your open documents, approved local files, and an F35-approved SQLite
+  database together with read-only SQL, under CEESVEE's local
+  controlled-execution model — nothing leaves the device, there is no
+  scripting or network surface, and files outside the ones you explicitly
+  approve are never readable. Built on the F35 SafeQueryEngine: approved CSV /
+  JSON / Parquet / Arrow files become queryable tables without a full import
+  (windowed reads over a generic tabular virtual table, so a file is a table
+  without loading it whole), and every source is reached through the
+  authorizer-guarded, read-only connection. Only `SELECT`, `WITH`, `VALUES`
+  and `EXPLAIN` statements run — multi-statement input, DDL/DML (including
+  CTE- or EXPLAIN-wrapped), `ATTACH`/`DETACH`, PRAGMA writes and extension
+  loading are all rejected _before_ execution (statement-level pre-validation
+  layered on the authorizer and a `query_only` connection). Typed named
+  parameters (`:name` — text / integer / decimal / float / boolean / date /
+  datetime / null) are validated up front and always bound through the driver,
+  never spliced into SQL, so a hostile string parameter is inert data. The
+  dialog gives you a schema browser over every source, a monospace editor (no
+  heavyweight editor dependency) with prefix-matched column/table autocomplete,
+  a typed `:param` table that tracks the query and flags bad values before a
+  run, prepare-only validation (errors + output columns), an `EXPLAIN QUERY
+PLAN` tree, and Run with rows-produced progress, a working cancel, and
+  configurable row / byte / time limits enforced during streaming. A document
+  edited mid-query reads its current revision consistently (F35 snapshot
+  semantics) and an approved file rewritten mid-query aborts the query instead
+  of mixing versions. Results stream into a bounded grid you page through with
+  "load more", and can be materialized as a new derived document (editable or
+  indexed by size) or exported directly to CSV. A settings-persisted query
+  history ring (capped, click to reload, never auto-executed) and the project
+  file's `queries` section for saved query definitions (name + sql + params +
+  sources — never results, never auto-run) round out the workspace; approved
+  files are managed inline (add via the file picker to register with the
+  approved-source registry; remove to revoke it).
 - **Parquet & Arrow interoperability** (palette → "Open Parquet/Arrow…" and
   "Export as Parquet/Arrow…"): open and export typed columnar datasets —
   Apache Parquet, Arrow IPC files (Feather v2 is the Arrow IPC file format),

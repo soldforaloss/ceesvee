@@ -124,6 +124,11 @@ mod schema_ops;
 mod semantic;
 mod settings;
 mod sort;
+/// F36 sandboxed SQL query workspace: approved-file tables over the generic
+/// tabular vtab, statement pre-validation, typed bound parameters, limited
+/// streaming execution with progress/cancel, result materialize/export,
+/// settings-persisted history and the project saved-queries section.
+mod sql_workspace;
 mod state;
 /// Public like [`job`]: the shared TabularSource/TabularSink contracts
 /// (schema + windowed reads + fingerprints; atomic streamed writes) that
@@ -211,6 +216,7 @@ pub fn run() {
         .manage(crate::safe_query::ApprovedSources::default())
         .manage(crate::db_browser::DbBrowserCache::default())
         .manage(crate::db_export::DbExportReports::default())
+        .manage(crate::sql_workspace::SqlWorkspace::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -435,6 +441,18 @@ pub fn run() {
             commands::compute_facets,
             commands::apply_facets,
             commands::convert_facets_to_filter,
+            sql_workspace::sql_register_file,
+            sql_workspace::sql_unregister_file,
+            sql_workspace::sql_list_files,
+            sql_workspace::sql_schema,
+            sql_workspace::sql_validate,
+            sql_workspace::sql_explain,
+            sql_workspace::sql_run,
+            sql_workspace::sql_result_rows,
+            sql_workspace::sql_materialize,
+            sql_workspace::sql_export,
+            sql_workspace::sql_history,
+            sql_workspace::sql_history_clear,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

@@ -167,9 +167,22 @@ import type {
   FacetSpec,
   FacetKind,
   FacetMode,
+  SqlParam,
+  SqlSchemaDto,
+  SqlValidation,
+  SqlPlanNode,
+  SqlRunSummary,
+  SqlRunRequest,
+  SqlTableInfo,
+  SqlHistoryEntry,
+  SqlSourceSelection,
+  SqlLimits,
+  SavedQuery,
 } from "../types";
 import type { GatingWarning } from "../lib/project";
 import { clampRecord, type RecordDraft } from "../lib/recordForm";
+import { mergeDetectedParams, pushHistoryEntry } from "../lib/sqlWorkspace";
+import { isCancelledError } from "../lib/jobs";
 
 export type ThemePref = "light" | "dark" | "system";
 
@@ -662,7 +675,7 @@ export interface DeriveState {
   jobId: number;
   /** The id the NEW document will register under. */
   docId: number;
-  kind: "append" | "join" | "groupBy" | "reshape" | "jsonImport" | "excelImport";
+  kind: "append" | "join" | "groupBy" | "reshape" | "jsonImport" | "excelImport" | "sqlMaterialize";
   processed: number;
   total: number | null;
   message: string | null;
@@ -942,6 +955,119 @@ const initialFacets: FacetsUiState = {
   dedupContext: null,
 };
 
+/**
+ * Sandboxed SQL query workspace (F36). Not document-scoped: it composes open
+ * documents, approved local files and one approved SQLite database, so the
+ * state persists across open/close (unlike a doc panel) and `open` gates the
+ * dialog. `runJobId`/`exportJobId` are learned from the job's progress events
+ * (the run/export commands are awaited and only return at the end), enabling
+ * cancel; `running` covers the pre-first-row window before a job id is known.
+ * Materialization rides the shared `derive` slot (kind `sqlMaterialize`).
+ */
+export interface SqlWorkspaceState {
+  open: boolean;
+  /** The editor's SQL text. */
+  sql: string;
+  /** Typed named parameters, reconciled from the SQL on every edit. */
+  params: SqlParam[];
+  /** Ids of the open documents selected as sources. */
+  documentIds: number[];
+  /** Registered approved-file tables (mirror of the backend registry). */
+  files: SqlTableInfo[];
+  /** Path of the approved SQLite database source, if any. */
+  database: string | null;
+  /** Bounded schema / autocomplete payload for the current selection. */
+  schema: SqlSchemaDto | null;
+  schemaLoading: boolean;
+  /** Per-run caps (blank = engine default). */
+  limits: SqlLimits;
+  /** Prepare-only validation result (null until Validate runs). */
+  validation: SqlValidation | null;
+  /** EXPLAIN QUERY PLAN tree (null until Explain runs). */
+  plan: SqlPlanNode[] | null;
+  /** Which secondary pane the results area shows. */
+  view: "results" | "plan";
+  /** True from run start until the awaited command resolves. */
+  running: boolean;
+  /** Running query job id once learned from progress (enables cancel). */
+  runJobId: number | null;
+  runProcessed: number;
+  /** The finished run's summary (identity + first window). */
+  result: SqlRunSummary | null;
+  /** Rows fetched beyond the first window (appended, bounded). */
+  extraRows: (string | null)[][];
+  loadingMore: boolean;
+  /** In-flight direct-export job id (null when idle). */
+  exportJobId: number | null;
+  exporting: boolean;
+  /** True while a file is being approved + registered. */
+  addingFile: boolean;
+  /** Persisted query history (most recent first) and saved definitions. */
+  history: SqlHistoryEntry[];
+  saved: SavedQuery[];
+  /** Last error, shown inline. */
+  error: string | null;
+  /** Transient status note (e.g. "Saved to project", "Materializing…"). */
+  notice: string | null;
+}
+
+const initialSqlWorkspace: SqlWorkspaceState = {
+  open: false,
+  sql: "",
+  params: [],
+  documentIds: [],
+  files: [],
+  database: null,
+  schema: null,
+  schemaLoading: false,
+  limits: {},
+  validation: null,
+  plan: null,
+  view: "results",
+  running: false,
+  runJobId: null,
+  runProcessed: 0,
+  result: null,
+  extraRows: [],
+  loadingMore: false,
+  exportJobId: null,
+  exporting: false,
+  addingFile: false,
+  history: [],
+  saved: [],
+  error: null,
+  notice: null,
+};
+
+/** F36: approvable file sources (CSV/JSON/Parquet/Arrow). SQLite is added as
+ * the separate database source; Excel is not a file-vtab source this cycle. */
+const SQL_SOURCE_FILE_FILTERS = [
+  { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
+  { name: "JSON", extensions: ["json", "jsonl", "ndjson"] },
+  { name: "Columnar", extensions: ["parquet", "arrow", "feather", "ipc", "arrows"] },
+  { name: "All files", extensions: ["*"] },
+];
+
+/** Build the engine source selection, dropping doc ids whose tab has closed. */
+function sqlSelectionOf(tabs: DocumentMeta[], ws: SqlWorkspaceState): SqlSourceSelection {
+  const open = new Set(tabs.map((t) => t.id));
+  return {
+    documents: ws.documentIds.filter((id) => open.has(id)).map((docId) => ({ docId })),
+    files: ws.files.map((f) => f.alias),
+    database: ws.database,
+  };
+}
+
+/** Full run/validate/explain request from the current workspace state. */
+function sqlRequestOf(tabs: DocumentMeta[], ws: SqlWorkspaceState): SqlRunRequest {
+  return {
+    sql: ws.sql,
+    params: ws.params,
+    sources: sqlSelectionOf(tabs, ws),
+    limits: ws.limits,
+  };
+}
+
 const initialFilter: FilterState = {
   open: false,
   spec: {
@@ -1128,6 +1254,8 @@ interface Store {
   excelImport: ExcelImportState | null;
   /** Local database browser (F35); non-null while its dialog is open. */
   dbBrowser: DbBrowserState | null;
+  /** Sandboxed SQL query workspace (F36); `open` gates its dialog. */
+  sqlWorkspace: SqlWorkspaceState;
   /** Database export flow (F35); non-null while its dialog is open. */
   dbExport: DbExportState | null;
   /** Running sampling/partitioning job (F48), if any. */
@@ -1627,6 +1755,57 @@ interface Store {
   importDbTable: (object: string, force: boolean) => Promise<void>;
   /** Dismiss the memory-bound "import anyway" prompt. */
   dismissDbForceImport: () => void;
+
+  // sandboxed SQL query workspace (F36)
+  /** Open the workspace dialog (refreshes files, history, saved queries and
+   * the schema). Preserves the editor's SQL/params across open/close. */
+  openSqlWorkspace: () => Promise<void>;
+  /** Close the dialog (cancels an in-flight run/export); keeps editor state. */
+  closeSqlWorkspace: () => void;
+  /** Replace the editor text and reconcile the typed parameter list. */
+  sqlSetText: (sql: string) => void;
+  /** Patch one named parameter (type and/or value). */
+  sqlSetParam: (name: string, patch: Partial<SqlParam>) => void;
+  /** Patch the per-run limits (row / byte / time). */
+  sqlSetLimits: (patch: Partial<SqlLimits>) => void;
+  /** Switch the results pane between the grid and the plan tree. */
+  sqlSetView: (view: "results" | "plan") => void;
+  /** Toggle whether an open document is included as a source. */
+  sqlToggleDocument: (docId: number) => void;
+  /** Pick + approve a SQLite database as the (single) database source. */
+  sqlChooseDatabase: () => Promise<void>;
+  /** Drop the database source (approval persists in the registry). */
+  sqlClearDatabase: () => void;
+  /** Pick + approve a CSV/JSON/Parquet/Arrow file and register it as a table. */
+  sqlAddFile: () => Promise<void>;
+  /** Unregister a file table and revoke its approval. */
+  sqlRemoveFile: (alias: string) => Promise<void>;
+  /** Refresh the bounded schema/autocomplete payload for the selection. */
+  sqlRefreshSchema: () => Promise<void>;
+  /** Prepare-only dry run: errors + output columns + parameters. */
+  sqlValidate: () => Promise<void>;
+  /** Build the EXPLAIN QUERY PLAN tree. */
+  sqlExplain: () => Promise<void>;
+  /** Run the statement (cancellable); stores the result and first window. */
+  sqlRun: () => Promise<void>;
+  /** Cancel the running query, if its job id is known yet. */
+  sqlCancelRun: () => Promise<void>;
+  /** Fetch the next bounded window of the current result. */
+  sqlLoadMore: () => Promise<void>;
+  /** Materialize the current result as a new derived document. */
+  sqlMaterialize: (forceIndexed: boolean) => Promise<void>;
+  /** Export the current result directly to a delimited file. */
+  sqlExport: () => Promise<void>;
+  /** Reload the editor from a history entry (never auto-runs). */
+  sqlLoadFromHistory: (entry: SqlHistoryEntry) => void;
+  /** Clear the persisted query history. */
+  sqlClearHistory: () => Promise<void>;
+  /** Save the current SQL + params + sources into the project's queries section. */
+  sqlSaveCurrent: (name: string) => Promise<void>;
+  /** Load a saved query definition into the editor (never auto-runs). */
+  sqlLoadSavedQuery: (query: SavedQuery) => void;
+  /** Delete a saved query definition from the project. */
+  sqlDeleteSaved: (id: string) => Promise<void>;
 
   // database export (F35)
   /** Open the export dialog for the active editable document. */
@@ -2248,6 +2427,11 @@ export const useStore = create<Store>((set, get) => {
     }
   };
 
+  /** Merge a patch into the (always-present) SQL workspace slice (F36). */
+  const patchWs = (patch: Partial<SqlWorkspaceState>) => {
+    set({ sqlWorkspace: { ...get().sqlWorkspace, ...patch } });
+  };
+
   /**
    * Run one atomic streaming save job to completion. Returns whether the file
    * was written (progress streams over the job events into `fileJobs`).
@@ -2614,6 +2798,7 @@ export const useStore = create<Store>((set, get) => {
     columnarExportResult: { running: false, report: null, error: null },
     excelImport: null,
     dbBrowser: null,
+    sqlWorkspace: initialSqlWorkspace,
     dbExport: null,
     sample: null,
     sampleError: null,
@@ -5023,6 +5208,28 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
+      // F36: the SQL run/export commands are awaited (they return only at the
+      // end), so their job id first reaches us HERE — capture it to enable the
+      // cancel button, and mirror the rows-produced / rows-written count.
+      if (progress.kind === "sqlQuery") {
+        const ws = get().sqlWorkspace;
+        if (!ws.running) return;
+        set({
+          sqlWorkspace: {
+            ...ws,
+            runJobId: progress.jobId,
+            runProcessed: progress.processed,
+          },
+        });
+        return;
+      }
+      if (progress.kind === "sqlExport") {
+        const ws = get().sqlWorkspace;
+        if (!ws.exporting) return;
+        set({ sqlWorkspace: { ...ws, exportJobId: progress.jobId } });
+        return;
+      }
+
       if (progress.kind === "pii") {
         if (get().pii.scanJobId !== progress.jobId) return;
         set((s) => ({
@@ -5363,7 +5570,14 @@ export const useStore = create<Store>((set, get) => {
         set({ derive: null });
         if (finished.status !== "done") {
           if (finished.status === "failed") {
-            set({ deriveError: finished.error ?? "the operation failed" });
+            // F36: surface a materialize failure inside the workspace (which
+            // stays open) rather than only as a global toast.
+            if (derive.kind === "sqlMaterialize") {
+              const ws = get().sqlWorkspace;
+              set({ sqlWorkspace: { ...ws, error: finished.error ?? "materialize failed" } });
+            } else {
+              set({ deriveError: finished.error ?? "the operation failed" });
+            }
           }
           return;
         }
@@ -5375,6 +5589,18 @@ export const useStore = create<Store>((set, get) => {
           // document is now open); a failure above leaves it open to show why.
           if (derive.kind === "jsonImport") set({ jsonImport: null });
           if (derive.kind === "excelImport") set({ excelImport: null });
+          // F36: the workspace stays open (a tool, not an import), so confirm
+          // the new document inline instead of closing.
+          if (derive.kind === "sqlMaterialize") {
+            const ws = get().sqlWorkspace;
+            set({
+              sqlWorkspace: {
+                ...ws,
+                notice: `Materialized ${meta.fileName} — opened in a new tab`,
+                error: null,
+              },
+            });
+          }
         } catch (e) {
           set({ deriveError: String(e) });
         }
@@ -6258,6 +6484,346 @@ export const useStore = create<Store>((set, get) => {
     dismissDbForceImport: () => {
       const st = get().dbBrowser;
       if (st) set({ dbBrowser: { ...st, forceImport: null } });
+    },
+
+    // ----- sandboxed SQL query workspace (F36) -----------------------------------
+
+    openSqlWorkspace: async () => {
+      const ws = get().sqlWorkspace;
+      // Default to including the active document the first time it opens.
+      const documentIds =
+        ws.documentIds.length === 0 && get().activeId != null
+          ? [get().activeId as number]
+          : ws.documentIds;
+      patchWs({ open: true, documentIds, error: null, notice: null });
+      // Refresh the registry-backed lists (files persist in the backend across
+      // close; history + saved queries are re-read fresh).
+      await Promise.all([
+        get().sqlRefreshSchema(),
+        (async () => {
+          const files = await api.sqlListFiles().catch(() => [] as SqlTableInfo[]);
+          patchWs({ files });
+        })(),
+        (async () => {
+          const history = await api.sqlHistory().catch(() => [] as SqlHistoryEntry[]);
+          patchWs({ history });
+        })(),
+        (async () => {
+          const state = await api.projectGet().catch(() => null);
+          patchWs({ saved: (state?.sections.queries as SavedQuery[] | undefined) ?? [] });
+        })(),
+      ]);
+    },
+
+    closeSqlWorkspace: () => {
+      const ws = get().sqlWorkspace;
+      // Cancel anything in flight; the editor state itself is preserved.
+      if (ws.runJobId != null) void api.cancelJob(ws.runJobId).catch(() => undefined);
+      if (ws.exportJobId != null) void api.cancelJob(ws.exportJobId).catch(() => undefined);
+      patchWs({ open: false, running: false, runJobId: null, exporting: false, exportJobId: null });
+    },
+
+    sqlSetText: (sql) => {
+      const ws = get().sqlWorkspace;
+      // Reconcile the typed parameter list; validation/plan go stale on edit.
+      patchWs({ sql, params: mergeDetectedParams(ws.params, sql), validation: null, plan: null });
+    },
+
+    sqlSetParam: (name, patch) => {
+      const ws = get().sqlWorkspace;
+      patchWs({
+        params: ws.params.map((p) => (p.name === name ? { ...p, ...patch } : p)),
+      });
+    },
+
+    sqlSetLimits: (patch) => {
+      const ws = get().sqlWorkspace;
+      patchWs({ limits: { ...ws.limits, ...patch } });
+    },
+
+    sqlSetView: (view) => patchWs({ view }),
+
+    sqlToggleDocument: (docId) => {
+      const ws = get().sqlWorkspace;
+      const has = ws.documentIds.includes(docId);
+      patchWs({
+        documentIds: has ? ws.documentIds.filter((id) => id !== docId) : [...ws.documentIds, docId],
+        validation: null,
+        plan: null,
+      });
+      void get().sqlRefreshSchema();
+    },
+
+    sqlChooseDatabase: async () => {
+      const selected = await openFileDialog({ multiple: false, filters: DB_FILE_FILTERS });
+      if (typeof selected !== "string") return;
+      try {
+        // dbOpen approves the path (and pins a session); we only need the
+        // approval, so release the session immediately — the approval persists.
+        const info = await api.dbOpen(selected);
+        await api.dbClose(info.sessionId).catch(() => undefined);
+        patchWs({ database: info.path, validation: null, plan: null, error: null });
+        await get().sqlRefreshSchema();
+      } catch (e) {
+        patchWs({ error: String(e) });
+      }
+    },
+
+    sqlClearDatabase: () => {
+      patchWs({ database: null, validation: null, plan: null });
+      void get().sqlRefreshSchema();
+    },
+
+    sqlAddFile: async () => {
+      const selected = await openFileDialog({
+        multiple: false,
+        filters: SQL_SOURCE_FILE_FILTERS,
+      });
+      if (typeof selected !== "string") return;
+      patchWs({ addingFile: true, error: null });
+      try {
+        await api.sqlRegisterFile(selected);
+        const files = await api.sqlListFiles();
+        patchWs({ files, addingFile: false, validation: null, plan: null });
+        await get().sqlRefreshSchema();
+      } catch (e) {
+        patchWs({ addingFile: false, error: String(e) });
+      }
+    },
+
+    sqlRemoveFile: async (alias) => {
+      try {
+        await api.sqlUnregisterFile(alias);
+      } catch (e) {
+        patchWs({ error: String(e) });
+      }
+      const files = await api.sqlListFiles().catch(() => get().sqlWorkspace.files);
+      patchWs({ files, validation: null, plan: null });
+      await get().sqlRefreshSchema();
+    },
+
+    sqlRefreshSchema: async () => {
+      const ws = get().sqlWorkspace;
+      const selection = sqlSelectionOf(get().tabs, ws);
+      patchWs({ schemaLoading: true });
+      try {
+        const schema = await api.sqlSchema(selection);
+        if (!get().sqlWorkspace.open) return;
+        patchWs({ schema, schemaLoading: false });
+      } catch (e) {
+        patchWs({ schemaLoading: false, error: String(e) });
+      }
+    },
+
+    sqlValidate: async () => {
+      const request = sqlRequestOf(get().tabs, get().sqlWorkspace);
+      patchWs({ error: null });
+      try {
+        const validation = await api.sqlValidate(request);
+        patchWs({ validation, plan: null, view: "results" });
+      } catch (e) {
+        patchWs({ error: String(e) });
+      }
+    },
+
+    sqlExplain: async () => {
+      const request = sqlRequestOf(get().tabs, get().sqlWorkspace);
+      patchWs({ error: null });
+      try {
+        const plan = await api.sqlExplain(request);
+        patchWs({ plan, view: "plan" });
+      } catch (e) {
+        patchWs({ error: String(e), plan: null });
+      }
+    },
+
+    sqlRun: async () => {
+      const ws0 = get().sqlWorkspace;
+      if (ws0.running) return;
+      const request = sqlRequestOf(get().tabs, ws0);
+      patchWs({
+        running: true,
+        runJobId: null,
+        runProcessed: 0,
+        error: null,
+        notice: null,
+        result: null,
+        extraRows: [],
+        view: "results",
+      });
+      try {
+        const result = await api.sqlRun(request);
+        patchWs({ result, running: false, runJobId: null });
+      } catch (e) {
+        if (isCancelledError(e)) {
+          patchWs({ running: false, runJobId: null, notice: "Query cancelled" });
+        } else {
+          patchWs({ running: false, runJobId: null, error: String(e) });
+        }
+      }
+      // The engine appended this run to the persisted history whatever the
+      // outcome; re-read it so the dropdown reflects it (optimistic + reconcile).
+      const optimistic = pushHistoryEntry(get().sqlWorkspace.history, {
+        sql: request.sql,
+        params: request.params,
+        sources: [],
+        ranAtMs: Date.now(),
+        status: get().sqlWorkspace.result ? "done" : "failed",
+      });
+      patchWs({ history: optimistic });
+      const history = await api.sqlHistory().catch(() => get().sqlWorkspace.history);
+      patchWs({ history });
+    },
+
+    sqlCancelRun: async () => {
+      const ws = get().sqlWorkspace;
+      if (ws.runJobId != null) await api.cancelJob(ws.runJobId).catch(() => undefined);
+    },
+
+    sqlLoadMore: async () => {
+      const ws = get().sqlWorkspace;
+      if (!ws.result || ws.loadingMore) return;
+      const loaded = ws.result.rows.length + ws.extraRows.length;
+      if (loaded >= ws.result.rowCount) return;
+      patchWs({ loadingMore: true });
+      try {
+        const window = await api.sqlResultRows(ws.result.resultId, loaded, 500);
+        const cur = get().sqlWorkspace;
+        if (cur.result?.resultId !== ws.result.resultId) return;
+        patchWs({ extraRows: [...cur.extraRows, ...window.rows], loadingMore: false });
+      } catch (e) {
+        patchWs({ loadingMore: false, error: String(e) });
+      }
+    },
+
+    sqlMaterialize: async (forceIndexed) => {
+      const ws = get().sqlWorkspace;
+      if (!ws.result) return;
+      if (get().derive) {
+        patchWs({ error: "Another derived-document job is already running." });
+        return;
+      }
+      patchWs({ error: null, notice: null });
+      try {
+        const started = await api.sqlMaterialize(ws.result.resultId, forceIndexed);
+        set({
+          derive: {
+            jobId: started.jobId,
+            docId: started.docId,
+            kind: "sqlMaterialize",
+            processed: 0,
+            total: null,
+            message: null,
+          },
+        });
+        consumeEarlyFinish(started.jobId);
+      } catch (e) {
+        patchWs({ error: String(e) });
+      }
+    },
+
+    sqlExport: async () => {
+      const ws = get().sqlWorkspace;
+      if (!ws.result || ws.exporting) return;
+      const dest = await saveFileDialog({
+        defaultPath: "query-result.csv",
+        filters: [
+          { name: "CSV", extensions: ["csv"] },
+          { name: "TSV", extensions: ["tsv"] },
+        ],
+      });
+      if (typeof dest !== "string") return;
+      const options: ExportOptions = {
+        delimiter: dest.toLowerCase().endsWith(".tsv") ? "\t" : ",",
+        encoding: "utf-8",
+        quoteStyle: "minimal",
+        lineEnding: "lf",
+        bom: false,
+        includeHeaders: true,
+      };
+      patchWs({ exporting: true, exportJobId: null, error: null, notice: null });
+      try {
+        const rows = await api.sqlExport(ws.result.resultId, dest, options);
+        patchWs({
+          exporting: false,
+          exportJobId: null,
+          notice: `Exported ${rows.toLocaleString()} row${rows === 1 ? "" : "s"}`,
+        });
+      } catch (e) {
+        if (isCancelledError(e)) {
+          patchWs({ exporting: false, exportJobId: null, notice: "Export cancelled" });
+        } else {
+          patchWs({ exporting: false, exportJobId: null, error: String(e) });
+        }
+      }
+    },
+
+    sqlLoadFromHistory: (entry) => {
+      patchWs({
+        sql: entry.sql,
+        params: mergeDetectedParams(entry.params, entry.sql),
+        validation: null,
+        plan: null,
+        notice: null,
+        error: null,
+      });
+    },
+
+    sqlClearHistory: async () => {
+      try {
+        await api.sqlHistoryClear();
+        patchWs({ history: [] });
+      } catch (e) {
+        patchWs({ error: String(e) });
+      }
+    },
+
+    sqlSaveCurrent: async (name) => {
+      const ws = get().sqlWorkspace;
+      const trimmed = name.trim();
+      if (trimmed === "") return;
+      const selection = sqlSelectionOf(get().tabs, ws);
+      const sources = [
+        ...selection.documents.map((d) => `doc:${d.docId}`),
+        ...selection.files,
+        ...(selection.database ? [selection.database] : []),
+      ];
+      const query: SavedQuery = {
+        id: crypto.randomUUID(),
+        name: trimmed,
+        sql: ws.sql,
+        params: ws.params,
+        sources,
+      };
+      const next = [...ws.saved.filter((q) => q.name !== trimmed), query];
+      try {
+        await api.projectSetSection("queries", next);
+        patchWs({ saved: next, notice: `Saved query "${trimmed}" to the project` });
+      } catch (e) {
+        patchWs({ error: String(e) });
+      }
+    },
+
+    sqlLoadSavedQuery: (query) => {
+      patchWs({
+        sql: query.sql,
+        params: mergeDetectedParams(query.params, query.sql),
+        validation: null,
+        plan: null,
+        notice: `Loaded "${query.name}"`,
+        error: null,
+      });
+    },
+
+    sqlDeleteSaved: async (id) => {
+      const ws = get().sqlWorkspace;
+      const next = ws.saved.filter((q) => q.id !== id);
+      try {
+        await api.projectSetSection("queries", next);
+        patchWs({ saved: next });
+      } catch (e) {
+        patchWs({ error: String(e) });
+      }
     },
 
     // ----- database export (F35) -------------------------------------------------

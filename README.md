@@ -303,6 +303,24 @@ and faithful on large, real-world delimited files.**
   two open documents on composite keys with trim / case / blank /
   numeric / date normalization, cardinality previews, expansion
   confirmation, and a unique-key lookup mode. Sources are preserved.
+- **SQL query workspace** — query your open documents, approved local files
+  (CSV / JSON / Parquet / Arrow, each a queryable table without a full import
+  via windowed reads), and an approved SQLite database together with read-only
+  SQL, under CEESVEE's local controlled-execution model. Only `SELECT` /
+  `WITH` / `VALUES` / `EXPLAIN` run — multi-statement input, DDL/DML (even
+  CTE- or EXPLAIN-wrapped), `ATTACH`, PRAGMA writes, and extension loading are
+  rejected before execution, and files outside the ones you explicitly approve
+  are never readable. Typed named parameters (`:name` — text / integer /
+  decimal / float / boolean / date / datetime / null) are validated up front
+  and always bound, never spliced into SQL. A schema browser over every
+  source, a dependency-free monospace editor with column/table autocomplete,
+  prepare-only validation (errors + output columns), an EXPLAIN QUERY PLAN
+  tree, and Run with rows-produced progress, a working cancel, and configurable
+  row / byte / time limits. A document edited mid-query reads its current
+  revision consistently; results stream into a bounded grid and can be
+  materialized as a new derived document (editable or indexed) or exported to
+  CSV. A persisted query-history ring (never auto-run) and saved query
+  definitions in the project complete the workspace.
 - **Group by** — count / distinct / sum / mean / min / max / median /
   first / last / concatenate aggregations into a new grouped document,
   with normalized grouping, blank-key policies, and ordering options.

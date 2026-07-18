@@ -142,6 +142,15 @@ import type {
   FacetConfig,
   FacetResultSet,
   FacetConversion,
+  SqlSourceSelection,
+  SqlSchemaDto,
+  SqlRunRequest,
+  SqlValidation,
+  SqlPlanNode,
+  SqlRunSummary,
+  SqlResultWindow,
+  SqlTableInfo,
+  SqlHistoryEntry,
 } from "../types";
 
 export const openFile = (path: string, options?: OpenOptions) =>
@@ -1583,3 +1592,59 @@ export const startDbExport = (docId: number, expectedRevision: number, spec: DbE
 /** Fetch (and consume) the report of a finished export job. */
 export const dbExportReport = (jobId: number) =>
   invoke<DbExportResult>("db_export_report", { jobId });
+
+// ----- sandboxed SQL query workspace (F36) -----------------------------------
+// Queries run through the F35 SafeQueryEngine (read-only, authorizer-guarded).
+// Picking a file in the OS dialog is the user's approval: `sqlRegisterFile`
+// joins the path to the approved-source registry, and nothing outside it is
+// readable. Only SELECT/WITH/VALUES/EXPLAIN reach the engine; every blocked
+// statement fails before execution. Parameters are bound, never interpolated.
+
+/** Approve a user-picked file and register it as a queryable table (CSV / JSON /
+ * Parquet / Arrow). Runs as a cancellable job; `pointer` selects a JSON array. */
+export const sqlRegisterFile = (path: string, pointer?: string | null) =>
+  invoke<SqlTableInfo>("sql_register_file", { path, pointer: pointer ?? null });
+
+/** Forget a registered file table and revoke its approval. */
+export const sqlUnregisterFile = (alias: string) => invoke<void>("sql_unregister_file", { alias });
+
+/** The registered file tables. */
+export const sqlListFiles = () => invoke<SqlTableInfo[]>("sql_list_files");
+
+/** Bounded schema-browser / autocomplete payload for a source selection. */
+export const sqlSchema = (selection: SqlSourceSelection) =>
+  invoke<SqlSchemaDto>("sql_schema", { selection });
+
+/** Prepare-only dry run: errors, output columns and the named parameters used.
+ * Never executes anything. */
+export const sqlValidate = (request: SqlRunRequest) =>
+  invoke<SqlValidation>("sql_validate", { request });
+
+/** EXPLAIN QUERY PLAN tree for a statement (parameters bound). */
+export const sqlExplain = (request: SqlRunRequest) =>
+  invoke<SqlPlanNode[]>("sql_explain", { request });
+
+/** Run one statement as a cancellable job (kind `sqlQuery`). Stores the bounded
+ * result spool (replacing the previous one) and returns its first window; the
+ * run is appended to the persisted history whatever the outcome. */
+export const sqlRun = (request: SqlRunRequest) => invoke<SqlRunSummary>("sql_run", { request });
+
+/** One bounded window of the stored result. */
+export const sqlResultRows = (resultId: number, start: number, limit: number) =>
+  invoke<SqlResultWindow>("sql_result_rows", { resultId, start, limit });
+
+/** Materialize the stored result as a NEW derived document (editable when
+ * small, indexed when large or forced). Completes via the `derive` job. */
+export const sqlMaterialize = (resultId: number, forceIndexed: boolean) =>
+  invoke<IndexedOpenStart>("sql_materialize", { resultId, forceIndexed });
+
+/** Export the stored result directly to a delimited file (atomic commit;
+ * cancellable job of kind `sqlExport`). Resolves with rows written. */
+export const sqlExport = (resultId: number, path: string, options: ExportOptions) =>
+  invoke<number>("sql_export", { resultId, path, options });
+
+/** The persisted query history (most recent first). Data only — nothing runs. */
+export const sqlHistory = () => invoke<SqlHistoryEntry[]>("sql_history");
+
+/** Clear the persisted query history. */
+export const sqlHistoryClear = () => invoke<void>("sql_history_clear");
