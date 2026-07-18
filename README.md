@@ -58,6 +58,16 @@ and faithful on large, real-world delimited files.**
   explode into rows, or drop). Signed/unsigned 64-bit integers, exact
   decimal precision/scale, timestamps with timezone, and null-vs-empty-string
   all survive intact.
+- **Import & export Excel `.xlsx`** — a chooser lists every sheet (including
+  hidden ones), named tables and ranges, used ranges, and formula/merged-cell
+  counts. Pick a sheet, table or cell range; choose the header row, how merged
+  cells and formulas are handled (cached result, formula text, or blank), and
+  blank-row/column trimming. The workbook's 1900/1904 date system is honoured
+  (no date shifting) and leading-zero text stays text. Export one document — or
+  several open tabs as one sheet each — with optional header styling, a frozen
+  header row, an autofilter, column widths, and typed numbers/dates/booleans
+  from the declared schema; imports always create a new document, never an
+  in-place `.xlsx` save.
 - Auto-detect the **delimiter** (comma, tab, semicolon, pipe) with a manual /
   custom override — plus an **advanced import** for preambles, comment
   lines, custom quoting/escaping, multi-row headers, and footers.

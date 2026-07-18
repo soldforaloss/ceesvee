@@ -35,12 +35,16 @@ use crate::dictionary::{
 use crate::document::{ChangeSummary, Document};
 use crate::dto::{
     BackupPolicy, CellRect, ColumnSummary, DocumentMeta, EncodingCompatibility,
-    EncodingIncompatibility, ExportOptions, ExportScope, ExternalChange, FileFingerprint,
-    FilterGroup, FindMatch, FindOptions, IndexedOpenStart, JsonExportOptions, OpenOptions,
-    ReparsePreview, ReplaceResult, RowsResponse, ScopeCounts, SelectionStats, SortKey,
-    SplitOptions,
+    EncodingIncompatibility, ExcelExportOptions, ExcelSheetExport, ExportOptions, ExportScope,
+    ExternalChange, FileFingerprint, FilterGroup, FindMatch, FindOptions, IndexedOpenStart,
+    JsonExportOptions, OpenOptions, ReparsePreview, ReplaceResult, RowsResponse, ScopeCounts,
+    SelectionStats, SortKey, SplitOptions,
 };
 use crate::error::{AppError, AppResult};
+use crate::excel::{
+    self, ExcelImportOptions, ExcelImportPreview, ExcelInspectCache, ExcelPreviewCache,
+    SheetSource, WorkbookInfo,
+};
 use crate::follow::{self, FollowRegistry};
 use crate::groupby::{self, GroupByPreview, GroupBySpec};
 use crate::highlight::{
@@ -5021,4 +5025,191 @@ pub fn get_columnar_export_report(
     reports: State<'_, ColumnarExportReportCache>,
 ) -> Option<ColumnarExportReport> {
     reports.get(job_id)
+}
+
+// ----- Excel .xlsx interoperability (F34) --------------------------------------
+
+/// Start a workbook inspection as a cancellable job (kind "scan"): sheets (with
+/// visibility), named tables, named ranges, used ranges + dimensions, formula
+/// and merged-cell counts, header candidates and bounded previews. Nothing is
+/// opened; fetch the result with `get_excel_inspect` after `job-finished`.
+#[tauri::command]
+pub async fn excel_inspect(
+    path: String,
+    app: tauri::AppHandle,
+    jobs: State<'_, JobRegistry>,
+    excel_inspects: State<'_, ExcelInspectCache>,
+) -> AppResult<u64> {
+    let sink = excel_inspects.share();
+    let ctx = jobs.begin_for_app(&app, "scan", None);
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let info = excel::inspect(Path::new(&path), Some(ctx))?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(job_id, info);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// The inspection of a finished workbook scan, by its job id.
+#[tauri::command]
+pub fn get_excel_inspect(
+    job_id: u64,
+    excel_inspects: State<'_, ExcelInspectCache>,
+) -> Option<WorkbookInfo> {
+    excel_inspects.get(job_id)
+}
+
+/// Start an import preview of the chosen source/options as a cancellable job
+/// (kind "scan"): columns with inferred types, sample rows, projected
+/// dimensions and warnings (including formula cells with no cached result).
+/// Fetch the result with `get_excel_import_preview` after `job-finished`.
+#[tauri::command]
+pub async fn excel_import_preview(
+    path: String,
+    options: Option<ExcelImportOptions>,
+    app: tauri::AppHandle,
+    jobs: State<'_, JobRegistry>,
+    excel_previews: State<'_, ExcelPreviewCache>,
+) -> AppResult<u64> {
+    let options = options.unwrap_or_default();
+    let sink = excel_previews.share();
+    let ctx = jobs.begin_for_app(&app, "scan", None);
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let preview = excel::preview(Path::new(&path), &options, Some(ctx))?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(job_id, preview);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// The preview of a finished Excel import scan, by its job id.
+#[tauri::command]
+pub fn get_excel_import_preview(
+    job_id: u64,
+    excel_previews: State<'_, ExcelPreviewCache>,
+) -> Option<ExcelImportPreview> {
+    excel_previews.get(job_id)
+}
+
+/// Run an Excel import as a cancellable job (kind "derive"): the selected sheet
+/// / table / named range (optionally a cell sub-range) is read under the chosen
+/// merged / formula / date-system / trimming options into a NEW CEESVEE
+/// document that registers under the returned doc id when the job finishes. The
+/// original workbook is never modified; a failure leaves no document behind.
+#[tauri::command]
+pub async fn excel_import_apply(
+    path: String,
+    options: Option<ExcelImportOptions>,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<IndexedOpenStart> {
+    let options = options.unwrap_or_default();
+    let doc_id = lock(&state)?.alloc_id();
+    let cache_root = index_cache_root(&app)?;
+
+    let ctx = jobs.begin_for_app(&app, "derive", Some(doc_id));
+    let job_id = ctx.id;
+    let app_for_job = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            use tauri::Manager;
+            let doc = excel::import(Path::new(&path), &options, &cache_root, doc_id, Some(ctx))?;
+            let registry = app_for_job.state::<Mutex<AppState>>();
+            registry
+                .lock()
+                .map_err(|_| AppError::Other("internal state lock error".into()))?
+                .insert(doc);
+            Ok(())
+        })
+        .await;
+    });
+    Ok(IndexedOpenStart { job_id, doc_id })
+}
+
+/// Start an Excel `.xlsx` export as a cancellable job (kind "export"): one sheet
+/// from one document, or several sheets (one per selected tab) into a single
+/// workbook. Revisions, scopes, sheet names and Excel's row/column limits are
+/// validated BEFORE the job spawns (and again inside it); the workbook is
+/// committed through the atomic-save pipeline, so a failure or cancellation
+/// never touches an existing destination.
+#[tauri::command]
+pub async fn excel_export(
+    sheets: Vec<ExcelSheetExport>,
+    path: String,
+    options: ExcelExportOptions,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<u64> {
+    if sheets.is_empty() {
+        return Err(AppError::invalid(
+            "an Excel export needs at least one sheet",
+        ));
+    }
+    // Resolve every sheet's document handle up front.
+    let handles: Vec<SharedDocument> = sheets
+        .iter()
+        .map(|s| doc_handle(&state, s.doc_id))
+        .collect::<AppResult<_>>()?;
+    // Fail fast: revisions, scopes, sheet names and Excel limits reject the
+    // invoke, not a background job.
+    {
+        let guards: Vec<_> = handles
+            .iter()
+            .map(|h| h.read().map_err(poisoned))
+            .collect::<AppResult<Vec<_>>>()?;
+        let sources: Vec<SheetSource> = guards
+            .iter()
+            .zip(&sheets)
+            .map(|(g, s)| SheetSource {
+                doc: g,
+                name: s.name.clone(),
+                scope: s.scope.clone(),
+                expected_revision: s.expected_revision,
+                grid_widths_px: s.grid_widths_px.clone(),
+            })
+            .collect();
+        excel::plan_export(&sources)?;
+    }
+
+    let first_doc = sheets.first().map(|s| s.doc_id);
+    let ctx = jobs.begin_for_app(&app, "export", first_doc);
+    let job_id = ctx.id;
+    let dest = PathBuf::from(&path);
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let guards: Vec<_> = handles
+                .iter()
+                .map(|h| h.read().map_err(poisoned))
+                .collect::<AppResult<Vec<_>>>()?;
+            let sources: Vec<SheetSource> = guards
+                .iter()
+                .zip(&sheets)
+                .map(|(g, s)| SheetSource {
+                    doc: g,
+                    name: s.name.clone(),
+                    scope: s.scope.clone(),
+                    expected_revision: s.expected_revision,
+                    grid_widths_px: s.grid_widths_px.clone(),
+                })
+                .collect();
+            excel::export(&sources, &dest, &options, ctx)?;
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
 }
