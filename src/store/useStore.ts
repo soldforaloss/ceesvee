@@ -22,7 +22,11 @@ import { annotationExportName } from "../lib/annotations";
 import { currentOpenOptions, fingerprintKey } from "../lib/reopen";
 import { defaultImportOptions } from "../lib/jsonImport";
 import { suggestJsonFileName } from "../lib/jsonExport";
-import { isColumnarPath, suggestColumnarFileName } from "../lib/columnar";
+import {
+  defaultColumnarOpenOptions,
+  isColumnarPath,
+  suggestColumnarFileName,
+} from "../lib/columnar";
 import { isLegacyEncoding } from "../lib/save";
 import {
   availableOnlyChoices,
@@ -38,6 +42,7 @@ import {
   panelsFromLayout,
   pathKey,
   projectSnapshot,
+  restoreOpenRoute,
   type PanelLayout,
   type ProjectSnapshot,
   type SourceAnnotationsSection,
@@ -1424,6 +1429,10 @@ interface Store {
   // Parquet / Arrow interop (F32)
   /** Inspect a columnar file and open the inspect dialog. */
   openColumnarInspect: (path: string) => Promise<void>;
+  /** Restore a columnar source non-interactively (F37): reopen it directly as
+   * an indexed read-only document, awaiting the open job, WITHOUT the inspect
+   * dialog. Used by project open so a Parquet / Arrow tab is actually created. */
+  openColumnarRestore: (path: string) => Promise<void>;
   /** Close the inspect dialog. */
   dismissColumnarInspect: () => void;
   /** Open the inspected file as an indexed READ-ONLY document. */
@@ -2218,7 +2227,16 @@ export const useStore = create<Store>((set, get) => {
     openingProject = true;
     try {
       for (const entry of plan.entries) {
-        await get().openPath(entry.path);
+        // A restore is non-interactive: a columnar (Parquet / Arrow) source
+        // must NOT route through the interactive inspect dialog `openPath`
+        // would open — that returns without creating a tab, leaving the
+        // restored source missing until the user manually confirmed it. Reopen
+        // it directly as an indexed read-only document instead (F37).
+        if (restoreOpenRoute(entry.path) === "columnarIndexed") {
+          await get().openColumnarRestore(entry.path);
+        } else {
+          await get().openPath(entry.path);
+        }
       }
     } finally {
       openingProject = false;
@@ -5856,6 +5874,39 @@ export const useStore = create<Store>((set, get) => {
             ? { excelImport: { ...s.excelImport, inspectJobId: null, inspectError: String(e) } }
             : {},
         );
+      }
+    },
+
+    openColumnarRestore: async (path) => {
+      // Non-interactive columnar restore (F37 project open). Reuse an already
+      // open tab, otherwise reopen the source as an indexed READ-ONLY document
+      // with default policies — no inspect dialog. Indexed is the memory-safe,
+      // prompt-free reproduction of a columnar source (it never hits the F10
+      // memory decision, and indexed documents stay read-only unless the user
+      // later converts them). The open is a job, so await it here rather than
+      // via the shared `indexing` pipeline: the restore's later steps (tab
+      // order, annotations, view reapply) need the tab to exist synchronously.
+      const existing = get().tabs.find((t) => t.path === path);
+      if (existing) {
+        set((s) => switchPatch(s, existing.id));
+        return;
+      }
+      try {
+        const started = await api.columnarOpenIndexed(path, defaultColumnarOpenOptions());
+        const finished = await awaitJob(started.jobId);
+        if (finished.status !== "done") {
+          // A restore only warns on incompatibility; a failed columnar open
+          // surfaces its message but never blocks the rest of the project.
+          if (finished.status === "failed") {
+            set({ error: finished.error ?? `Could not restore ${path}` });
+          }
+          return;
+        }
+        const meta = await api.getMeta(started.docId);
+        set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] }));
+        pushRecent(path);
+      } catch (e) {
+        set({ error: String(e) });
       }
     },
 
