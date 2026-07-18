@@ -23,6 +23,10 @@ mod crossval;
 /// table opens, bounded editable imports and external-change detection.
 /// SQLite ONLY this cycle — DuckDB is out of scope (see the module docs).
 mod db_browser;
+/// Database export (F35 write side): mapping + conversion previews and the
+/// single-transaction create/append/replace write path with explicit
+/// primary-key conflict policies. The ONE place CEESVEE writes to a database.
+mod db_export;
 mod dedup;
 mod delimiter;
 mod derived;
@@ -198,6 +202,7 @@ pub fn run() {
         .manage(crate::excel::ExcelPreviewCache::default())
         .manage(crate::safe_query::ApprovedSources::default())
         .manage(crate::db_browser::DbBrowserCache::default())
+        .manage(crate::db_export::DbExportReports::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -416,6 +421,9 @@ pub fn run() {
             db_browser::start_db_open_table,
             db_browser::start_db_import_table,
             db_browser::db_doc_refresh_probe,
+            db_export::db_export_preview,
+            db_export::start_db_export,
+            db_export::db_export_report,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

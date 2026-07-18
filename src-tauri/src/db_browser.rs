@@ -220,7 +220,7 @@ impl DbBrowserCache {
 // Schema reading
 // ---------------------------------------------------------------------------
 
-fn quote_ident(name: &str) -> String {
+pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", escape_double_quote(name))
 }
 
@@ -294,7 +294,7 @@ fn ignore_no_rows<T>(e: rusqlite::Error) -> Result<Option<T>, rusqlite::Error> {
 }
 
 /// Whether `name` is a WITHOUT ROWID table (`pragma_table_list.wr`).
-fn is_without_rowid(conn: &Connection, name: &str) -> AppResult<bool> {
+pub(crate) fn is_without_rowid(conn: &Connection, name: &str) -> AppResult<bool> {
     Ok(conn
         .query_row(
             "SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
@@ -449,7 +449,7 @@ fn read_object_info(conn: &Connection, name: &str, kind: &str) -> AppResult<DbOb
 
 /// Row-count estimate with bounded work: `sqlite_stat1` when ANALYZE ran,
 /// otherwise a scan capped at [`ROW_COUNT_CAP`] rows.
-fn row_estimate(conn: &Connection, name: &str, kind: &str) -> AppResult<(u64, bool)> {
+pub(crate) fn row_estimate(conn: &Connection, name: &str, kind: &str) -> AppResult<(u64, bool)> {
     if kind == "table" {
         // sqlite_stat1 only exists after ANALYZE; any failure (missing
         // table, NULL stat) quietly falls through to the capped scan.
@@ -935,7 +935,7 @@ fn display_label(path: &Path, object: &str) -> String {
     format!("{file} → {object}")
 }
 
-fn blocking_err(e: tauri::Error) -> AppError {
+pub(crate) fn blocking_err(e: tauri::Error) -> AppError {
     AppError::Other(format!("background task failed: {e}"))
 }
 
