@@ -120,6 +120,7 @@ import type {
   TagToColumnPreview,
   TagToColumnTarget,
   RecordLayout,
+  DraftField,
 } from "../types";
 import type { GatingWarning } from "../lib/project";
 import { clampRecord, type RecordDraft } from "../lib/recordForm";
@@ -419,6 +420,13 @@ const initialRecordUi = (): RecordUiState => ({
   draftRevision: null,
   layout: null,
 });
+
+/**
+ * The outcome of a record-form draft commit (F41): `saved` applied, `noop`
+ * nothing changed, `stale` the document moved under the draft (rejected by the
+ * server-side revision guard — the draft was discarded), `error` anything else.
+ */
+export type SaveDraftResult = "saved" | "noop" | "stale" | "error";
 
 /** A matched profile suggestion awaiting the user's decision. */
 export interface ProfileSuggestion {
@@ -746,8 +754,15 @@ interface Store {
   setRecordDraftField: (col: number, value: string) => void;
   /** Discard the whole record draft. */
   clearRecordDraft: () => void;
-  /** Commit a record draft as ONE set_cells batch; clears the draft on success. */
-  saveRecordDraft: (cells: [number, number, string][]) => Promise<boolean>;
+  /** Commit a record draft (the changed fields of ONE display row) as one
+   * revision-guarded, batched set_cells → one undo op. Clears the draft on
+   * success; on a stale revision (the document moved under the draft) discards
+   * it and returns "stale" so the caller can surface the same notice. */
+  saveRecordDraft: (
+    row: number,
+    edits: DraftField[],
+    expectedRevision: number,
+  ) => Promise<SaveDraftResult>;
   /** Replace the ACTIVE document's record-form layout (null = automatic). */
   setRecordLayout: (layout: RecordLayout | null) => void;
   /** Scroll the grid to a field's column on the current record's row (F41). */
@@ -4143,20 +4158,31 @@ export const useStore = create<Store>((set, get) => {
     clearRecordDraft: () =>
       set((s) => ({ record: { ...s.record, draft: {}, draftRevision: null } })),
 
-    saveRecordDraft: async (cells) => {
+    saveRecordDraft: async (row, edits, expectedRevision) => {
       const id = get().activeId;
-      if (id == null || cells.length === 0) return false;
+      if (id == null) return "error";
+      if (edits.length === 0) return "noop";
       try {
-        // One batched, F31-validated commit → exactly one undo step for the
-        // whole record. A strict-invalid batch is rejected here (the UI gates
-        // Save on the pre-check, so this is defence in depth).
-        const meta = await api.setCells(id, cells);
+        // One batched, F31-validated, revision-guarded commit → exactly one undo
+        // step for the whole record. A strict-invalid batch is rejected here
+        // (the UI gates Save on the pre-check, so that is defence in depth), and
+        // a document that moved under the draft is rejected by the server-side
+        // revision guard before any cell changes.
+        const meta = await api.saveRecordDraft(id, row, edits, expectedRevision);
         reloadDoc(meta);
         set((s) => ({ record: { ...s.record, draft: {}, draftRevision: null } }));
-        return true;
+        return "saved";
       } catch (e) {
+        // A stale revision means the row this draft was composed against may have
+        // remapped; discard the draft (the backend already refused to write it)
+        // and let the caller show the "document changed" notice. Other failures
+        // surface as an error.
+        if (String(e).includes("stale revision")) {
+          set((s) => ({ record: { ...s.record, draft: {}, draftRevision: null } }));
+          return "stale";
+        }
         set({ error: String(e) });
-        return false;
+        return "error";
       }
     },
 

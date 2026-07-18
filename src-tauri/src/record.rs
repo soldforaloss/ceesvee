@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dictionary::DictionaryField;
 use crate::document::Document;
+use crate::error::{AppError, AppResult};
 use crate::schema::{self, CellState, LogicalType, SchemaIssue, ValidationMode};
 use crate::schema_ops;
 use crate::semantic::{SemanticReport, SemanticType};
@@ -356,6 +357,41 @@ pub fn validate_draft(doc: &Document, edits: &[DraftField]) -> DraftValidation {
 }
 
 // ---------------------------------------------------------------------------
+// Draft commit (revision-guarded, one-undo batch)
+// ---------------------------------------------------------------------------
+
+/// Commit the changed fields of ONE record — every edit shares the same
+/// `display_row` — as a single F31-validated `set_cells` batch (one undo step).
+///
+/// Guarded against a stale draft: a display→absolute row mapping is only stable
+/// while the document has not moved, so if a filter/sort/insert/delete/transform
+/// has bumped the revision since the fields were read at `expected_revision`,
+/// the commit is REJECTED (with [`AppError::StaleRevision`]) before ANY cell
+/// changes. This closes the deferred-write hole where a draft composed against
+/// one row could otherwise be written onto whichever absolute row the (now
+/// remapped) display index happens to resolve to at write time — mirroring the
+/// revision guard every other prepare-then-apply path in the app uses. Returns
+/// the count of advisory issues recorded (see [`schema_ops::apply_validated_cells`]).
+pub fn commit_draft(
+    doc: &mut Document,
+    display_row: usize,
+    edits: &[DraftField],
+    expected_revision: u64,
+) -> AppResult<usize> {
+    // Guard FIRST, before translating the display row: a moved document may map
+    // this display index onto a different (or now out-of-range) absolute row.
+    doc.check_revision(expected_revision)?;
+    let abs = doc
+        .display_to_abs(display_row)
+        .ok_or_else(|| AppError::invalid("row index out of range"))?;
+    let cells: Vec<(usize, usize, String)> = edits
+        .iter()
+        .map(|e| (abs, e.col, e.value.clone()))
+        .collect();
+    schema_ops::apply_validated_cells(doc, cells)
+}
+
+// ---------------------------------------------------------------------------
 // Per-row advisory schema-issue lookup
 // ---------------------------------------------------------------------------
 
@@ -376,6 +412,7 @@ pub fn issues_for_row(doc: &Document, abs_row: usize) -> Vec<SchemaIssue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dto::SortKey;
     use crate::parse::{parse, ParseSettings};
     use crate::schema::ColumnSchema;
     use crate::semantic::{ColumnSemantics, SemanticReport};
@@ -682,6 +719,128 @@ mod tests {
         doc.undo().unwrap();
         assert_eq!(row_cells(&doc, 0), vec!["1", "2", "3"]);
         assert!(!doc.can_undo());
+    }
+
+    // ----- display→absolute remap + stale-draft guard (filters / sorts) ----
+
+    #[test]
+    fn fetch_and_commit_hit_the_correct_absolute_row_under_a_filter() {
+        // Four source rows; a filter presents a SUBSET in a non-identity order,
+        // so display row != absolute row and display_to_abs must remap through
+        // the composed view (exercising its `Some(view)` branch through F41).
+        let mut doc = doc_from_csv("a,b\nr0,x\nr1,y\nr2,z\nr3,w\n");
+        doc.set_filter(vec![2, 0]).unwrap(); // display 0 -> abs 2, display 1 -> abs 0
+        assert_eq!(doc.display_to_abs(0), Some(2));
+        assert_eq!(doc.display_to_abs(1), Some(0));
+
+        // The record fetch reads through the remap: display 0 shows absolute row 2.
+        let view = fetch(&doc, 0, None);
+        assert_eq!(view.abs_row, 2, "display 0 maps to absolute row 2");
+        assert_eq!(view.display_row, 0);
+        assert_eq!(view.fields[0].raw, "r2");
+        assert_eq!(view.visible_len, 2);
+
+        // A draft commit at display row 1 must land on absolute row 0 — NOT row 1.
+        let rev = doc.revision();
+        let recorded = commit_draft(
+            &mut doc,
+            1,
+            &[DraftField {
+                col: 1,
+                value: "Y!".into(),
+            }],
+            rev,
+        )
+        .unwrap();
+        assert_eq!(recorded, 0, "no schema, no advisory issue");
+        assert_eq!(
+            row_cells(&doc, 0),
+            vec!["r0", "Y!"],
+            "absolute row 0 edited"
+        );
+        assert_eq!(row_cells(&doc, 1), vec!["r1", "y"], "row 1 untouched");
+        assert_eq!(row_cells(&doc, 2), vec!["r2", "z"], "row 2 untouched");
+        assert_eq!(
+            doc.changes_since_save().len(),
+            1,
+            "one undo op for the batch"
+        );
+    }
+
+    #[test]
+    fn fetch_and_commit_hit_the_correct_absolute_row_under_a_view_sort() {
+        // Keys out of source order; an ascending view sort reorders the DISPLAY
+        // without moving source rows, so again display != absolute.
+        let mut doc = doc_from_csv("k,v\n3,a\n1,b\n2,c\n");
+        doc.set_view_sort(vec![SortKey {
+            column: 0,
+            descending: false,
+        }])
+        .unwrap();
+        // Text order of keys "1","2","3": display 0->abs1, 1->abs2, 2->abs0.
+        assert_eq!(doc.display_to_abs(0), Some(1));
+        assert_eq!(doc.display_to_abs(2), Some(0));
+
+        let view = fetch(&doc, 0, None);
+        assert_eq!(
+            view.abs_row, 1,
+            "lowest key sits at display 0 = absolute row 1"
+        );
+        assert_eq!(view.fields[0].raw, "1");
+
+        // Display 2 is the highest key "3" = absolute row 0.
+        let rev = doc.revision();
+        commit_draft(
+            &mut doc,
+            2,
+            &[DraftField {
+                col: 1,
+                value: "A!".into(),
+            }],
+            rev,
+        )
+        .unwrap();
+        assert_eq!(row_cells(&doc, 0), vec!["3", "A!"], "absolute row 0 edited");
+        assert_eq!(row_cells(&doc, 1), vec!["1", "b"], "untouched");
+        assert_eq!(row_cells(&doc, 2), vec!["2", "c"], "untouched");
+    }
+
+    #[test]
+    fn commit_draft_rejects_a_stale_revision_and_mutates_nothing() {
+        let mut doc = doc_from_csv("a,b\n1,2\n3,4\n");
+        // The draft is composed against this revision...
+        let stale = doc.revision();
+        // ...but the view then moves under it: a sort bumps the revision and
+        // remaps which absolute row display 0 points at ("3,4" instead of "1,2").
+        doc.set_view_sort(vec![SortKey {
+            column: 0,
+            descending: true,
+        }])
+        .unwrap();
+        assert_ne!(doc.revision(), stale, "the sort bumped the revision");
+        assert_eq!(
+            doc.display_to_abs(0),
+            Some(1),
+            "display 0 now maps to row 1"
+        );
+
+        let err = commit_draft(
+            &mut doc,
+            0,
+            &[DraftField {
+                col: 1,
+                value: "99".into(),
+            }],
+            stale,
+        );
+        assert!(
+            matches!(err, Err(AppError::StaleRevision { .. })),
+            "a commit at a stale revision is rejected before any write"
+        );
+        // Not one cell changed, and nothing entered the undo stack.
+        assert_eq!(row_cells(&doc, 0), vec!["1", "2"]);
+        assert_eq!(row_cells(&doc, 1), vec!["3", "4"]);
+        assert!(!doc.can_undo(), "the rejected commit left no undo entry");
     }
 
     // ----- per-row advisory schema-issue lookup ---------------------------

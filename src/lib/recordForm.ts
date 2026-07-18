@@ -51,20 +51,6 @@ export function isDraftDirty(fields: RecordField[], draft: RecordDraft): boolean
 }
 
 /**
- * The `set_cells` batch for a draft save: [displayRow, col, value] triples for
- * every changed field. The display row is re-translated to an absolute row at
- * commit time by the backend, so the edit lands under the current filter/sort.
- * Empty when nothing changed (the caller should not save in that case).
- */
-export function draftCommitCells(
-  displayRow: number,
-  fields: RecordField[],
-  draft: RecordDraft,
-): [number, number, string][] {
-  return changedFields(fields, draft).map((c) => [displayRow, c.col, c.value]);
-}
-
-/**
  * Clamp a target record index into the visible range. Returns `null` when there
  * are no visible records (an empty or fully-filtered document).
  */

@@ -208,6 +208,7 @@ pub fn run() {
             commands::fetch_record,
             commands::validate_record_draft,
             commands::get_record_issues,
+            commands::save_record_draft,
             commands::paste,
             commands::copy_as,
             commands::preview_paste_special,

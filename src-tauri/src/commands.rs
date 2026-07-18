@@ -3525,6 +3525,27 @@ pub fn get_record_issues(doc_id: u64, row: usize, state: Db<'_>) -> AppResult<Ve
     })
 }
 
+/// Commit a record-form draft — all changed fields of ONE visible row (display
+/// coordinates) — as a single F31-validated `set_cells` batch (one undo step).
+/// Revision-guarded: if the document moved since `expected_revision` (the
+/// revision the form's fields were read at), the commit is rejected with
+/// [`AppError::StaleRevision`] BEFORE the display row is translated or any cell
+/// changes — so a stale draft can never be written onto a row a changed
+/// filter/sort/structural edit has since remapped under the same display index.
+#[tauri::command]
+pub fn save_record_draft(
+    doc_id: u64,
+    row: usize,
+    edits: Vec<record::DraftField>,
+    expected_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DocumentMeta> {
+    write_doc(&state, doc_id, |doc| {
+        record::commit_draft(doc, row, &edits, expected_revision)?;
+        Ok(doc.meta())
+    })
+}
+
 /// Copy As (F14): serialize a selection into a structured clipboard format.
 /// Runs on the blocking pool — a large off-screen selection reads through
 /// Rust's row-visit API, never the front-end cache.

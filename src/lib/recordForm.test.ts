@@ -5,7 +5,6 @@ import {
   assignToGroup,
   changedFields,
   clampRecord,
-  draftCommitCells,
   fieldChanged,
   isDraftDirty,
   layoutSections,
@@ -54,14 +53,12 @@ describe("draft reducer", () => {
     expect(isDraftDirty(FIELDS, { 1: "N/A" })).toBe(false);
   });
 
-  it("builds a set_cells batch of changed fields at the display row", () => {
-    const draft: RecordDraft = { 0: "2", 2: "world" };
-    expect(draftCommitCells(7, FIELDS, draft)).toEqual([
-      [7, 0, "2"],
-      [7, 2, "world"],
-    ]);
-    // Nothing changed → empty batch (caller must not save).
-    expect(draftCommitCells(7, FIELDS, {})).toEqual([]);
+  it("yields no commit payload when nothing changed (caller must not save)", () => {
+    // The commit sends only the changed fields (display-row → absolute-row
+    // remap now happens server-side under the revision guard); a clean draft
+    // produces an empty payload the caller uses to skip the save.
+    expect(changedFields(FIELDS, {})).toEqual([]);
+    expect(changedFields(FIELDS, { 1: "N/A" })).toEqual([]); // reverted-to-stored
   });
 });
 

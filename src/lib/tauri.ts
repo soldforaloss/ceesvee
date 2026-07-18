@@ -602,6 +602,20 @@ export const getRecordIssues = (docId: number, row: number) =>
   invoke<SchemaIssue[]>("get_record_issues", { docId, row });
 
 /**
+ * Commit a record-form draft — all changed fields of ONE visible row (display
+ * coords) — as one F31-validated `set_cells` batch (one undo step). Guarded by
+ * `expectedRevision` (the revision the form's fields were read at): a document
+ * that moved under the draft rejects the commit with a stale-revision error, so
+ * the edit never lands on a row a changed filter/sort has since remapped (F41).
+ */
+export const saveRecordDraft = (
+  docId: number,
+  row: number,
+  edits: DraftField[],
+  expectedRevision: number,
+) => invoke<DocumentMeta>("save_record_draft", { docId, row, edits, expectedRevision });
+
+/**
  * Start a bounded invalid-value scan of one column as a cancellable job (F31).
  * Returns the job id; fetch the report with `takeSchemaInvalidSamples`.
  */

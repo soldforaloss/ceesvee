@@ -6,7 +6,6 @@ import {
   assignToGroup,
   changedFields,
   clampRecord,
-  draftCommitCells,
   emptyLayout,
   fieldChanged,
   fieldValue,
@@ -155,9 +154,19 @@ export function FormView() {
 
   const commit = useCallback(async (): Promise<boolean> => {
     if (!view || blocked) return false;
-    const cells = draftCommitCells(view.displayRow, view.fields, draft);
-    if (cells.length === 0) return true;
-    return saveDraft(cells);
+    const edits = changedFields(view.fields, draft);
+    if (edits.length === 0) return true;
+    // Guard the commit with the revision the fields were READ at (view.revision).
+    // If the document moved under the draft (a filter/sort/structural change can
+    // remap which absolute row this display index points at), the backend
+    // rejects the save and the draft is discarded rather than written onto the
+    // wrong row — surface the same notice as the reactive refetch path.
+    const result = await saveDraft(view.displayRow, edits, view.revision);
+    if (result === "stale") {
+      setNotice("The document changed — the unsaved draft was discarded.");
+      return false;
+    }
+    return result === "saved" || result === "noop";
   }, [view, blocked, draft, saveDraft]);
 
   // Navigate to a visible record, honouring the unsaved-draft preference.
