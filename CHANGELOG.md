@@ -34,6 +34,35 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   export runs as a cancellable job with progress, and imported files land
   through the same pipeline as a CSV open (tabs, dirty tracking,
   diagnostics). Exported JSON is always UTF-8 and reparses cleanly.
+- **Project workspaces** (Projects toolbar menu, or palette → "New
+  project", "Open project…"): save a working context across related
+  datasets in a versioned `.ceesveeproj` JSON file. Saving captures the
+  live session — referenced source documents (with file fingerprints and
+  parse settings), open-tab order and active tab, panel layout, and each
+  document's named views and active view. The versioned section store also
+  round-trips file profiles, schemas, recipes, join mappings, comparison
+  definitions, and row-key definitions when a template or existing project
+  file carries them (typed, registered sections that future features
+  extend; with reserved sections for annotations, data dictionaries, and
+  saved queries) — capturing those sections from a live session is planned
+  for a later release. Projects reference data, never embed it: every save
+  and section write structurally rejects cell-value payloads. Source paths
+  are stored relative to the project file when possible (absolute across
+  drive roots), saves are atomic, and unknown fields written by newer
+  versions survive a round-trip while newer major format versions are
+  rejected with a clear error. Opening a project surfaces missing, moved,
+  changed, and column-incompatible sources with per-source choices (locate
+  a replacement, open available only, remove, or cancel), reapplies each
+  opened document's saved views only after fingerprint and
+  column-compatibility checks (warn, never break), and never auto-runs
+  recipes, queries, joins, or exports.
+  Templates capture the configuration without source paths to initialize a
+  repeatable workflow. A project bar shows the current project and a dirty
+  dot; a Projects toolbar menu and command-palette entries cover New, New
+  from template, Open, Save, Save As, Save as Template and Close; the open
+  dialog lists each source's status with per-source actions (open, relink,
+  leave out, remove, or open-available-only); and quitting or closing a
+  project with unsaved workspace changes prompts to save first.
 - **Explicit schemas and typed columns** (palette → "Edit schema…", or a
   column header's menu): declare an explicit logical type per column —
   text, integer, decimal, float, boolean, date, datetime, UUID, or JSON —

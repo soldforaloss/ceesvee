@@ -125,6 +125,68 @@ function staticCommands(): AppCommand[] {
       run: () => void state().convertActiveToEditable(false),
     },
 
+    // ----- Project (F37) ---------------------------------------------------
+    {
+      id: "project.new",
+      title: "New project",
+      keywords: ["workspace", "ceesveeproj", "project"],
+      category: "Project",
+      allowInEditable: true,
+      run: () => void state().projectNew(),
+    },
+    {
+      id: "project.newFromTemplate",
+      title: "New project from template…",
+      keywords: ["workspace", "template", "scaffold", "repeatable"],
+      category: "Project",
+      allowInEditable: true,
+      run: () => void state().projectNewFromTemplate(),
+    },
+    {
+      id: "project.open",
+      title: "Open project…",
+      keywords: ["workspace", "ceesveeproj", "load project"],
+      category: "Project",
+      allowInEditable: true,
+      run: () => void state().projectPickAndOpen(),
+    },
+    {
+      id: "project.save",
+      title: "Save project",
+      keywords: ["workspace", "persist project"],
+      category: "Project",
+      allowInEditable: true,
+      unavailableReason: () => (state().project ? null : "No project is open"),
+      run: () => void state().projectSave(false),
+    },
+    {
+      id: "project.saveAs",
+      title: "Save project as…",
+      keywords: ["workspace", "copy project"],
+      category: "Project",
+      allowInEditable: true,
+      unavailableReason: () => (state().project ? null : "No project is open"),
+      run: () => void state().projectSave(true),
+    },
+    {
+      id: "project.saveTemplate",
+      title: "Save project as template…",
+      keywords: ["workspace", "template", "reusable", "configuration"],
+      category: "Project",
+      allowInEditable: true,
+      unavailableReason: () => (state().project ? null : "No project is open"),
+      run: () => void state().projectSaveTemplate(),
+    },
+    {
+      id: "project.close",
+      title: "Close project",
+      keywords: ["workspace", "end project"],
+      category: "Project",
+      allowInEditable: true,
+      unavailableReason: () => (state().project ? null : "No project is open"),
+      run: () => state().requestCloseProject(),
+    },
+
     // ----- Edit ------------------------------------------------------------
     {
       id: "edit.undo",

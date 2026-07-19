@@ -10,8 +10,13 @@ export function QuitDialog() {
   const dirtyTabs = useStore((s) => s.tabs.filter((t) => t.dirty));
   const setOpen = useStore((s) => s.setQuitPromptOpen);
   const confirmQuit = useStore((s) => s.confirmQuit);
+  const isProjectDirty = useStore((s) => s.isProjectDirty);
+  const project = useStore((s) => s.project);
+  const projectDirty = isProjectDirty();
 
   if (!open) return null;
+
+  const docCount = dirtyTabs.length;
 
   return (
     <Modal
@@ -32,21 +37,30 @@ export function QuitDialog() {
       }
     >
       <div className="space-y-2 text-sm">
-        <p>
-          {dirtyTabs.length === 1
-            ? "One document has unsaved changes:"
-            : `${dirtyTabs.length} documents have unsaved changes:`}
-        </p>
-        <ul className="max-h-40 overflow-y-auto rounded border border-zinc-200 px-3 py-1.5 text-xs dark:border-zinc-800">
-          {dirtyTabs.map((t) => (
-            <li key={t.id} className="truncate py-0.5" title={t.path ?? t.fileName}>
-              ● {t.fileName}
-            </li>
-          ))}
-        </ul>
+        {docCount > 0 && (
+          <>
+            <p>
+              {docCount === 1
+                ? "One document has unsaved changes:"
+                : `${docCount} documents have unsaved changes:`}
+            </p>
+            <ul className="max-h-40 overflow-y-auto rounded border border-zinc-200 px-3 py-1.5 text-xs dark:border-zinc-800">
+              {dirtyTabs.map((t) => (
+                <li key={t.id} className="truncate py-0.5" title={t.path ?? t.fileName}>
+                  ● {t.fileName}
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+        {projectDirty && project && (
+          <p className="rounded border border-violet-200 bg-violet-50 px-3 py-1.5 text-xs text-violet-800 dark:border-violet-500/30 dark:bg-violet-500/10 dark:text-violet-200">
+            The project “{project.name}” also has unsaved workspace changes.
+          </p>
+        )}
         <p className="text-xs text-zinc-500 dark:text-zinc-400">
-          “Save all” asks for a location for any document that has never been saved, and quitting is
-          cancelled if a save fails.
+          “Save all” asks for a location for any document (or project) that has never been saved,
+          and quitting is cancelled if a save fails.
         </p>
       </div>
     </Modal>

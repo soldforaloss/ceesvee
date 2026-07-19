@@ -1604,3 +1604,157 @@ export interface JsonExportOptions {
   /** Backup policy for the previous destination file. */
   backup: BackupPolicy;
 }
+
+// ----- project workspaces (F37) ---------------------------------------------
+
+/** Header state of the open project, for the project bar (F37). */
+export interface ProjectMeta {
+  /** Absolute path of the `.ceesveeproj` file, or null for an unsaved project. */
+  path: string | null;
+  /** File stem, or "Untitled project" before the first save. */
+  name: string;
+  /** Backend revision-derived dirty flag (front-end tracks its own too). */
+  dirty: boolean;
+  revision: number;
+  formatVersion: string;
+  appVersion: string;
+}
+
+/** Parse settings a source was captured with (mirrors DocumentMeta). */
+export interface ProjectOpenSettings {
+  delimiter?: string | null;
+  encoding?: string | null;
+  hasHeaderRow?: boolean | null;
+}
+
+/** Column snapshot (stable id + header text) stored for compatibility checks. */
+export interface ProjectColumn {
+  id: string;
+  name: string;
+}
+
+/** One referenced document in a project (never embeds cell data). */
+export interface ProjectSource {
+  id: string;
+  /** Absolute over IPC; relativized against the project file on disk. */
+  path: string;
+  displayName?: string | null;
+  fingerprint?: FileFingerprint | null;
+  open?: ProjectOpenSettings;
+  columns?: ProjectColumn[];
+}
+
+/** Open-tab order and active tab, by source id. */
+export interface ProjectTabsSection {
+  open: string[];
+  active: string | null;
+}
+
+/** Front-end-owned panel layout, round-tripped verbatim (config only). */
+export interface ProjectLayoutSection {
+  panels?: { diagnostics?: boolean; explorer?: boolean; changes?: boolean };
+  [key: string]: unknown;
+}
+
+/** A document's schema in its versioned export envelope (F31). */
+export interface SchemaExport {
+  version: number;
+  columns: ColumnSchema[];
+}
+
+/** Project sections as returned by `project_get` (only the ones the UI reads
+ * are typed; the rest round-trip opaquely). */
+export interface ProjectSections {
+  sources?: ProjectSource[];
+  tabs?: ProjectTabsSection;
+  layout?: ProjectLayoutSection | null;
+  [section: string]: unknown;
+}
+
+/** Full project state for the UI: meta + every section. */
+export interface ProjectStateDto {
+  meta: ProjectMeta;
+  sections: ProjectSections;
+}
+
+/** Per-source condition found while previewing a project open (F37). */
+export type SourceStatus =
+  | "ok"
+  | "missing"
+  | "movedCandidate"
+  | "changedFingerprint"
+  | "schemaIncompatible";
+
+/** One source's preview line in the open dialog. */
+export interface SourcePreviewEntry {
+  sourceId: string;
+  displayName: string | null;
+  resolvedPath: string;
+  status: SourceStatus;
+  storedFingerprint: FileFingerprint | null;
+  diskFingerprint: FileFingerprint | null;
+  /** Relink candidate found near the project (MovedCandidate only). */
+  movedCandidate: string | null;
+  /** Whether saved views are safe to reapply (fingerprint + column check). */
+  reapplyViews: boolean;
+  warnings: string[];
+}
+
+/** Everything the open dialog needs; produced without touching any state. */
+export interface ProjectOpenPreview {
+  path: string;
+  formatVersion: string;
+  appVersion: string;
+  sources: SourcePreviewEntry[];
+  tabOrder: string[];
+  activeTab: string | null;
+}
+
+/** The user's per-source choice, serialized for `project_open_apply`. */
+export type SourceResolution =
+  | { action: "open" }
+  | { action: "locate"; path: string }
+  | { action: "skip" }
+  | { action: "remove" };
+
+/** One resolution, addressed by source id. */
+export type ResolutionEntry = { sourceId: string } & SourceResolution;
+
+/**
+ * One document the front end should open, with the named views to reapply
+ * after it opens. Schemas and row keys are NOT part of the open plan: they stay
+ * in the persisted project sections and are consumed by their owning features
+ * on demand, never reapplied as a side effect of opening a project.
+ */
+export interface PlanEntry {
+  sourceId: string;
+  path: string;
+  displayName: string | null;
+  open: ProjectOpenSettings;
+  status: SourceStatus;
+  reapplyViews: boolean;
+  viewWarnings: string[];
+  views: NamedView[];
+  activeViewId: string | null;
+}
+
+/** The resolved open plan. Nothing here executes on its own. */
+export interface ProjectOpenPlan {
+  meta: ProjectMeta;
+  entries: PlanEntry[];
+  tabOrder: string[];
+  activeTab: string | null;
+  removedSourceIds: string[];
+  skippedSourceIds: string[];
+}
+
+/**
+ * An in-progress project open, driven one source at a time (F37). A source that
+ * routes through a deferred flow (large-file decision, archive extraction, JSON
+ * import) pauses the queue; `remaining` holds the source paths not yet opened so
+ * the open resumes — and only then finalizes the baseline — once it settles.
+ */
+export interface ProjectOpenPending {
+  plan: ProjectOpenPlan;
+  remaining: string[];
+}
