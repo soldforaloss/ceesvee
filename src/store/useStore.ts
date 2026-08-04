@@ -18,12 +18,14 @@ import {
   type ColumnLayout,
 } from "../lib/viewProjection";
 import { hydrateFilter, snapshotView, uniqueViewName, upsertView } from "../lib/views";
+import { annotationExportName } from "../lib/annotations";
 import { currentOpenOptions, fingerprintKey } from "../lib/reopen";
 import { defaultImportOptions } from "../lib/jsonImport";
 import { suggestJsonFileName } from "../lib/jsonExport";
 import { isLegacyEncoding } from "../lib/save";
 import {
   availableOnlyChoices,
+  buildAnnotationsSection,
   buildLayoutSection,
   buildResolutions,
   buildSources,
@@ -38,6 +40,7 @@ import {
   projectSnapshot,
   type PanelLayout,
   type ProjectSnapshot,
+  type SourceAnnotationsSection,
   type SourceChoice,
   type SourceViewsSection,
 } from "../lib/project";
@@ -109,6 +112,15 @@ import type {
   MergeMatchBy,
   MergePlan,
   MergeResolution,
+  AnnotationsExport,
+  AnnotationsView,
+  AnnotationPredicate,
+  AnnotationExportFormat,
+  KeySpec,
+  RowMarkPatch,
+  TagDef,
+  TagToColumnPreview,
+  TagToColumnTarget,
 } from "../types";
 import type { GatingWarning } from "../lib/project";
 
@@ -156,6 +168,8 @@ export type ModalName =
   | "dictionary"
   | "jsonExport"
   | "sampling"
+  | "tagToColumn"
+  | "annotationExport"
   | "views";
 
 const FILE_FILTERS = [
@@ -765,6 +779,24 @@ interface Store {
   dictionaryView: DictionaryView | null;
   /** Physical column the dictionary dialog should focus on open (F38). */
   dictionaryDialogColumn: number | null;
+  // ----- row bookmarks, tags & notes (F40) -----------------------------------
+  /** The ACTIVE document's annotations, resolved against the current view.
+   * Drives the grid gutter indicators and the annotations panel; refreshed on
+   * load, structural edits and every annotation mutation. Null until loaded. */
+  annotationsView: AnnotationsView | null;
+  /** Whether the annotations side panel is open (F40). */
+  annotationsPanelOpen: boolean;
+  /** Note-editor target: a row note (`columnId` null) or a cell note (F40). */
+  annotationNoteTarget: {
+    displayRow: number;
+    columnId: string | null;
+    label: string;
+    initialText: string;
+  } | null;
+  /** Tag-picker target: the display rows to apply tags to (F40). */
+  annotationTagTarget: { displayRows: number[] } | null;
+  /** The tag whose "copy to column" dialog is open, or null (F40). */
+  tagToColumnTag: string | null;
   /** Running derived-document job (F20–F23), if any. */
   derive: DeriveState | null;
   /** Error from the last derive job, for the dialog that started it. */
@@ -1045,6 +1077,60 @@ interface Store {
     expectedDictionaryRevision: number,
   ) => Promise<DictionaryImportOutcome | null>;
 
+  // row bookmarks, tags & notes (F40)
+  /** Fetch the active document's annotations into the store (grid + panel).
+   * Reads the doc_id-keyed registry, re-resolving against the current view. */
+  loadAnnotations: () => Promise<void>;
+  /** Load the active document's annotations from its `.ceesvee-notes.json`
+   * sidecar, replacing any current store. Called once when a file opens. */
+  hydrateAnnotationsFromSidecar: (docId: number, sourcePath: string | null) => Promise<void>;
+  /** Open / close the annotations side panel (mutually exclusive with the
+   * other right-rail panels). */
+  setAnnotationsPanelOpen: (open: boolean) => void;
+  /** Apply a star/flag/tag patch to a set of DISPLAY rows (threads the
+   * annotations revision across the batch). Returns false on error. */
+  applyRowMarks: (displayRows: number[], patch: RowMarkPatch) => Promise<boolean>;
+  /** Set (or clear, with `text = null`) the ROW note on a display row. */
+  setRowNote: (displayRow: number, text: string | null) => Promise<boolean>;
+  /** Set (or clear, with `text = null`) a CELL note on a display row + column. */
+  setCellNote: (displayRow: number, columnId: string, text: string | null) => Promise<boolean>;
+  /** Define or update a tag in the per-document namespace. */
+  defineAnnotationTag: (tag: TagDef) => Promise<boolean>;
+  /** Remove a tag from the namespace and from every row that carries it. */
+  removeAnnotationTag: (name: string) => Promise<boolean>;
+  /** Delete one whole annotation entry by its stable handle. */
+  removeAnnotation: (handle: number) => Promise<boolean>;
+  /** Discard every orphaned annotation (no matching row in the document). */
+  discardAnnotationOrphans: () => Promise<boolean>;
+  /** Set (or clear, with `null`) the default author label for new notes. */
+  setAnnotationAuthor: (author: string | null) => Promise<boolean>;
+  /** Set (or clear, with `null`) the key columns anchoring new annotations. */
+  setAnnotationKeySpec: (keySpec: KeySpec | null) => Promise<boolean>;
+  /** Filter the grid to the rows matching an annotation-state predicate. */
+  applyAnnotationFilter: (predicate: AnnotationPredicate) => Promise<void>;
+  /** Preview copying a tag into a column (read-only); null on error. */
+  previewTagToColumn: (tag: string) => Promise<TagToColumnPreview | null>;
+  /** Copy a tag into a real column as one undoable op; false on error. */
+  applyTagToColumn: (tag: string, target: TagToColumnTarget) => Promise<boolean>;
+  /** Export the annotations as JSON / CSV; prompts for a path. */
+  exportAnnotationsToFile: (format: AnnotationExportFormat) => Promise<void>;
+  /** Note-editor dialog: open on a row note, a cell note, or close. The
+   * `initialText` prefills the editor with any existing note. */
+  openRowNoteEditor: (displayRow: number, label: string, initialText?: string) => void;
+  openCellNoteEditor: (
+    displayRow: number,
+    columnId: string,
+    label: string,
+    initialText?: string,
+  ) => void;
+  closeNoteEditor: () => void;
+  /** Tag-picker dialog: open for a set of display rows, or close. */
+  openTagPicker: (displayRows: number[]) => void;
+  closeTagPicker: () => void;
+  /** Tag-to-column dialog: open for a tag, or close. */
+  openTagToColumn: (tag: string) => void;
+  closeTagToColumn: () => void;
+
   // compressed files (F17)
   /** Start extracting an archive (gzip member or chosen ZIP entry). */
   startArchiveExtract: (path: string, entry: string | null, allowLarge: boolean) => Promise<void>;
@@ -1074,6 +1160,15 @@ interface Store {
   project: ProjectMeta | null;
   /** UI snapshot captured at the last save/open, for dirty derivation. */
   projectBaseline: ProjectSnapshot | null;
+  /**
+   * Whether project-backed annotations changed since the last project save/open.
+   * Annotations are not part of the {@link ProjectSnapshot} (they live in the
+   * backend registry and are captured into the project's `annotations` section
+   * on save), so an annotation edit is tracked with this explicit flag to keep
+   * `isProjectDirty()` honest — otherwise adding a note in a project would leave
+   * the project falsely clean and quit/discard would drop it.
+   */
+  projectAnnotationsDirty: boolean;
   /** The open-dialog preview awaiting per-source resolutions, if any. */
   projectOpen: ProjectOpenPreview | null;
   /** Per-source choices in the open dialog, by source id. */
@@ -1372,6 +1467,12 @@ export const useStore = create<Store>((set, get) => {
       // F38: the dictionary is per-document; the Grid reloads it for the tab.
       dictionaryView: null,
       dictionaryDialogColumn: null,
+      // F40: annotations are per-document (the Grid reloads them for the tab);
+      // any open annotation editor targets the outgoing document, so drop it.
+      annotationsView: null,
+      annotationNoteTarget: null,
+      annotationTagTarget: null,
+      tagToColumnTag: null,
     };
   };
 
@@ -1617,6 +1718,29 @@ export const useStore = create<Store>((set, get) => {
     }
   };
 
+  /**
+   * Persist a document's annotations after an edit (F40), fire-and-forget.
+   *
+   * The two backing stores are mutually exclusive per the spec's migration
+   * rule: when a PROJECT is open the annotations live in the project's
+   * `annotations` section (captured into the ProjectStore on the next project
+   * save, exactly like tabs/layout/views — never in the sidecar), so instead of
+   * writing a sidecar we mark the project dirty, so quit/close prompts to save
+   * the edit rather than dropping it. With no project open the durable store is
+   * the source's `.ceesvee-notes.json` sidecar; an empty store deletes it (the
+   * backend handles that). A path-less document (new/derived) has nowhere to
+   * write, so this is a no-op there too. Write failures are swallowed — they
+   * surface on the next explicit save/export instead of interrupting an edit.
+   */
+  const persistAnnotationSidecar = (docId: number, path: string | null) => {
+    if (get().project) {
+      if (!get().projectAnnotationsDirty) set({ projectAnnotationsDirty: true });
+      return;
+    }
+    if (!path) return;
+    void api.annotationsSaveSidecar(docId, path).catch(() => undefined);
+  };
+
   /** Merge a partial update into one document's diagnostics state. */
   const patchDiagnostics = (docId: number, patch: Partial<DiagnosticsDocState>) => {
     set((s) => ({
@@ -1789,9 +1913,7 @@ export const useStore = create<Store>((set, get) => {
    * that would replace it (new / open). Returns whether to proceed.
    */
   const guardDiscardProject = async (): Promise<boolean> => {
-    const s = get();
-    if (!s.project || !projectDirty(s.project.dirty, s.projectBaseline, currentProjectSnapshot()))
-      return true;
+    if (!get().isProjectDirty()) return true;
     return ask("Discard unsaved changes to the current project?", {
       title: "Discard project changes",
       kind: "warning",
@@ -1799,9 +1921,10 @@ export const useStore = create<Store>((set, get) => {
   };
 
   /**
-   * Push the live sources/tabs/layout/views into the backend ProjectStore (THE
-   * persistence boundary). Reuses existing source ids by path so ids stay
-   * stable across saves. Captures configuration only — never cell data.
+   * Push the live sources/tabs/layout/views/annotations into the backend
+   * ProjectStore (THE persistence boundary). Reuses existing source ids by path
+   * so ids stay stable across saves. Captures configuration only — never cell
+   * data (the annotations envelope references rows by identity + content hash).
    * Schemas, recipes, joins, comparisons and row keys are NOT captured from the
    * live session this cycle; they round-trip when a template or existing
    * project file carries them (see CHANGELOG for the deferred scope).
@@ -1810,14 +1933,20 @@ export const useStore = create<Store>((set, get) => {
     const s = get();
     const docs = s.tabs.filter((t) => t.path);
     const fingerprints: Record<number, FileFingerprint | null> = {};
+    const exports: Record<number, AnnotationsExport | null> = {};
     await Promise.all(
       docs.map(async (t) => {
         fingerprints[t.id] = await api.getFileFingerprint(t.id).catch(() => null);
+        // F40: the backend registry is the live source of truth; pull each open
+        // document's export envelope so the project absorbs its annotations.
+        exports[t.id] = await api.annotationsGetExport(t.id).catch(() => null);
       }),
     );
     const state = await api.projectGet().catch(() => null);
     const existingSources = state?.sections.sources ?? [];
     const existingViews = (state?.sections.views as SourceViewsSection[] | undefined) ?? [];
+    const existingAnnotations =
+      (state?.sections.annotations as SourceAnnotationsSection[] | undefined) ?? [];
     const sources = buildSources(s.tabs, existingSources, fingerprints);
     const views = buildViewsSection(
       sources,
@@ -1827,10 +1956,17 @@ export const useStore = create<Store>((set, get) => {
       (tab) =>
         tab.id === s.activeId ? s.activeViewId : (s.uiStates[tab.id]?.activeViewId ?? null),
     );
+    const annotations = buildAnnotationsSection(
+      sources,
+      s.tabs,
+      existingAnnotations,
+      (tab) => exports[tab.id] ?? null,
+    );
     await api.projectSetSection("sources", sources);
     await api.projectSetSection("tabs", buildTabsSection(sources, s.tabs, s.activeId));
     await api.projectSetSection("layout", buildLayoutSection(currentPanels(s)));
     await api.projectSetSection("views", views);
+    await api.projectSetSection("annotations", annotations);
   };
 
   /** Whether an open is currently paused on a user/job decision (F10/F17/F33). */
@@ -1852,26 +1988,38 @@ export const useStore = create<Store>((set, get) => {
       const tabs = order.map((id) => byId.get(id)).filter((t): t is DocumentMeta => !!t);
       return { tabs };
     });
+    const state = await api.projectGet().catch(() => null);
     // Restore the saved panel layout (front-end config only; runs nothing).
-    const panels = panelsFromLayout(
-      await api
-        .projectGet()
-        .then((state) => state?.sections.layout ?? null)
-        .catch(() => null),
-    );
+    const panels = panelsFromLayout(state?.sections.layout ?? null);
     set((s) => ({
       diagnosticsOpen: panels.diagnostics,
       changesOpen: panels.changes,
       explorer: { ...s.explorer, open: panels.explorer },
     }));
 
+    const findTab = (path: string) =>
+      get().tabs.find((t) => t.path && pathKey(t.path) === pathKey(path));
+
+    // F40: hydrate each opened source's annotations FROM THE PROJECT SECTION
+    // (authoritative over any sidecar), by matching the section's stable source
+    // id to the plan entry that opened the tab. A source still pending a
+    // large-file decision or archive extraction has no tab yet — it is skipped,
+    // mirroring the view-reapply gate below.
+    const savedAnnotations =
+      (state?.sections.annotations as SourceAnnotationsSection[] | undefined) ?? [];
+    const bySourceId = new Map(savedAnnotations.map((a) => [a.sourceId, a]));
+    for (const entry of plan.entries) {
+      const saved = bySourceId.get(entry.sourceId);
+      const tab = saved ? findTab(entry.path) : undefined;
+      if (!saved || !tab) continue;
+      await api.annotationsLoadExport(tab.id, saved.annotations).catch(() => undefined);
+    }
+
     // Reapply each opened source's saved view against ITS OWN document. A
     // source left out or that failed to open has no tab — skip it rather than
     // applying its view to whatever document is active. applyNamedView targets
     // the active document, so switch to each source's tab first; the saved
     // active tab is done LAST so the session ends focused on it.
-    const findTab = (path: string) =>
-      get().tabs.find((t) => t.path && pathKey(t.path) === pathKey(path));
     const reapplyOrder = [
       ...plan.entries.filter((e) => e.sourceId !== plan.activeTab),
       ...plan.entries.filter((e) => e.sourceId === plan.activeTab),
@@ -1895,9 +2043,13 @@ export const useStore = create<Store>((set, get) => {
     set({
       project: plan.meta,
       projectBaseline: currentProjectSnapshot(),
+      projectAnnotationsDirty: false,
       projectWarnings: gatingWarnings(plan.entries),
       projectOpenPending: null,
     });
+    // Refresh the annotations surface for the now-active document from the
+    // registry the project section just populated.
+    void get().loadAnnotations();
   };
 
   // Only one queue pump runs at a time; the deferred-open completion paths
@@ -1997,6 +2149,11 @@ export const useStore = create<Store>((set, get) => {
     schemaDialogColumn: null,
     dictionaryView: null,
     dictionaryDialogColumn: null,
+    annotationsView: null,
+    annotationsPanelOpen: false,
+    annotationNoteTarget: null,
+    annotationTagTarget: null,
+    tagToColumnTag: null,
     derive: null,
     deriveError: null,
     jsonImport: null,
@@ -2014,6 +2171,7 @@ export const useStore = create<Store>((set, get) => {
     quitPromptOpen: false,
     project: null,
     projectBaseline: null,
+    projectAnnotationsDirty: false,
     projectOpen: null,
     projectOpenChoices: {},
     projectOpenPending: null,
@@ -2478,6 +2636,9 @@ export const useStore = create<Store>((set, get) => {
           busy: false,
         }));
         pushRecent(path);
+        // F40: hydrate annotations from the source's sidecar so bookmarks /
+        // tags / notes persist across sessions when no project is open.
+        void get().hydrateAnnotationsFromSidecar(meta.id, meta.path);
         void suggestProfileFor(meta)
           .then(() => restoreLastViewFor(meta))
           .catch(() => undefined);
@@ -2499,6 +2660,7 @@ export const useStore = create<Store>((set, get) => {
           const meta = await api.getMeta(started.docId);
           set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta], busy: false }));
           pushRecent(decision.path);
+          void get().hydrateAnnotationsFromSidecar(meta.id, meta.path);
           return;
         }
         const meta = await api.openFile(decision.path, { forceInMemory: true });
@@ -2508,6 +2670,7 @@ export const useStore = create<Store>((set, get) => {
           busy: false,
         }));
         pushRecent(decision.path);
+        void get().hydrateAnnotationsFromSidecar(meta.id, meta.path);
         void suggestProfileFor(meta)
           .then(() => restoreLastViewFor(meta))
           .catch(() => undefined);
@@ -3380,6 +3543,278 @@ export const useStore = create<Store>((set, get) => {
       }
     },
 
+    // ----- row bookmarks, tags & notes (F40) ---------------------------------
+
+    loadAnnotations: async () => {
+      const meta = activeMeta();
+      if (!meta) {
+        set({ annotationsView: null });
+        return;
+      }
+      try {
+        // Reads the registry and re-resolves against the current view; a tab
+        // switch may have landed during the await, so don't cross-install.
+        const view = await api.annotationsView(meta.id);
+        if (get().activeId === meta.id) set({ annotationsView: view });
+      } catch {
+        // Non-fatal: the grid simply shows no indicators until the next load.
+      }
+    },
+
+    hydrateAnnotationsFromSidecar: async (docId, sourcePath) => {
+      try {
+        // With a project open (or one mid-open — `projectOpenPending` spans the
+        // whole queued open, including deferred pauses), the project's
+        // `annotations` section is authoritative — never let the per-source
+        // sidecar clobber it (F40 migration rule: the project absorbs the
+        // sidecar on save). Fall back to a plain registry view so the grid
+        // indicators still refresh without reading — or overwriting — the
+        // sidecar.
+        const useSidecar = !!sourcePath && !get().projectOpenPending && !get().project;
+        const view = useSidecar
+          ? await api.annotationsLoadSidecar(docId, sourcePath as string)
+          : await api.annotationsView(docId);
+        if (get().activeId === docId) set({ annotationsView: view });
+      } catch {
+        // A malformed/absent sidecar must never block opening the file.
+      }
+    },
+
+    setAnnotationsPanelOpen: (open) => {
+      set((s) => ({
+        annotationsPanelOpen: open,
+        diagnosticsOpen: open ? false : s.diagnosticsOpen,
+        changesOpen: open ? false : s.changesOpen,
+        explorer: open ? { ...s.explorer, open: false } : s.explorer,
+      }));
+      if (open) void get().loadAnnotations();
+    },
+
+    applyRowMarks: async (displayRows, patch) => {
+      const meta = activeMeta();
+      const view = get().annotationsView;
+      if (!meta || !view || displayRows.length === 0) return false;
+      let rev = view.annotationsRevision;
+      let next = view;
+      try {
+        // Each edit bumps the annotations revision, so thread it across the
+        // batch. A mid-batch failure leaves the store ahead of our revision;
+        // resync by reloading.
+        for (const row of displayRows) {
+          next = await api.annotationsEditRow(meta.id, row, patch, rev);
+          rev = next.annotationsRevision;
+        }
+        if (get().activeId === meta.id) set({ annotationsView: next });
+        persistAnnotationSidecar(meta.id, meta.path);
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        void get().loadAnnotations();
+        return false;
+      }
+    },
+
+    setRowNote: async (displayRow, text) => {
+      const meta = activeMeta();
+      const view = get().annotationsView;
+      if (!meta || !view) return false;
+      try {
+        // author = null: the backend fills the store's configured default.
+        const next = await api.annotationsSetRowNote(
+          meta.id,
+          displayRow,
+          text,
+          null,
+          view.annotationsRevision,
+        );
+        if (get().activeId === meta.id) set({ annotationsView: next });
+        persistAnnotationSidecar(meta.id, meta.path);
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    setCellNote: async (displayRow, columnId, text) => {
+      const meta = activeMeta();
+      const view = get().annotationsView;
+      if (!meta || !view) return false;
+      try {
+        const next = await api.annotationsSetCellNote(
+          meta.id,
+          displayRow,
+          columnId,
+          text,
+          null,
+          view.annotationsRevision,
+        );
+        if (get().activeId === meta.id) set({ annotationsView: next });
+        persistAnnotationSidecar(meta.id, meta.path);
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    defineAnnotationTag: async (tag) => {
+      const meta = activeMeta();
+      const view = get().annotationsView;
+      if (!meta || !view) return false;
+      try {
+        const next = await api.annotationsDefineTag(meta.id, tag, view.annotationsRevision);
+        if (get().activeId === meta.id) set({ annotationsView: next });
+        persistAnnotationSidecar(meta.id, meta.path);
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    removeAnnotationTag: async (name) => {
+      const meta = activeMeta();
+      const view = get().annotationsView;
+      if (!meta || !view) return false;
+      try {
+        const next = await api.annotationsRemoveTag(meta.id, name, view.annotationsRevision);
+        if (get().activeId === meta.id) set({ annotationsView: next });
+        persistAnnotationSidecar(meta.id, meta.path);
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    removeAnnotation: async (handle) => {
+      const meta = activeMeta();
+      const view = get().annotationsView;
+      if (!meta || !view) return false;
+      try {
+        const next = await api.annotationsRemoveRow(meta.id, handle, view.annotationsRevision);
+        if (get().activeId === meta.id) set({ annotationsView: next });
+        persistAnnotationSidecar(meta.id, meta.path);
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    discardAnnotationOrphans: async () => {
+      const meta = activeMeta();
+      const view = get().annotationsView;
+      if (!meta || !view) return false;
+      try {
+        const next = await api.annotationsDiscardOrphans(meta.id, view.annotationsRevision);
+        if (get().activeId === meta.id) set({ annotationsView: next });
+        persistAnnotationSidecar(meta.id, meta.path);
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    setAnnotationAuthor: async (author) => {
+      const meta = activeMeta();
+      const view = get().annotationsView;
+      if (!meta || !view) return false;
+      try {
+        const next = await api.annotationsSetAuthor(meta.id, author, view.annotationsRevision);
+        if (get().activeId === meta.id) set({ annotationsView: next });
+        persistAnnotationSidecar(meta.id, meta.path);
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    setAnnotationKeySpec: async (keySpec) => {
+      const meta = activeMeta();
+      const view = get().annotationsView;
+      if (!meta || !view) return false;
+      try {
+        const next = await api.annotationsSetKeySpec(meta.id, keySpec, view.annotationsRevision);
+        if (get().activeId === meta.id) set({ annotationsView: next });
+        persistAnnotationSidecar(meta.id, meta.path);
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    applyAnnotationFilter: async (predicate) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      try {
+        // Integrates with the existing row-filter view; only MATCHED rows are
+        // filtered onto (the backend refuses to filter onto uncertain rows).
+        const updated = await api.applyAnnotationFilter(meta.id, predicate, meta.revision);
+        reloadDoc(updated);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    previewTagToColumn: async (tag) => {
+      const meta = activeMeta();
+      if (!meta) return null;
+      try {
+        return await api.previewTagToColumn(meta.id, tag);
+      } catch (e) {
+        set({ error: String(e) });
+        return null;
+      }
+    },
+
+    applyTagToColumn: async (tag, target) => {
+      const meta = activeMeta();
+      if (!meta) return false;
+      try {
+        // One undoable document op; the notes themselves are untouched. The
+        // grid reload re-resolves the annotations against the new structure.
+        const updated = await api.applyTagToColumn(meta.id, tag, target, meta.revision);
+        reloadDoc(updated);
+        return true;
+      } catch (e) {
+        set({ error: String(e) });
+        return false;
+      }
+    },
+
+    exportAnnotationsToFile: async (format) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const ext = format === "json" ? "json" : "csv";
+      const chosen = await saveFileDialog({
+        defaultPath: annotationExportName(meta.fileName || "annotations", ext),
+        filters: [
+          { name: format === "json" ? "Annotations JSON" : "Annotations CSV", extensions: [ext] },
+        ],
+      });
+      if (typeof chosen !== "string") return;
+      try {
+        await api.exportAnnotations(meta.id, chosen, format);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    openRowNoteEditor: (displayRow, label, initialText = "") =>
+      set({ annotationNoteTarget: { displayRow, columnId: null, label, initialText } }),
+    openCellNoteEditor: (displayRow, columnId, label, initialText = "") =>
+      set({ annotationNoteTarget: { displayRow, columnId, label, initialText } }),
+    closeNoteEditor: () => set({ annotationNoteTarget: null }),
+    openTagPicker: (displayRows) => set({ annotationTagTarget: { displayRows } }),
+    closeTagPicker: () => set({ annotationTagTarget: null }),
+    openTagToColumn: (tag) => set({ tagToColumnTag: tag, activeModal: "tagToColumn" }),
+    closeTagToColumn: () => set({ tagToColumnTag: null, activeModal: null }),
+
     // ----- compressed files (F17) --------------------------------------------
 
     startArchiveExtract: async (path, entry, allowLarge) => {
@@ -3675,6 +4110,7 @@ export const useStore = create<Store>((set, get) => {
         // The side area shows one panel at a time.
         changesOpen: open ? false : s.changesOpen,
         explorer: open ? { ...s.explorer, open: false } : s.explorer,
+        annotationsPanelOpen: open ? false : s.annotationsPanelOpen,
       })),
 
     setChangesOpen: (open) =>
@@ -3682,6 +4118,7 @@ export const useStore = create<Store>((set, get) => {
         changesOpen: open,
         diagnosticsOpen: open ? false : s.diagnosticsOpen,
         explorer: open ? { ...s.explorer, open: false } : s.explorer,
+        annotationsPanelOpen: open ? false : s.annotationsPanelOpen,
       })),
 
     runDiagnosticsScan: async () => {
@@ -3978,6 +4415,10 @@ export const useStore = create<Store>((set, get) => {
           const meta = await api.getMeta(started.docId);
           set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] }));
           pushRecent(path);
+          // F40: hydrate annotations from the extracted file's sidecar so a
+          // later edit merges into any existing notes instead of overwriting
+          // an empty store on top of them.
+          void get().hydrateAnnotationsFromSidecar(meta.id, meta.path);
         } catch (e) {
           set({ error: String(e) });
         }
@@ -4003,6 +4444,13 @@ export const useStore = create<Store>((set, get) => {
           if (finished.kind === "openIndexed") {
             set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] }));
             if (indexing.path) pushRecent(indexing.path);
+            // F40: hydrate annotations from the source's sidecar. Indexed
+            // (F10) opens land here too; without this an annotation edit on a
+            // large read-only document would overwrite its existing sidecar
+            // with an otherwise-empty store. Skipped for the in-place
+            // convert/reindex cases below — the doc id (and its registry
+            // store) is stable across those.
+            void get().hydrateAnnotationsFromSidecar(meta.id, meta.path);
             // F12: restore the matching profile's last-selected view (works
             // on indexed documents — layout, filter and view sort are all
             // non-destructive).
@@ -4522,6 +4970,7 @@ export const useStore = create<Store>((set, get) => {
     isProjectDirty: () => {
       const s = get();
       if (!s.project) return false;
+      if (s.projectAnnotationsDirty) return true;
       return projectDirty(s.project.dirty, s.projectBaseline, currentProjectSnapshot());
     },
 
@@ -4532,6 +4981,7 @@ export const useStore = create<Store>((set, get) => {
         set({
           project: meta,
           projectBaseline: currentProjectSnapshot(),
+          projectAnnotationsDirty: false,
           projectWarnings: [],
           projectOpen: null,
           projectOpenChoices: {},
@@ -4612,7 +5062,11 @@ export const useStore = create<Store>((set, get) => {
         } else {
           meta = await api.projectSave();
         }
-        set({ project: meta, projectBaseline: currentProjectSnapshot() });
+        set({
+          project: meta,
+          projectBaseline: currentProjectSnapshot(),
+          projectAnnotationsDirty: false,
+        });
         return true;
       } catch (e) {
         set({ error: String(e) });
@@ -4646,6 +5100,7 @@ export const useStore = create<Store>((set, get) => {
       set({
         project: null,
         projectBaseline: null,
+        projectAnnotationsDirty: false,
         projectWarnings: [],
         projectClosePromptOpen: false,
         projectOpen: null,
@@ -5151,15 +5606,16 @@ export function useActiveMeta(): DocumentMeta | null {
 
 /**
  * Whether the open project has unsaved changes (F37). Derived reactively from
- * the open documents, active tab, panel layout and each document's active named
- * view versus the snapshot captured at the last save/open, OR'd with the
- * backend's own dirty flag (a relink/removal applied while opening is already
- * unsaved even though the snapshot matches its just-captured baseline), so the
- * dirty dot updates without event bookkeeping.
+ * the open documents, active tab, panel layout, each document's active named
+ * view and the annotations-dirty flag versus the snapshot captured at the last
+ * save/open, OR'd with the backend's own dirty flag (a relink/removal applied
+ * while opening is already unsaved even though the snapshot matches its
+ * just-captured baseline), so the dirty dot updates without event bookkeeping.
  */
 export function useProjectDirty(): boolean {
   return useStore((s) => {
     if (s.project == null) return false;
+    if (s.projectAnnotationsDirty) return true;
     const activeViews: Record<number, string | null> = {};
     for (const t of s.tabs) {
       activeViews[t.id] =

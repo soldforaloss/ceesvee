@@ -12,6 +12,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use tauri::State;
 
+use crate::annotations::{
+    self, AnnotationExportFormat, AnnotationPredicate, AnnotationRegistry, AnnotationsExport,
+    AnnotationsView, RematchReport, RowMarkPatch, TagDef, TagToColumnPreview, TagToColumnTarget,
+};
 use crate::append::{self, AppendCache, AppendInput, AppendOptions, AppendPreview, AppendReport};
 use crate::archive::{self, ArchiveCache, ZipEntryInfo};
 use crate::clipboard::{self, CopyFormat};
@@ -51,6 +55,7 @@ use crate::recipe::{self, BatchOptions, BatchReport, RecipeCache};
 use crate::reopen::{self, CurrentInterpretation};
 use crate::repair::{self, RepairPreview, RepairSpec};
 use crate::reshape::{self, ReshapePreview, ReshapeSpec};
+use crate::row_identity::KeySpec;
 use crate::sampling::{
     self, SampleDestination, SamplePlan, SamplePreview, SampleRequest, SampleStart,
 };
@@ -680,6 +685,11 @@ pub async fn apply_reparse(
         // dictionary (F38) carries across on the same principle.
         fresh.inherit_schema(doc);
         fresh.inherit_dictionary(doc);
+        // F40 annotations are NOT held on the document: they live in the
+        // doc_id-keyed AnnotationRegistry, so this whole-document swap preserves
+        // them automatically. They re-resolve against the fresh content on the
+        // next read; the front end calls `annotations_rematch` after a reparse
+        // to surface any newly-ambiguous / orphaned annotations for review.
         // Journaling continues against the NEW interpretation.
         attach_journal_if_enabled(&app, &mut fresh);
         let meta = fresh.meta();
@@ -926,6 +936,7 @@ pub fn close_document(
     outlier_cache: State<'_, OutlierCache>,
     append_cache: State<'_, AppendCache>,
     pii_cache: State<'_, PiiCache>,
+    annotations: State<'_, AnnotationRegistry>,
     follows: State<'_, FollowRegistry>,
 ) -> AppResult<()> {
     // Closing a followed tab stops its watcher and releases the handle.
@@ -951,6 +962,7 @@ pub fn close_document(
     outlier_cache.remove(doc_id);
     append_cache.remove(doc_id);
     pii_cache.remove(doc_id);
+    annotations.remove(doc_id);
     Ok(())
 }
 
@@ -2058,6 +2070,403 @@ pub async fn apply_dictionary_import(
     .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
 }
 
+// ----- row bookmarks, tags and notes (F40) ---------------------------------------
+//
+// Annotations live in the doc_id-keyed [`AnnotationRegistry`], deliberately
+// OUTSIDE the document: they survive the whole-`Document` replacement a reparse
+// / reindex / convert-to-editable performs (the id is stable) and are re-resolved
+// lazily against the current content on every read, so those flows need no change
+// — the front end calls `annotations_rematch` after a reload to surface the
+// ambiguous / orphaned review list. All edits are metadata: never undoable, never
+// dirtying the document, guarded by the store's own revision. Reads run a bounded
+// scan of the document (like `apply_diagnostic_filter`); a huge indexed source is
+// only ever fully scanned when a record anchor's content drifted (which an
+// immutable indexed backing never does) or a key spec is in use.
+
+/// Run `f` with read access to the document and mutable access to its
+/// annotation store (both created/looked-up here). Lock order is always
+/// document-then-registry.
+fn edit_annotations<T>(
+    state: &Db<'_>,
+    annotations: &State<'_, AnnotationRegistry>,
+    doc_id: u64,
+    f: impl FnOnce(&Document, &mut annotations::AnnotationStore) -> AppResult<T>,
+) -> AppResult<T> {
+    let handle = doc_handle(state, doc_id)?;
+    let doc = handle.read().map_err(poisoned)?;
+    annotations.try_with(doc_id, |store| f(&doc, store))
+}
+
+/// Snapshot the annotations panel surface (rematched against the current doc).
+#[tauri::command]
+pub fn annotations_view(
+    doc_id: u64,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<AnnotationsView> {
+    edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.view(&DocumentSource::new(doc), doc.revision(), None)
+    })
+}
+
+/// Re-resolve every annotation against the current document and return the
+/// matched tally plus the ambiguous / orphaned review list. The front end calls
+/// this after any reparse / reindex / external-change reload.
+#[tauri::command]
+pub fn annotations_rematch(
+    doc_id: u64,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<RematchReport> {
+    edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.rematch_report(&DocumentSource::new(doc), None)
+    })
+}
+
+/// Set (or clear, with `None`) the key columns used to anchor NEW annotations,
+/// then re-anchor the matched existing ones to the new mechanism.
+#[tauri::command]
+pub fn annotations_set_key_spec(
+    doc_id: u64,
+    key_spec: Option<KeySpec>,
+    expected_annotations_revision: u64,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<AnnotationsView> {
+    edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.check_revision(expected_annotations_revision)?;
+        let source = DocumentSource::new(doc);
+        // Re-anchor the existing annotations under the new spec, resolving them
+        // under the OLD spec first so keyed notes are not orphaned or silently
+        // reattached to the wrong row.
+        store.set_key_spec_and_reanchor(&source, key_spec, None)?;
+        store.view(&source, doc.revision(), None)
+    })
+}
+
+/// Set (or clear, with `None`) the default author label carried on new notes.
+#[tauri::command]
+pub fn annotations_set_author(
+    doc_id: u64,
+    author: Option<String>,
+    expected_annotations_revision: u64,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<AnnotationsView> {
+    edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.check_revision(expected_annotations_revision)?;
+        store.set_author(author);
+        store.view(&DocumentSource::new(doc), doc.revision(), None)
+    })
+}
+
+/// Star / flag / add or remove tags on the row at `display_row` (translated to
+/// its absolute record). Creates the annotation if absent; prunes it if empty.
+#[tauri::command]
+pub fn annotations_edit_row(
+    doc_id: u64,
+    display_row: usize,
+    patch: RowMarkPatch,
+    expected_annotations_revision: u64,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<AnnotationsView> {
+    edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.check_revision(expected_annotations_revision)?;
+        let record = abs_row(doc, display_row)? as u64;
+        let source = DocumentSource::new(doc);
+        store.edit_row_marks(&source, record, &patch, None)?;
+        store.view(&source, doc.revision(), None)
+    })
+}
+
+/// Set (or clear, with `text = None`) the ROW note on `display_row`.
+#[tauri::command]
+pub fn annotations_set_row_note(
+    doc_id: u64,
+    display_row: usize,
+    text: Option<String>,
+    author: Option<String>,
+    expected_annotations_revision: u64,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<AnnotationsView> {
+    edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.check_revision(expected_annotations_revision)?;
+        let record = abs_row(doc, display_row)? as u64;
+        let source = DocumentSource::new(doc);
+        store.set_row_note(&source, record, text, author, None)?;
+        store.view(&source, doc.revision(), None)
+    })
+}
+
+/// Set (or clear, with `text = None`) a CELL note on `column_id` of
+/// `display_row`.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn annotations_set_cell_note(
+    doc_id: u64,
+    display_row: usize,
+    column_id: String,
+    text: Option<String>,
+    author: Option<String>,
+    expected_annotations_revision: u64,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<AnnotationsView> {
+    edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.check_revision(expected_annotations_revision)?;
+        let record = abs_row(doc, display_row)? as u64;
+        let source = DocumentSource::new(doc);
+        store.set_cell_note(&source, record, &column_id, text, author, None)?;
+        store.view(&source, doc.revision(), None)
+    })
+}
+
+/// Delete one whole annotation entry by its stable handle (e.g. discarding a
+/// single orphan from the review list).
+#[tauri::command]
+pub fn annotations_remove_row(
+    doc_id: u64,
+    handle: u64,
+    expected_annotations_revision: u64,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<AnnotationsView> {
+    edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.check_revision(expected_annotations_revision)?;
+        store.remove_row(handle);
+        store.view(&DocumentSource::new(doc), doc.revision(), None)
+    })
+}
+
+/// Discard every orphaned annotation (no matching row in the current document).
+#[tauri::command]
+pub fn annotations_discard_orphans(
+    doc_id: u64,
+    expected_annotations_revision: u64,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<AnnotationsView> {
+    edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.check_revision(expected_annotations_revision)?;
+        let source = DocumentSource::new(doc);
+        store.discard_orphans(&source, None)?;
+        store.view(&source, doc.revision(), None)
+    })
+}
+
+/// Define or update a tag in the namespace.
+#[tauri::command]
+pub fn annotations_define_tag(
+    doc_id: u64,
+    tag: TagDef,
+    expected_annotations_revision: u64,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<AnnotationsView> {
+    edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.check_revision(expected_annotations_revision)?;
+        store.define_tag(tag)?;
+        store.view(&DocumentSource::new(doc), doc.revision(), None)
+    })
+}
+
+/// Remove a tag from the namespace and from every row that carries it.
+#[tauri::command]
+pub fn annotations_remove_tag(
+    doc_id: u64,
+    name: String,
+    expected_annotations_revision: u64,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<AnnotationsView> {
+    edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.check_revision(expected_annotations_revision)?;
+        store.remove_tag(&name);
+        store.view(&DocumentSource::new(doc), doc.revision(), None)
+    })
+}
+
+/// Filter the grid to the rows matching an annotation-state predicate
+/// (starred / flagged / tagged / has-note …), via the existing row-filter view.
+/// Only MATCHED rows contribute — an ambiguous or orphaned annotation is never
+/// filtered onto. Guarded by the document revision.
+#[tauri::command]
+pub fn apply_annotation_filter(
+    doc_id: u64,
+    predicate: AnnotationPredicate,
+    expected_revision: u64,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<DocumentMeta> {
+    let handle = doc_handle(&state, doc_id)?;
+    let mut doc = handle.write().map_err(poisoned)?;
+    doc.check_revision(expected_revision)?;
+    let records = {
+        let source = DocumentSource::new(&doc);
+        annotations.try_with(doc_id, |store| {
+            store.matching_records(&source, &predicate, None)
+        })?
+    };
+    let rows: Vec<usize> = records.into_iter().map(|r| r as usize).collect();
+    doc.set_filter(rows)?;
+    Ok(doc.meta())
+}
+
+/// Preview copying a tag into a column (how many rows are affected, what is
+/// skipped as ambiguous / orphaned, a bounded sample). Read-only; carries the
+/// document revision the apply is guarded by.
+#[tauri::command]
+pub fn preview_tag_to_column(
+    doc_id: u64,
+    tag: String,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<TagToColumnPreview> {
+    edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.preview_tag_to_column(&DocumentSource::new(doc), &tag, doc.revision(), None)
+    })
+}
+
+/// Copy a tag into a real column as ONE undoable document operation: a fresh
+/// column (filled for tagged rows, blank elsewhere) or writes into an existing
+/// column (only the tagged rows). Guarded by the document revision. The notes
+/// themselves are untouched — this materialises a copy, on request.
+#[tauri::command]
+pub fn apply_tag_to_column(
+    doc_id: u64,
+    tag: String,
+    target: TagToColumnTarget,
+    expected_revision: u64,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<DocumentMeta> {
+    let handle = doc_handle(&state, doc_id)?;
+    let mut doc = handle.write().map_err(poisoned)?;
+    doc.check_revision(expected_revision)?;
+    doc.ensure_editable()?;
+    // record → tag value, computed against a read snapshot of the same doc.
+    let writes = {
+        let source = DocumentSource::new(&doc);
+        annotations.try_with(doc_id, |store| {
+            store.tag_to_column_writes(&source, &tag, None)
+        })?
+    };
+    match target {
+        TagToColumnTarget::NewColumn { name } => {
+            let n_rows = doc.n_rows();
+            let mut values = vec![String::new(); n_rows];
+            for (record, value) in writes {
+                if let Some(slot) = values.get_mut(record as usize) {
+                    *slot = value;
+                }
+            }
+            let insert_at = doc.n_cols();
+            doc.replace_columns(Vec::new(), insert_at, vec![(name, values)])?;
+        }
+        TagToColumnTarget::ExistingColumn { column } => {
+            if column >= doc.n_cols() {
+                return Err(AppError::invalid("column index out of range"));
+            }
+            let changes: Vec<(usize, usize, String)> = writes
+                .into_iter()
+                .map(|(record, value)| (record as usize, column, value))
+                .collect();
+            // Route through the F31 validation path, exactly like an ordinary
+            // cell edit: a strict integer/date/boolean target rejects the whole
+            // batch instead of committing tag text it would otherwise refuse;
+            // an advisory column applies and records issues. Same undo shape as
+            // a direct set_cells.
+            schema_ops::apply_validated_cells(&mut doc, changes)?;
+        }
+    }
+    Ok(doc.meta())
+}
+
+/// Export the annotations as versioned JSON or flat CSV (atomic write via the
+/// F03 pipeline). An EXPLICIT action — notes never leave through an ordinary
+/// data export.
+#[tauri::command]
+pub fn export_annotations(
+    doc_id: u64,
+    path: String,
+    format: AnnotationExportFormat,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<()> {
+    let rendered = edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.export_as(&DocumentSource::new(doc), format, None)
+    })?;
+    save_mod::atomic_write(Path::new(&path), BackupPolicy::None, |file| {
+        use std::io::Write;
+        file.write_all(rendered.as_bytes())?;
+        Ok(rendered.len() as u64)
+    })?;
+    Ok(())
+}
+
+/// The full annotations export envelope for `doc_id` — what the front end writes
+/// into the project's `annotations` section, or a sidecar.
+#[tauri::command]
+pub fn annotations_get_export(
+    doc_id: u64,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<AnnotationsExport> {
+    annotations.try_with(doc_id, |store| Ok(store.to_export()))
+}
+
+/// Hydrate a document's annotation store from an export envelope (from the
+/// project section on project open, say). Replaces any current store.
+#[tauri::command]
+pub fn annotations_load_export(
+    doc_id: u64,
+    export: AnnotationsExport,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<AnnotationsView> {
+    annotations.set(doc_id, annotations::AnnotationStore::from_export(export))?;
+    edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.view(&DocumentSource::new(doc), doc.revision(), None)
+    })
+}
+
+/// Load a document's annotations from its sidecar file (`<source>` →
+/// `<source>.ceesvee-notes.json`), replacing any current store. An absent
+/// sidecar yields an empty store. Used when no project is open.
+#[tauri::command]
+pub fn annotations_load_sidecar(
+    doc_id: u64,
+    source_path: String,
+    state: Db<'_>,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<AnnotationsView> {
+    let store = annotations::load_sidecar(Path::new(&source_path))?;
+    annotations.set(doc_id, store)?;
+    edit_annotations(&state, &annotations, doc_id, |doc, store| {
+        store.view(&DocumentSource::new(doc), doc.revision(), None)
+    })
+}
+
+/// Save a document's annotations to its sidecar file (atomic). An empty store
+/// deletes the sidecar. When a project is open the front end persists into the
+/// project's `annotations` section instead (the project absorbs the sidecar on
+/// save — the simple migration rule).
+#[tauri::command]
+pub fn annotations_save_sidecar(
+    doc_id: u64,
+    source_path: String,
+    annotations: State<'_, AnnotationRegistry>,
+) -> AppResult<()> {
+    // A fire-and-forget save can race a tab close that already removed the
+    // registry entry. Do NOT resurrect an empty store on a miss — that would
+    // delete the existing notes file. No store means nothing to persist.
+    let Some(store) = annotations.clone_existing(doc_id)? else {
+        return Ok(());
+    };
+    annotations::save_sidecar(Path::new(&source_path), &store)
+}
+
 // ----- batch recipes (F25) ------------------------------------------------------
 
 /// Validate a batch (recipe version, steps, templates, distinct output
@@ -2972,6 +3381,24 @@ pub async fn start_column_profile(
 #[tauri::command]
 pub fn get_rows(doc_id: u64, start: usize, count: usize, state: Db<'_>) -> AppResult<RowsResponse> {
     read_doc(&state, doc_id, |doc| doc.get_rows(start, count))
+}
+
+/// Absolute source record numbers for a DISPLAY-row window (F40). Under a sort
+/// or filter the display row is not the record, so the front end needs this map
+/// to place per-row annotation indicators on the correct rows. `None` for a
+/// display index past the current view's end.
+#[tauri::command]
+pub fn display_records(
+    doc_id: u64,
+    start: usize,
+    count: usize,
+    state: Db<'_>,
+) -> AppResult<Vec<Option<u64>>> {
+    read_doc(&state, doc_id, |doc| {
+        Ok((start..start.saturating_add(count))
+            .map(|display| doc.display_to_abs(display).map(|abs| abs as u64))
+            .collect())
+    })
 }
 
 /// The COMPLETE content of one cell (display coordinates), read through the

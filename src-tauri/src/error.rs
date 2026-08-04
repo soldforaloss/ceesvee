@@ -49,6 +49,12 @@ pub enum AppError {
     #[error("stale dictionary: the data dictionary changed since this operation was prepared (expected dictionary revision {expected}, document is at {actual})")]
     StaleDictionaryRevision { expected: u64, actual: u64 },
 
+    /// An annotation-dependent deferred operation (F40 mark/note/tag edit) was
+    /// prepared against an older annotations revision. Independent of the data,
+    /// schema and dictionary revisions: annotating never dirties the document.
+    #[error("stale annotations: the annotations changed since this operation was prepared (expected annotations revision {expected}, document is at {actual})")]
+    StaleAnnotationsRevision { expected: u64, actual: u64 },
+
     /// A mutation was attempted on a document opened in indexed read-only
     /// mode (F10). Convert it to editable first.
     #[error(

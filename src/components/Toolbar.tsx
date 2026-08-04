@@ -74,6 +74,8 @@ export function Toolbar() {
   const setDiagnosticsOpen = useStore((s) => s.setDiagnosticsOpen);
   const explorerOpen = useStore((s) => s.explorer.open);
   const setExplorerOpen = useStore((s) => s.setExplorerOpen);
+  const annotationsPanelOpen = useStore((s) => s.annotationsPanelOpen);
+  const setAnnotationsPanelOpen = useStore((s) => s.setAnnotationsPanelOpen);
 
   const hasDoc = meta !== null;
   // Indexed read-only documents (F10): every mutating tool is disabled; the
@@ -182,6 +184,14 @@ export function Toolbar() {
       icon: <Pulse />,
       onClick: () => setDiagnosticsOpen(!diagnosticsOpen),
       active: diagnosticsOpen,
+      disabled: !hasDoc,
+    },
+    {
+      label: "Annotations",
+      title: "Row bookmarks, tags & notes",
+      icon: <Bookmark />,
+      onClick: () => setAnnotationsPanelOpen(!annotationsPanelOpen),
+      active: annotationsPanelOpen,
       disabled: !hasDoc,
     },
     { label: "Export…", icon: <Download />, onClick: () => setModal("export"), disabled: !hasDoc },

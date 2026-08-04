@@ -26,6 +26,14 @@ function needsEditable(): string | null {
   return meta?.backing === "indexedReadOnly" ? READ_ONLY : null;
 }
 
+/** Annotation row-ops act on the selection; they never touch source data, so a
+ * read-only (indexed) document is fine — only a non-empty selection is needed. */
+function needsRows(): string | null {
+  const s = state();
+  if (s.activeId == null) return NO_DOC;
+  return s.selectedRows.length === 0 ? "Select one or more rows first" : null;
+}
+
 function activeMeta() {
   const s = state();
   return s.tabs.find((t) => t.id === s.activeId) ?? null;
@@ -436,6 +444,90 @@ function staticCommands(): AppCommand[] {
       category: "Data",
       unavailableReason: needsDoc,
       run: () => state().openDictionaryDialog(),
+    },
+    // ----- Annotate (F40) --------------------------------------------------
+    {
+      id: "annotate.panel",
+      title: "Annotations panel",
+      keywords: ["bookmarks", "tags", "notes", "flags", "stars", "review", "orphans"],
+      category: "Annotate",
+      unavailableReason: needsDoc,
+      run: () => {
+        const s = state();
+        s.setAnnotationsPanelOpen(!s.annotationsPanelOpen);
+      },
+    },
+    {
+      id: "annotate.star",
+      title: "Star selected rows",
+      keywords: ["bookmark", "mark", "favourite", "favorite"],
+      category: "Annotate",
+      unavailableReason: needsRows,
+      run: () => void state().applyRowMarks(state().selectedRows, { star: true }),
+    },
+    {
+      id: "annotate.unstar",
+      title: "Unstar selected rows",
+      keywords: ["bookmark", "clear", "remove"],
+      category: "Annotate",
+      unavailableReason: needsRows,
+      run: () => void state().applyRowMarks(state().selectedRows, { star: false }),
+    },
+    {
+      id: "annotate.flag",
+      title: "Flag selected rows",
+      keywords: ["mark", "attention", "review"],
+      category: "Annotate",
+      unavailableReason: needsRows,
+      run: () => void state().applyRowMarks(state().selectedRows, { flag: true }),
+    },
+    {
+      id: "annotate.unflag",
+      title: "Unflag selected rows",
+      keywords: ["clear", "remove"],
+      category: "Annotate",
+      unavailableReason: needsRows,
+      run: () => void state().applyRowMarks(state().selectedRows, { flag: false }),
+    },
+    {
+      id: "annotate.tag",
+      title: "Tag selected rows…",
+      keywords: ["label", "categorise", "categorize", "tags"],
+      category: "Annotate",
+      unavailableReason: needsRows,
+      run: () => state().openTagPicker(state().selectedRows),
+    },
+    {
+      id: "annotate.filterStarred",
+      title: "Filter: starred rows",
+      keywords: ["bookmarks", "show only", "annotation"],
+      category: "Annotate",
+      unavailableReason: needsDoc,
+      run: () => void state().applyAnnotationFilter({ type: "starred" }),
+    },
+    {
+      id: "annotate.filterFlagged",
+      title: "Filter: flagged rows",
+      keywords: ["show only", "annotation"],
+      category: "Annotate",
+      unavailableReason: needsDoc,
+      run: () => void state().applyAnnotationFilter({ type: "flagged" }),
+    },
+    {
+      id: "annotate.filterAnnotated",
+      title: "Filter: annotated rows",
+      keywords: ["show only", "has note", "any annotation"],
+      category: "Annotate",
+      unavailableReason: needsDoc,
+      run: () => void state().applyAnnotationFilter({ type: "anyAnnotation" }),
+    },
+    {
+      id: "annotate.export",
+      title: "Export annotations…",
+      keywords: ["json", "csv", "notes", "tags", "backup"],
+      category: "Annotate",
+      unavailableReason: needsDoc,
+      run: () => openModal("annotationExport"),
     },
     {
       id: "file.follow",
