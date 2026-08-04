@@ -20,12 +20,18 @@ export function ProfilesDialog({ onClose }: { onClose: () => void }) {
   const runValidation = useStore((s) => s.runProfileValidation);
   const clearValidation = useStore((s) => s.clearProfileValidation);
 
+  // F42: the active document's current highlight rules, so a profile can
+  // capture / re-apply them (view-only decoration).
+  const highlightRules = useStore((s) => s.highlight.rules);
+  const setHighlightRules = useStore((s) => s.setHighlightRules);
+
   const [newName, setNewName] = useState("");
   const profiles = settings?.profiles ?? [];
 
   const createFromCurrent = () => {
     if (!meta || !newName.trim()) return;
     const profile = profileFromDocument(newName.trim(), meta);
+    profile.highlightRules = highlightRules.map((r) => ({ ...r }));
     void saveProfiles([...profiles, profile]);
     setNewName("");
   };
@@ -79,6 +85,11 @@ export function ProfilesDialog({ onClose }: { onClose: () => void }) {
                 onValidate={() => void runValidation(p)}
                 validation={validation?.profileId === p.id ? validation : null}
                 hasDoc={!!meta}
+                onSaveHighlights={() =>
+                  update(p.id, { highlightRules: highlightRules.map((r) => ({ ...r })) })
+                }
+                onApplyHighlights={() => void setHighlightRules(p.highlightRules ?? [])}
+                currentHighlightCount={highlightRules.length}
               />
             ))}
           </div>
@@ -97,6 +108,9 @@ function ProfileCard({
   onValidate,
   validation,
   hasDoc,
+  onSaveHighlights,
+  onApplyHighlights,
+  currentHighlightCount,
 }: {
   profile: FileProfile;
   matchesActive: boolean;
@@ -106,9 +120,13 @@ function ProfileCard({
   onValidate: () => void;
   validation: import("../types").ProfileValidation | null;
   hasDoc: boolean;
+  onSaveHighlights: () => void;
+  onApplyHighlights: () => void;
+  currentHighlightCount: number;
 }) {
   const m = profile.matcher;
   const matchValue = matcherValue(m);
+  const profileHighlightCount = profile.highlightRules?.length ?? 0;
 
   return (
     <div className="rounded-lg border border-zinc-200 px-3 py-2 dark:border-zinc-800">
@@ -196,7 +214,33 @@ function ProfileCard({
             {profile.enforceOrder ? " (ordered)" : ""}
           </span>
         )}
+        {profileHighlightCount > 0 && (
+          <span>
+            {profileHighlightCount} highlight rule{profileHighlightCount === 1 ? "" : "s"}
+          </span>
+        )}
       </div>
+
+      {hasDoc && (
+        <div className="mt-1.5 flex items-center gap-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+          <span>Highlighting:</span>
+          <button
+            onClick={onSaveHighlights}
+            title="Store the current document's highlight rules in this profile"
+            className={btnSmall}
+          >
+            Save current ({currentHighlightCount})
+          </button>
+          <button
+            onClick={onApplyHighlights}
+            disabled={profileHighlightCount === 0}
+            title="Apply this profile's highlight rules to the current document"
+            className={`${btnSmall} disabled:opacity-40`}
+          >
+            Apply to document
+          </button>
+        </div>
+      )}
 
       {validation && (
         <div

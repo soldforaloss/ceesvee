@@ -107,5 +107,6 @@ export function profileFromDocument(name: string, meta: DocumentMeta): FileProfi
     crossRules: [],
     namedViews: [],
     lastViewId: null,
+    highlightRules: [],
   };
 }

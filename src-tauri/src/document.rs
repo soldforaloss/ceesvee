@@ -1100,6 +1100,13 @@ impl Document {
         self.undo_stack.len() != self.saved_marker
     }
 
+    /// Cells changed since the last save, in absolute `(row, col)` coordinates
+    /// (best-effort — cleared by a save). Used by conditional highlighting
+    /// (F42) for the "changed since save" condition.
+    pub fn dirty_cells(&self) -> &HashSet<(usize, usize)> {
+        &self.dirty_cells
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo_stack.is_empty()
     }

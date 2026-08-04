@@ -1,7 +1,10 @@
 // Glide Data Grid theme objects for light and dark modes, plus the per-cell
-// override used to highlight unsaved (dirty) cells.
+// overrides used to decorate unsaved (dirty) cells and F42 highlight matches.
 
 import type { Theme } from "@glideapps/glide-data-grid";
+
+import { highlightBackground, highlightFontStyle } from "./highlight";
+import type { HighlightDecoration } from "../types";
 
 const shared: Partial<Theme> = {
   fontFamily: "Inter, ui-sans-serif, system-ui, sans-serif",
@@ -58,3 +61,22 @@ export const darkGridTheme: Partial<Theme> = {
 export const dirtyCellOverride: Partial<Theme> = {
   bgCell: "rgba(139, 92, 246, 0.14)",
 };
+
+/**
+ * The glide theme override that paints one F42 highlight decoration: a
+ * translucent tone tint (so the cell's own text keeps its theme contrast) plus
+ * an optional bold/italic weight. Theme-aware — the same rule reads correctly
+ * in light and dark. The icon is carried separately (shown in the rule list
+ * and explain popover), so it is not part of the canvas override.
+ */
+export function highlightCellOverride(
+  decoration: HighlightDecoration,
+  dark: boolean,
+): Partial<Theme> {
+  const override: Partial<Theme> = {
+    bgCell: highlightBackground(decoration.tone, decoration.emphasis, dark),
+  };
+  const font = highlightFontStyle(decoration.textStyle);
+  if (font) override.baseFontStyle = font;
+  return override;
+}

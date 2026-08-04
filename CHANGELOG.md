@@ -50,6 +50,26 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that opens the same note editor — annotations taken in the form resolve to
   the same rows as the grid gutter and the annotations panel, and stay
   available on a read-only form since they are pure metadata.
+- **Conditional highlighting** (view-only decoration; rules persist in named
+  views and file profiles): flag cells and rows with prioritized rules whose
+  conditions cover equals / not-equals, contains, regular expression, numeric
+  and date ranges, blank / null / invalid (schema-aware), duplicate values,
+  diagnostic issues, cross-column violations, statistical outliers, and
+  changed-since-save — plus bookmarked / flagged / tagged, backed by the F40
+  row annotations (only unambiguously matched rows are decorated). Each rule
+  targets the matched cell, its whole row, or selected columns, and carries a
+  theme-aware semantic decoration (accent / info / warn / error / success /
+  neutral tone, subtle / normal / strong emphasis, optional icon and text
+  style) rather than a raw colour, so light and dark stay readable. Overlaps
+  resolve by priority (ties break by rule id) into one winning decoration per
+  cell, flattened server-side so the grid receives only the visible window — a
+  million-row scroll stays smooth with no per-cell IPC. Highlighting never
+  touches data: no dirty flag, no undo entry, exports unchanged. Per-rule match
+  sets are cached and a rule edit invalidates only its own cache; the
+  annotation-backed rules re-resolve only when an annotation (or the data)
+  changes; an "explain" query lists every rule matching a cell in priority
+  order; and a match report exports to JSON or CSV as a cancellable, atomic
+  job.
 - **JSON & JSON Lines interoperability** (palette → "Open JSON…" and
   "Export as JSON…"): open structured JSON without pre-converting to CSV —
   an array of objects, an array of arrays, JSON Lines / NDJSON, or an

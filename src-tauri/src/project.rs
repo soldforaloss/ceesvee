@@ -1576,6 +1576,7 @@ mod tests {
             column_order: Vec::new(),
             column_widths: std::collections::HashMap::new(),
             wrap_text: false,
+            highlight_rules: Vec::new(),
         }
     }
 
@@ -1653,6 +1654,7 @@ mod tests {
             named_views: Vec::new(),
             last_view_id: None,
             required_documentation: Vec::new(),
+            highlight_rules: Vec::new(),
         }
     }
 
