@@ -158,6 +158,13 @@ pub struct FileProfile {
     /// F12: the view last applied to a matching file, restored on reopen.
     #[serde(default)]
     pub last_view_id: Option<String>,
+
+    /// F38: required data-dictionary documentation. Each rule names the columns
+    /// it covers (empty = every column) and the dictionary fields that must be
+    /// populated; a gap surfaces as an ordinary `missingDocumentation`
+    /// validation issue.
+    #[serde(default)]
+    pub required_documentation: Vec<crate::dictionary::RequiredDocumentation>,
 }
 
 /// The persisted settings document.
@@ -451,6 +458,22 @@ pub fn validate_profile(doc: &Document, profile: &FileProfile) -> AppResult<Prof
         }
     }
 
+    // F38: required data-dictionary documentation. Gaps in a column's
+    // documentation surface as ordinary validation issues.
+    for gap in crate::dictionary::documentation_gaps(doc, &profile.required_documentation) {
+        let missing: Vec<&str> = gap.missing.iter().map(|k| k.label()).collect();
+        issues.push(ProfileIssue {
+            kind: "missingDocumentation".into(),
+            column: Some(gap.column_name.clone()),
+            detail: format!(
+                "“{}” is missing required documentation: {}",
+                gap.column_name,
+                missing.join(", ")
+            ),
+            affected_count: gap.missing.len(),
+        });
+    }
+
     Ok(ProfileValidation {
         profile_id: profile.id.clone(),
         ok: issues.is_empty(),
@@ -498,6 +521,7 @@ mod tests {
             cross_rules: Vec::new(),
             named_views: Vec::new(),
             last_view_id: None,
+            required_documentation: Vec::new(),
         }
     }
 
@@ -625,6 +649,62 @@ mod tests {
         assert!(kind("regexMismatch").is_some(), "bad-email");
         // 2000 exceeds max AND "oops" is non-numeric: both out of range.
         assert_eq!(kind("outOfRange").unwrap().affected_count, 2);
+    }
+
+    #[test]
+    fn required_documentation_surfaces_as_validation_issues() {
+        use crate::dictionary::{DictionaryField, DictionaryFieldKey, RequiredDocumentation};
+        let mut d = doc_from("id,amount,email\n1,10,a@b.c");
+        // Document only the id column, and only with a description.
+        let mut f = DictionaryField::empty(d.column_ids()[0].clone());
+        f.description = Some("primary key".into());
+        d.set_dictionary_field(f);
+
+        let mut p = profile();
+        // Trim the noisier data rules so the documentation issues stand alone.
+        p.regex_rules.clear();
+        p.range_rules.clear();
+        p.expected_types.clear();
+        p.required_documentation = vec![RequiredDocumentation {
+            columns: vec![],
+            fields: vec![DictionaryFieldKey::Description, DictionaryFieldKey::Owner],
+        }];
+        let v = validate_profile(&d, &p).unwrap();
+        let doc_issues: Vec<&ProfileIssue> = v
+            .issues
+            .iter()
+            .filter(|i| i.kind == "missingDocumentation")
+            .collect();
+        // id: missing owner; amount + email: missing both.
+        assert_eq!(doc_issues.len(), 3);
+        let id_issue = doc_issues
+            .iter()
+            .find(|i| i.column.as_deref() == Some("id"))
+            .unwrap();
+        assert!(id_issue.detail.contains("owner"));
+        assert!(
+            !id_issue.detail.contains("description"),
+            "description is set"
+        );
+        assert!(!v.ok);
+
+        // Fully documenting id + owner-only rule clears id's issue.
+        let mut full = DictionaryField::empty(d.column_ids()[0].clone());
+        full.description = Some("primary key".into());
+        full.owner = Some("data-team".into());
+        d.set_dictionary_field(full);
+        let scoped = FileProfile {
+            required_documentation: vec![RequiredDocumentation {
+                columns: vec!["id".into()],
+                fields: vec![DictionaryFieldKey::Description, DictionaryFieldKey::Owner],
+            }],
+            ..profile()
+        };
+        let v2 = validate_profile(&d, &scoped).unwrap();
+        assert!(
+            v2.issues.iter().all(|i| i.kind != "missingDocumentation"),
+            "id is fully documented"
+        );
     }
 
     #[test]

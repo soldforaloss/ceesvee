@@ -162,6 +162,20 @@ and faithful on large, real-world delimited files.**
   conversion applies as one previewed, undoable step. Schemas key columns
   by stable IDs so they survive renames and reorders; a violet header
   badge marks a declared type.
+- **Data dictionary** — document what each column MEANS: display name,
+  description, analytical role, unit, source, sensitivity, allowed values,
+  example, owner, and notes, each keyed by the stable column ID so the
+  documentation survives renames and reorders (deleting a column reports
+  its entry as orphaned and keeps it). The searchable editor prefills every
+  column's technical name and inferred type, shows a per-column
+  completeness indicator, and surfaces the description, unit, and a
+  sensitivity badge as a column-header tooltip. Editing the dictionary is
+  pure metadata — it has its own revision and never dirties the document.
+  Import and export as versioned CEESVEE JSON, Markdown, or CSV
+  documentation; an import merges by column ID (or mapped name) and every
+  field-level conflict is resolved explicitly before it replaces anything.
+  File profiles can require documentation fields, and columns marked
+  confidential or restricted feed the personal-data preflight.
 - **Cross-column validation** — relational rules between columns (typed
   comparisons, date order, conditional required, sum equality with
   tolerance, allowed combinations, …) with violation samples, jump-to-row,

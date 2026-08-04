@@ -7,19 +7,28 @@ import {
   type EditableGridCell,
   type GridCell,
   type GridColumn,
+  type GridMouseEventArgs,
   type GridSelection,
   type Item,
   type Rectangle,
 } from "@glideapps/glide-data-grid";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { SENSITIVITY_LABELS } from "../lib/dictionary";
 import { indicesToRanges } from "../lib/gridSelection";
 import { darkGridTheme, dirtyCellOverride, lightGridTheme } from "../lib/gridTheme";
 import { formatCellValue, isNumericType } from "../lib/schema";
 import * as api from "../lib/tauri";
 import { physicalToDisplay, projectColumns } from "../lib/viewProjection";
 import { useStore } from "../store/useStore";
-import type { ColumnKind, ColumnSchema, DocumentMeta, LogicalType } from "../types";
+import type {
+  ColumnKind,
+  ColumnSchema,
+  DictionaryEntryView,
+  DocumentMeta,
+  LogicalType,
+  Sensitivity,
+} from "../types";
 import { ColumnMenu, type ColumnMenuState } from "./ColumnMenu";
 
 const PAGE = 200;
@@ -180,6 +189,37 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     return arr;
   }, [schemaColumns, meta.columnIds, colCount]);
 
+  // F38: the active document's data dictionary, indexed by stable column ID so
+  // header tooltips survive reorders. Only entries with a display name /
+  // description / unit / sensitivity produce a tooltip.
+  const dictionaryEntries = useStore((s) => s.dictionaryView?.entries ?? null);
+  const dictByColumnId = useMemo(() => {
+    const map = new Map<string, DictionaryEntryView>();
+    if (dictionaryEntries) for (const e of dictionaryEntries) map.set(e.columnId, e);
+    return map;
+  }, [dictionaryEntries]);
+
+  const tooltipForPhys = useCallback(
+    (phys: number): DictionaryTooltip | null => {
+      const id = meta.columnIds[phys];
+      const entry = id ? dictByColumnId.get(id) : undefined;
+      if (!entry) return null;
+      const f = entry.field;
+      const displayName = f.displayName?.trim() || undefined;
+      const description = f.description?.trim() || undefined;
+      const unit = f.unit?.trim() || undefined;
+      const sensitivity = f.sensitivity;
+      if (!displayName && !description && !unit && !sensitivity) return null;
+      return { displayName, description, unit, sensitivity };
+    },
+    [dictByColumnId, meta.columnIds],
+  );
+
+  // Header-tooltip overlay (F38): tracked by physical column so a mouse move
+  // within the same header does not re-render, and cleared on leave.
+  const [headerTip, setHeaderTip] = useState<{ phys: number; x: number; y: number } | null>(null);
+  const headerTipCol = useRef<number | null>(null);
+
   // ----- columns (through the F12 view projection) -------------------------
 
   // DISPLAY position -> PHYSICAL column index. Everything the grid renders or
@@ -271,6 +311,9 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
   useEffect(() => {
     useStore.getState().loadSummaries();
     void useStore.getState().loadSchema();
+    // F38: refetch the dictionary alongside so header tooltips (display name /
+    // description / unit / sensitivity) track renames and structural edits.
+    void useStore.getState().loadDictionary();
   }, [docId, dataVersion]);
 
   const onVisibleRegionChanged = useCallback(
@@ -581,6 +624,29 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoFitRequest?.nonce]);
 
+  // F38: show a documentation tooltip while hovering a documented header.
+  const onItemHovered = useCallback(
+    (args: GridMouseEventArgs) => {
+      if (args.kind === "header") {
+        const phys = projectionRef.current.physical[args.location[0]];
+        if (phys != null && tooltipForPhys(phys)) {
+          if (headerTipCol.current !== phys) {
+            headerTipCol.current = phys;
+            setHeaderTip({ phys, x: args.bounds.x, y: args.bounds.y + args.bounds.height });
+          }
+          return;
+        }
+      }
+      if (headerTipCol.current !== null) {
+        headerTipCol.current = null;
+        setHeaderTip(null);
+      }
+    },
+    [tooltipForPhys],
+  );
+
+  const activeTip = headerTip ? tooltipForPhys(headerTip.phys) : null;
+
   // Effective leading freeze: pinned view columns when any, else the manual
   // "freeze up to here" count (both clamped below the display width).
   const displayCount = projection.physical.length;
@@ -605,6 +671,7 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         onColumnResize={onColumnResize}
         onColumnMoved={onColumnMoved}
         onVisibleRegionChanged={onVisibleRegionChanged}
+        onItemHovered={onItemHovered}
         onHeaderMenuClick={onHeaderMenuClick}
         onCellContextMenu={onCellContextMenu}
         gridSelection={selection}
@@ -621,6 +688,7 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
         width="100%"
         height="100%"
       />
+      {headerTip && activeTip && <HeaderTooltip x={headerTip.x} y={headerTip.y} tip={activeTip} />}
       {menu && (
         <ColumnMenu
           state={menu}
@@ -644,6 +712,56 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
 
 function rectOf(range: Rectangle) {
   return { x: range.x, y: range.y, width: range.width, height: range.height };
+}
+
+/** The documentation shown in a column header tooltip (F38). */
+interface DictionaryTooltip {
+  displayName?: string;
+  description?: string;
+  unit?: string;
+  sensitivity?: Sensitivity;
+}
+
+const SENSITIVITY_BADGE: Record<Sensitivity, string> = {
+  public: "bg-zinc-200 text-zinc-700 dark:bg-zinc-700 dark:text-zinc-200",
+  internal: "bg-sky-100 text-sky-700 dark:bg-sky-500/20 dark:text-sky-200",
+  confidential: "bg-amber-100 text-amber-800 dark:bg-amber-500/20 dark:text-amber-200",
+  restricted: "bg-red-100 text-red-700 dark:bg-red-500/20 dark:text-red-200",
+};
+
+/**
+ * A read-only documentation tooltip anchored under a column header (F38).
+ * Fixed-positioned from the header cell's viewport-relative bounds (the same
+ * convention the column header menu uses); never intercepts pointer events.
+ */
+function HeaderTooltip({ x, y, tip }: { x: number; y: number; tip: DictionaryTooltip }) {
+  return (
+    <div
+      className="pointer-events-none fixed z-40 max-w-xs rounded-md border border-zinc-200 bg-white px-2.5 py-1.5 text-xs shadow-lg dark:border-zinc-700 dark:bg-zinc-800"
+      style={{ left: x, top: y + 2 }}
+    >
+      {tip.displayName && (
+        <div className="font-medium text-zinc-800 dark:text-zinc-100">{tip.displayName}</div>
+      )}
+      {tip.description && (
+        <div className="mt-0.5 text-zinc-600 dark:text-zinc-300">{tip.description}</div>
+      )}
+      {(tip.unit || tip.sensitivity) && (
+        <div className="mt-1 flex flex-wrap items-center gap-1.5">
+          {tip.unit && (
+            <span className="text-[11px] text-zinc-500 dark:text-zinc-400">Unit: {tip.unit}</span>
+          )}
+          {tip.sensitivity && (
+            <span
+              className={`rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${SENSITIVITY_BADGE[tip.sensitivity]}`}
+            >
+              {SENSITIVITY_LABELS[tip.sensitivity]}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 /** Right-click cell menu (F13): open the multiline editor or copy the FULL

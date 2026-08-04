@@ -96,6 +96,13 @@ import type {
   ProjectOpenPreview,
   ProjectOpenPlan,
   ResolutionEntry,
+  DictionaryField,
+  DictionaryFormat,
+  DictionaryImportOutcome,
+  DictionaryView,
+  MergeMatchBy,
+  MergePlan,
+  MergeResolution,
 } from "../types";
 
 export const openFile = (path: string, options?: OpenOptions) =>
@@ -596,6 +603,78 @@ export const convertColumnApply = (
     columnId,
     expectedRevision,
     expectedSchemaRevision,
+  });
+
+// ----- data dictionary (F38) ------------------------------------------------
+
+/** The dictionary editor surface: one row per current column plus orphans (F38). */
+export const getDictionary = (docId: number) => invoke<DictionaryView>("get_dictionary", { docId });
+
+/**
+ * Insert or replace one column's documentation (F38). Metadata only: never
+ * dirties the document. An all-blank entry is removed rather than stored.
+ * Guarded by the dictionary revision.
+ */
+export const setDictionaryField = (
+  docId: number,
+  field: DictionaryField,
+  expectedDictionaryRevision: number,
+) =>
+  invoke<DictionaryView>("set_dictionary_field", {
+    docId,
+    field,
+    expectedDictionaryRevision,
+  });
+
+/** Drop one column's documentation entry (clear a column, or an orphan) (F38). */
+export const removeDictionaryField = (
+  docId: number,
+  columnId: string,
+  expectedDictionaryRevision: number,
+) =>
+  invoke<DictionaryView>("remove_dictionary_field", {
+    docId,
+    columnId,
+    expectedDictionaryRevision,
+  });
+
+/** Discard EVERY orphaned entry (documentation whose column is gone) (F38). */
+export const discardDictionaryOrphans = (docId: number, expectedDictionaryRevision: number) =>
+  invoke<DictionaryView>("discard_dictionary_orphans", {
+    docId,
+    expectedDictionaryRevision,
+  });
+
+/** Export the dictionary as JSON / Markdown / CSV (atomic write) (F38). */
+export const exportDictionary = (docId: number, path: string, format: DictionaryFormat) =>
+  invoke<void>("export_dictionary", { docId, path, format });
+
+/**
+ * Plan a dictionary import (F38): parse the CEESVEE dictionary JSON at `path`,
+ * match its entries to current columns, and return the merge plan (clean
+ * additions + the field-level conflicts that must be resolved). Read-only.
+ */
+export const previewDictionaryImport = (docId: number, path: string, matchBy: MergeMatchBy) =>
+  invoke<MergePlan>("preview_dictionary_import", { docId, path, matchBy });
+
+/**
+ * Apply a dictionary import under an explicit conflict resolution (F38). Fails
+ * (changing nothing) if any reported conflict is left unresolved, or if the
+ * dictionary moved since the plan was taken. Metadata only.
+ */
+export const applyDictionaryImport = (
+  docId: number,
+  path: string,
+  matchBy: MergeMatchBy,
+  resolution: MergeResolution,
+  expectedDictionaryRevision: number,
+) =>
+  invoke<DictionaryImportOutcome>("apply_dictionary_import", {
+    docId,
+    path,
+    matchBy,
+    resolution,
+    expectedDictionaryRevision,
   });
 
 /**

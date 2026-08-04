@@ -340,6 +340,16 @@ pub struct Document {
     /// their column's declared type. Bounded
     /// ([`crate::schema::MAX_SCHEMA_ISSUES`]), newest kept.
     schema_issues: Vec<crate::schema::SchemaIssue>,
+    /// F38 data dictionary: human documentation per column keyed by stable
+    /// column ID. Like the schema it lives OUTSIDE the undo stack and is pure
+    /// metadata — editing it never rewrites cells and never makes the document
+    /// dirty. Entries survive renames/reorders (keyed by ID) and are kept when
+    /// a column is deleted (reported as orphaned until explicitly discarded).
+    dictionary: crate::dictionary::Dictionary,
+    /// Bumped on every dictionary mutation, independent of both the document
+    /// `revision` and `schema_revision`, so documentation edits never move the
+    /// dirty flag or invalidate data/schema previews.
+    dictionary_revision: u64,
     /// F17: where the document came from when opened out of an archive.
     /// Archive-backed documents have no `path` (no in-place saving); Save As
     /// clears this and turns them into ordinary file documents.
@@ -418,6 +428,8 @@ impl Document {
             schema: crate::schema::DocumentSchema::default(),
             schema_revision: 0,
             schema_issues: Vec::new(),
+            dictionary: crate::dictionary::Dictionary::default(),
+            dictionary_revision: 0,
             backing: Backing::Memory,
             archive: None,
             archive_guard: None,
@@ -466,6 +478,8 @@ impl Document {
             schema: crate::schema::DocumentSchema::default(),
             schema_revision: 0,
             schema_issues: Vec::new(),
+            dictionary: crate::dictionary::Dictionary::default(),
+            dictionary_revision: 0,
             backing: Backing::Memory,
             archive: None,
             archive_guard: None,
@@ -521,6 +535,8 @@ impl Document {
             schema: crate::schema::DocumentSchema::default(),
             schema_revision: 0,
             schema_issues: Vec::new(),
+            dictionary: crate::dictionary::Dictionary::default(),
+            dictionary_revision: 0,
             backing: Backing::Indexed(handle),
             archive: None,
             archive_guard: None,
@@ -630,6 +646,64 @@ impl Document {
 
     pub fn clear_schema_issues(&mut self) {
         self.schema_issues.clear();
+    }
+
+    // ----- data dictionary (F38) -------------------------------------------
+
+    /// The document's data dictionary (per-column documentation keyed by
+    /// stable column ID). Reading it never touches cells.
+    pub fn dictionary(&self) -> &crate::dictionary::Dictionary {
+        &self.dictionary
+    }
+
+    /// Bumped on every dictionary mutation; independent of [`Document::revision`]
+    /// and [`Document::schema_revision`] so documentation edits never dirty the
+    /// document or invalidate data/schema previews.
+    pub fn dictionary_revision(&self) -> u64 {
+        self.dictionary_revision
+    }
+
+    /// Insert or replace one column's dictionary entry.
+    pub fn set_dictionary_field(&mut self, field: crate::dictionary::DictionaryField) {
+        self.dictionary.set(field);
+        self.dictionary_revision += 1;
+    }
+
+    /// Remove one column's dictionary entry (e.g. discarding an orphan).
+    /// Returns whether an entry was present.
+    pub fn remove_dictionary_field(&mut self, column_id: &str) -> bool {
+        let removed = self.dictionary.remove(column_id);
+        self.dictionary_revision += 1;
+        removed
+    }
+
+    /// Replace the whole dictionary (import / merge apply / bulk discard).
+    pub fn set_dictionary(&mut self, dictionary: crate::dictionary::Dictionary) {
+        self.dictionary = dictionary;
+        self.dictionary_revision += 1;
+    }
+
+    /// Carry the dictionary across a whole-`Document` replacement (reparse /
+    /// reindex): entries are keyed by stable IDs, which restart positionally,
+    /// so they re-attach to the same columns the original open assigned.
+    pub fn inherit_dictionary(&mut self, prev: &Document) {
+        self.dictionary = prev.dictionary.clone();
+        self.dictionary_revision = prev.dictionary_revision + 1;
+    }
+
+    /// Guard a dictionary-dependent deferred operation (F38: a merge/import
+    /// resolution prepared against a snapshot): fail with
+    /// [`AppError::StaleDictionaryRevision`] when the dictionary moved since
+    /// `expected` was captured. Independent of the data and schema revisions.
+    pub fn check_dictionary_revision(&self, expected: u64) -> AppResult<()> {
+        if self.dictionary_revision == expected {
+            Ok(())
+        } else {
+            Err(AppError::StaleDictionaryRevision {
+                expected,
+                actual: self.dictionary_revision,
+            })
+        }
     }
 
     /// The in-memory row slice. EDITABLE backing only: for indexed documents

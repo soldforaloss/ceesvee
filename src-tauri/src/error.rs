@@ -42,6 +42,13 @@ pub enum AppError {
     #[error("stale schema: the column schema changed since this operation was prepared (expected schema revision {expected}, document is at {actual})")]
     StaleSchemaRevision { expected: u64, actual: u64 },
 
+    /// A dictionary-dependent deferred operation (F38 import/merge resolution)
+    /// was prepared against an older dictionary revision. The imported
+    /// documentation must be re-planned against the current dictionary before
+    /// it can be applied.
+    #[error("stale dictionary: the data dictionary changed since this operation was prepared (expected dictionary revision {expected}, document is at {actual})")]
+    StaleDictionaryRevision { expected: u64, actual: u64 },
+
     /// A mutation was attempted on a document opened in indexed read-only
     /// mode (F10). Convert it to editable first.
     #[error(

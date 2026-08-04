@@ -63,6 +63,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dialog lists each source's status with per-source actions (open, relink,
   leave out, remove, or open-available-only); and quitting or closing a
   project with unsaved workspace changes prompts to save first.
+- **Data dictionary** — document what each column MEANS. Every column
+  carries an optional entry (display name, description, analytical role,
+  unit, source, sensitivity, allowed values, example, owner, notes) keyed
+  by its stable column ID, so the documentation survives renames and
+  reorders and is restored by undo/redo; deleting a column reports its
+  entry as orphaned and keeps it until you explicitly discard it (an undo
+  re-attaches it). Editing the dictionary is pure metadata: it has its own
+  revision, like the schema, and never rewrites a cell or marks the
+  document dirty. The editor prefills each column's technical name and
+  inferred F31 type. Dictionaries import and export as versioned CEESVEE
+  JSON, Markdown documentation, and tabular CSV documentation; an import
+  merges incoming metadata by column ID (or by mapped column name when the
+  IDs differ) and surfaces every field-level conflict for explicit
+  resolution before it replaces anything. File profiles can require
+  documentation fields (e.g. a description and owner on every column) as
+  ordinary validation issues, and columns classified confidential or
+  restricted are folded into the PII scan preflight even when no detector
+  matches them.
 - **Explicit schemas and typed columns** (palette → "Edit schema…", or a
   column header's menu): declare an explicit logical type per column —
   text, integer, decimal, float, boolean, date, datetime, UUID, or JSON —

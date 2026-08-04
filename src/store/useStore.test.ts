@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
+  DictionaryView,
   DocumentMeta,
   PlanEntry,
   ProjectMeta,
@@ -27,6 +28,7 @@ vi.mock("../lib/tauri", () => ({
   pendingArchiveEstimate: vi.fn(),
   openArchiveDocument: vi.fn(),
   discardArchive: vi.fn(),
+  applyDictionaryImport: vi.fn(),
   projectOpenApply: vi.fn(),
   projectGet: vi.fn(),
 }));
@@ -527,6 +529,49 @@ describe("compressed file open flow (F17)", () => {
     useStore.getState().dismissOpenDecision();
     expect(api.discardArchive).toHaveBeenCalledWith(12);
     expect(useStore.getState().openDecision).toBeNull();
+  });
+});
+
+describe("dictionary import stale-plan guard (F38)", () => {
+  const dictView = (rev: number): DictionaryView => ({
+    dictionaryRevision: rev,
+    revision: 1,
+    entries: [],
+    orphans: [],
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useStore.setState({
+      tabs: [meta(1)],
+      activeId: 1,
+      // The LIVE view has moved on (an edit was saved after the preview).
+      dictionaryView: dictView(9),
+      error: null,
+    });
+  });
+
+  it("applies the plan-time revision, not the live view's, so a stale apply is guarded", async () => {
+    vi.mocked(api.applyDictionaryImport).mockResolvedValue({
+      matchedColumns: 0,
+      newEntries: 0,
+      updatedEntries: 0,
+      fieldsAdded: 0,
+      conflictsResolved: 0,
+      unmatched: [],
+      view: dictView(10),
+    });
+
+    // The dialog passes the revision captured when the plan was previewed (7),
+    // even though the store's current view is at 9.
+    await useStore
+      .getState()
+      .applyDictionaryImport("C:/x.dictionary.json", "auto", { type: "keepAllExisting" }, 7);
+
+    const call = vi.mocked(api.applyDictionaryImport).mock.calls[0];
+    // (docId, path, matchBy, resolution, expectedDictionaryRevision)
+    expect(call[4]).toBe(7);
+    expect(call[4]).not.toBe(9);
   });
 });
 

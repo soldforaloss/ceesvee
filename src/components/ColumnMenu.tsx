@@ -37,6 +37,7 @@ export function ColumnMenu({ state, headers, columnIds, readOnly, onClose }: Col
   const pinColumn = useStore((s) => s.pinColumn);
   const requestAutoFit = useStore((s) => s.requestAutoFit);
   const openSchemaDialog = useStore((s) => s.openSchemaDialog);
+  const openDictionaryDialog = useStore((s) => s.openDictionaryDialog);
   const columnLayout = useStore((s) => s.columnLayout);
   const columnId = columnIds[col];
   const isPinned = columnId !== undefined && !!columnLayout?.pinnedColumnIds.includes(columnId);
@@ -128,6 +129,7 @@ export function ColumnMenu({ state, headers, columnIds, readOnly, onClose }: Col
           <Divider />
           {/* F31: declaring a logical type is metadata — allowed read-only too. */}
           <MenuItem onClick={() => run(() => openSchemaDialog(col))}>Edit schema…</MenuItem>
+          <MenuItem onClick={() => run(() => openDictionaryDialog(col))}>Document column…</MenuItem>
           <Divider />
           <MenuItem onClick={() => run(() => setColumnHidden(col, true))}>Hide column</MenuItem>
           <MenuItem onClick={() => run(() => pinColumn(col, !isPinned))}>

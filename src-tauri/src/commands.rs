@@ -21,6 +21,10 @@ use crate::crossval::{self, CrossRule, CrossValCache, CrossValReport};
 use crate::dedup::{self, DedupCache, DedupSpec, DuplicateKeepStrategy, DuplicateReport};
 use crate::diagnostics::{self, DiagnosticsCache, DiagnosticsReport};
 use crate::dialect::{self, CsvDialectOptions, DialectPreview};
+use crate::dictionary::{
+    self, DictionaryField, DictionaryFormat, DictionaryImportOutcome, DictionaryView, MergeMatchBy,
+    MergePlan, MergeResolution,
+};
 use crate::document::{ChangeSummary, Document};
 use crate::dto::{
     BackupPolicy, CellRect, ColumnSummary, DocumentMeta, EncodingCompatibility,
@@ -582,8 +586,10 @@ pub async fn start_reindex(
             fresh.set_revision(doc.revision() + 1);
             fresh.set_fingerprint(fingerprint);
             // Schema entries key on stable IDs, which restart positionally on
-            // a reload — they re-attach to the same columns (F31).
+            // a reload — they re-attach to the same columns (F31). The data
+            // dictionary (F38) carries across on the same principle.
             fresh.inherit_schema(&doc);
+            fresh.inherit_dictionary(&doc);
             *doc = fresh;
             Ok(())
         })
@@ -666,8 +672,10 @@ pub async fn apply_reparse(
         fresh.set_revision(doc.revision() + 1);
         fresh.set_fingerprint(fingerprint);
         // Schema entries key on stable IDs, which restart positionally on a
-        // reparse — they re-attach to the same columns (F31).
+        // reparse — they re-attach to the same columns (F31). The data
+        // dictionary (F38) carries across on the same principle.
         fresh.inherit_schema(doc);
+        fresh.inherit_dictionary(doc);
         // Journaling continues against the NEW interpretation.
         attach_journal_if_enabled(&app, &mut fresh);
         let meta = fresh.meta();
@@ -1884,6 +1892,166 @@ pub async fn apply_redaction(
     let (meta, audit) = result;
     append_pii_audit(&app, &audit);
     Ok(meta)
+}
+
+// ----- data dictionary (F38) ----------------------------------------------------
+
+/// The dictionary editor surface: one row per current column (technical name +
+/// inferred F31 type prefilled, stored entry when documented) plus any orphaned
+/// entries. `dictionaryRevision` is the metadata revision used to guard edits;
+/// documentation edits never move the document `revision` or the dirty flag.
+#[tauri::command]
+pub fn get_dictionary(doc_id: u64, state: Db<'_>) -> AppResult<DictionaryView> {
+    read_doc(&state, doc_id, |doc| Ok(dictionary::view(doc)))
+}
+
+/// Insert or replace one column's documentation. An entry with no populated
+/// field is removed rather than stored empty. Metadata only: not undoable,
+/// never dirties the document. Guarded by the dictionary revision.
+#[tauri::command]
+pub fn set_dictionary_field(
+    doc_id: u64,
+    field: DictionaryField,
+    expected_dictionary_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DictionaryView> {
+    write_doc(&state, doc_id, |doc| {
+        doc.check_dictionary_revision(expected_dictionary_revision)?;
+        dictionary::validate_field(&field)?;
+        // The entry must key on a column that exists (present or orphaned is
+        // fine — it is keyed by stable ID either way).
+        if field.is_documented() {
+            doc.set_dictionary_field(field);
+        } else {
+            doc.remove_dictionary_field(&field.column_id);
+        }
+        Ok(dictionary::view(doc))
+    })
+}
+
+/// Drop one column's documentation entry (clearing a column, or discarding a
+/// single orphan). Guarded by the dictionary revision.
+#[tauri::command]
+pub fn remove_dictionary_field(
+    doc_id: u64,
+    column_id: String,
+    expected_dictionary_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DictionaryView> {
+    write_doc(&state, doc_id, |doc| {
+        doc.check_dictionary_revision(expected_dictionary_revision)?;
+        doc.remove_dictionary_field(&column_id);
+        Ok(dictionary::view(doc))
+    })
+}
+
+/// Discard EVERY orphaned entry (documentation whose column is gone). The
+/// user's explicit "clean up orphans" action. Guarded by the dictionary
+/// revision.
+#[tauri::command]
+pub fn discard_dictionary_orphans(
+    doc_id: u64,
+    expected_dictionary_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DictionaryView> {
+    write_doc(&state, doc_id, |doc| {
+        doc.check_dictionary_revision(expected_dictionary_revision)?;
+        let orphan_ids: Vec<String> = dictionary::orphans(doc)
+            .into_iter()
+            .map(|o| o.column_id)
+            .collect();
+        if !orphan_ids.is_empty() {
+            let mut dict = doc.dictionary().clone();
+            for id in &orphan_ids {
+                dict.remove(id);
+            }
+            doc.set_dictionary(dict);
+        }
+        Ok(dictionary::view(doc))
+    })
+}
+
+/// Export the dictionary as versioned JSON, Markdown documentation, or tabular
+/// CSV documentation (atomic write via the F03 pipeline).
+#[tauri::command]
+pub async fn export_dictionary(
+    doc_id: u64,
+    path: String,
+    format: DictionaryFormat,
+    state: Db<'_>,
+) -> AppResult<()> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let rendered = {
+            let doc = handle.read().map_err(poisoned)?;
+            dictionary::export_as(&doc, format)?
+        };
+        save_mod::atomic_write(Path::new(&path), BackupPolicy::None, |file| {
+            use std::io::Write;
+            file.write_all(rendered.as_bytes())?;
+            Ok(rendered.len() as u64)
+        })?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Plan a dictionary import: parse the CEESVEE dictionary JSON at `path`, match
+/// its entries to current columns by ID or mapped name, and return the merge
+/// plan (clean additions + the field-level conflicts that must be resolved
+/// before applying). Read-only — nothing changes.
+#[tauri::command]
+pub async fn preview_dictionary_import(
+    doc_id: u64,
+    path: String,
+    match_by: MergeMatchBy,
+    state: Db<'_>,
+) -> AppResult<MergePlan> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let json = std::fs::read_to_string(&path)?;
+        let imported = dictionary::parse_import(&json)?;
+        let doc = handle.read().map_err(poisoned)?;
+        Ok(dictionary::plan_merge(&doc, &imported, match_by))
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+/// Apply a dictionary import under an explicit conflict resolution. Fails
+/// (changing nothing) if any reported conflict is left unresolved, or if the
+/// dictionary moved since the plan was taken. Metadata only: never dirties the
+/// document.
+#[tauri::command]
+pub async fn apply_dictionary_import(
+    doc_id: u64,
+    path: String,
+    match_by: MergeMatchBy,
+    resolution: MergeResolution,
+    expected_dictionary_revision: u64,
+    state: Db<'_>,
+) -> AppResult<DictionaryImportOutcome> {
+    let handle = doc_handle(&state, doc_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let json = std::fs::read_to_string(&path)?;
+        let imported = dictionary::parse_import(&json)?;
+        let mut doc = handle.write().map_err(poisoned)?;
+        doc.check_dictionary_revision(expected_dictionary_revision)?;
+        let applied = dictionary::apply_merge(&doc, &imported, match_by, &resolution)?;
+        doc.set_dictionary(applied.dictionary);
+        Ok(DictionaryImportOutcome {
+            matched_columns: applied.matched_columns,
+            new_entries: applied.new_entries,
+            updated_entries: applied.updated_entries,
+            fields_added: applied.fields_added,
+            conflicts_resolved: applied.conflicts_resolved,
+            unmatched: applied.unmatched,
+            view: dictionary::view(&doc),
+        })
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
 }
 
 // ----- batch recipes (F25) ------------------------------------------------------
