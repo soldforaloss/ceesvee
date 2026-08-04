@@ -42,6 +42,9 @@ import type {
   ExportOptions,
   ExportScope,
   ExternalChange,
+  JsonExportOptions,
+  JsonImportOptions,
+  JsonImportPreview,
   FileFingerprint,
   FileProfile,
   FilterGroup,
@@ -892,3 +895,39 @@ export const startExport = (
     writeManifest,
     expectedRevision,
   });
+
+// ----- JSON / JSON Lines interoperability (F33) ----------------------------
+
+/**
+ * Start a full-pass JSON import preview scan as a cancellable job (F33).
+ * Resolves with the job id; fetch the preview with {@link getJsonImportPreview}
+ * once the `job-finished` event arrives. Nothing is created.
+ */
+export const jsonImportPreview = (path: string, options?: JsonImportOptions) =>
+  invoke<number>("json_import_preview", { path, options });
+
+/** The preview of a finished JSON import scan, by its job id (F33). */
+export const getJsonImportPreview = (jobId: number) =>
+  invoke<JsonImportPreview | null>("get_json_import_preview", { jobId });
+
+/**
+ * Run a JSON / JSON Lines import as a cancellable "derive" job (F33): the NEW
+ * document registers under the returned docId when the job finishes, through
+ * the same pipeline as every other producer. Invalid input never leaves a
+ * partial document.
+ */
+export const jsonImportApply = (path: string, options?: JsonImportOptions) =>
+  invoke<IndexedOpenStart>("json_import_apply", { path, options });
+
+/**
+ * Start a scoped JSON / JSON Lines export as a cancellable "export" job (F33).
+ * Options validate, the scope resolves and duplicate output paths are rejected
+ * BEFORE the job spawns (the invoke rejects), then re-checked inside it.
+ */
+export const jsonExport = (
+  docId: number,
+  path: string,
+  options: JsonExportOptions,
+  scope: ExportScope,
+  expectedRevision: number,
+) => invoke<number>("json_export", { docId, path, options, scope, expectedRevision });

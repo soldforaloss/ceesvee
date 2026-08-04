@@ -30,6 +30,13 @@ mod index;
 pub mod job;
 mod joins;
 mod journal;
+mod json_export;
+/// Public like [`job`]: the F33 JSON / JSON Lines import engine (shape
+/// detection, streaming JSON Pointer resolution, the JSONL byte-offset
+/// record index, flatten/explode policies, preview scan and the
+/// document-producing import) consumed by the F33 command surface and the
+/// JSON export stage.
+pub mod json_import;
 mod outlier;
 mod parse;
 mod paste;
@@ -130,6 +137,7 @@ pub fn run() {
         .manage(crate::recipe::RecipeCache::default())
         .manage(crate::pii::PiiCache::default())
         .manage(crate::follow::FollowRegistry::default())
+        .manage(crate::json_import::JsonImportPreviewCache::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -216,6 +224,10 @@ pub fn run() {
             commands::export_scope_counts,
             commands::start_save,
             commands::start_export,
+            commands::json_import_preview,
+            commands::get_json_import_preview,
+            commands::json_import_apply,
+            commands::json_export,
             commands::get_settings,
             commands::set_settings,
             commands::validate_profile,

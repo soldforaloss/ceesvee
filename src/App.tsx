@@ -31,6 +31,8 @@ import { Grid } from "./components/Grid";
 import { GroupByDialog } from "./components/GroupByDialog";
 import { Close } from "./components/Icons";
 import { JoinDialog } from "./components/JoinDialog";
+import { JsonExportDialog } from "./components/JsonExportDialog";
+import { JsonImportDialog } from "./components/JsonImportDialog";
 import { ProfilesDialog } from "./components/ProfilesDialog";
 import { ProfileSuggestionBar } from "./components/ProfileSuggestionBar";
 import { OpenModeDialog } from "./components/OpenModeDialog";
@@ -71,6 +73,7 @@ export default function App() {
 
   const activeModal = useStore((s) => s.activeModal);
   const setModal = useStore((s) => s.setModal);
+  const jsonImportPath = useStore((s) => s.jsonImport?.path ?? null);
   const diagnosticsOpen = useStore((s) => s.diagnosticsOpen);
   const changesOpen = useStore((s) => s.changesOpen);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
@@ -316,6 +319,8 @@ export default function App() {
       {activeModal === "dialect" && <DialectDialog onClose={() => setModal(null)} />}
       {activeModal === "views" && <ViewsDialog onClose={() => setModal(null)} />}
       {activeModal === "pasteSpecial" && <PasteSpecialDialog onClose={() => setModal(null)} />}
+      {activeModal === "jsonExport" && <JsonExportDialog onClose={() => setModal(null)} />}
+      {jsonImportPath && <JsonImportDialog key={jsonImportPath} />}
       <CommandPalette />
       <CellEditorDialog />
       <ReopenDialog />

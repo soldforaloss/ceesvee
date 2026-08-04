@@ -19,6 +19,8 @@ import {
 } from "../lib/viewProjection";
 import { hydrateFilter, snapshotView, uniqueViewName, upsertView } from "../lib/views";
 import { currentOpenOptions, fingerprintKey } from "../lib/reopen";
+import { defaultImportOptions } from "../lib/jsonImport";
+import { suggestJsonFileName } from "../lib/jsonExport";
 import { isLegacyEncoding } from "../lib/save";
 import type {
   AppSettings,
@@ -31,6 +33,9 @@ import type {
   ExportOptions,
   ExportScope,
   ExternalChange,
+  JsonExportOptions,
+  JsonImportOptions,
+  JsonImportPreview,
   FileProfile,
   FilterGroup,
   FindMatch,
@@ -116,11 +121,20 @@ export type ModalName =
   | "recovery"
   | "dialect"
   | "schema"
-  | "views";
+  | "views"
+  | "jsonExport";
 
 const FILE_FILTERS = [
   { name: "Delimited text", extensions: ["csv", "tsv", "tab", "txt", "psv", "dat"] },
+  { name: "JSON (F33)", extensions: ["json", "jsonl", "ndjson"] },
   { name: "Compressed (F17)", extensions: ["gz", "zip"] },
+  { name: "All files", extensions: ["*"] },
+];
+
+/** File filters for a JSON / JSON Lines export target (F33). */
+const JSON_FILE_FILTERS = [
+  { name: "JSON", extensions: ["json"] },
+  { name: "JSON Lines", extensions: ["jsonl", "ndjson"] },
   { name: "All files", extensions: ["*"] },
 ];
 
@@ -466,10 +480,29 @@ export interface DeriveState {
   jobId: number;
   /** The id the NEW document will register under. */
   docId: number;
-  kind: "append" | "join" | "groupBy" | "reshape";
+  kind: "append" | "join" | "groupBy" | "reshape" | "jsonImport";
   processed: number;
   total: number | null;
   message: string | null;
+}
+
+/**
+ * JSON / JSON Lines import flow state (F33). Non-null while the import dialog
+ * is open. The preview scan runs through the job registry (progress + cancel);
+ * the apply step reuses the shared `derive` slot (kind "jsonImport"), so the
+ * finished document lands via the same pipeline as every other producer.
+ */
+export interface JsonImportState {
+  path: string;
+  fileName: string;
+  /** The options the current `preview` was scanned under. */
+  options: JsonImportOptions;
+  /** In-flight preview scan job id; null when idle. */
+  scanJobId: number | null;
+  scanProcessed: number;
+  scanTotal: number | null;
+  preview: JsonImportPreview | null;
+  scanError: string | null;
 }
 
 /** Outlier-finder state (F30), for the ACTIVE document. */
@@ -682,6 +715,8 @@ interface Store {
   derive: DeriveState | null;
   /** Error from the last derive job, for the dialog that started it. */
   deriveError: string | null;
+  /** JSON / JSON Lines import flow (F33); non-null while its dialog is open. */
+  jsonImport: JsonImportState | null;
   /** Running (or just finished) batch-recipe job (F25), if any. */
   batch: BatchState | null;
   /** PII scan state (F28). */
@@ -791,6 +826,8 @@ interface Store {
 
   // documents
   openDialog: () => Promise<void>;
+  /** File picker filtered to JSON / JSON Lines, routed through the open flow. */
+  openJsonDialog: () => Promise<void>;
   openPath: (path: string) => Promise<void>;
   newDoc: () => Promise<void>;
   closeTab: (id: number) => Promise<void>;
@@ -945,6 +982,20 @@ interface Store {
     split: SplitOptions,
     writeManifest: boolean,
   ) => Promise<void>;
+
+  // JSON / JSON Lines interoperability (F33)
+  /** Open the JSON import dialog for a file and run the first preview scan. */
+  openJsonImport: (path: string) => Promise<void>;
+  /** (Re)run the preview scan under the given options (supersedes any in-flight). */
+  runJsonScan: (options: JsonImportOptions) => Promise<void>;
+  /** Cancel the running preview scan, if any. */
+  cancelJsonScan: () => Promise<void>;
+  /** Import the file into a NEW document (reuses the shared derive slot). */
+  applyJsonImport: (options: JsonImportOptions) => Promise<void>;
+  /** Close the JSON import dialog, cancelling any in-flight scan. */
+  dismissJsonImport: () => void;
+  /** Prompt for a path and export the active document as JSON (F33). */
+  exportJson: (options: JsonExportOptions, scope: ExportScope) => Promise<void>;
 
   // data-cleaning transforms (F06)
   /**
@@ -1603,6 +1654,7 @@ export const useStore = create<Store>((set, get) => {
     schemaDialogColumn: null,
     derive: null,
     deriveError: null,
+    jsonImport: null,
     batch: null,
     pii: initialPii,
     followState: {},
@@ -2016,6 +2068,11 @@ export const useStore = create<Store>((set, get) => {
       if (typeof selected === "string") await get().openPath(selected);
     },
 
+    openJsonDialog: async () => {
+      const selected = await openFileDialog({ multiple: false, filters: JSON_FILE_FILTERS });
+      if (typeof selected === "string") await get().openPath(selected);
+    },
+
     openPath: async (path) => {
       const existing = get().tabs.find((t) => t.path === path);
       if (existing) {
@@ -2042,6 +2099,12 @@ export const useStore = create<Store>((set, get) => {
       }
       if (lower.endsWith(".gz")) {
         await get().startArchiveExtract(path, null, false);
+        return;
+      }
+      // F33: structured JSON / JSON Lines routes through the import preview
+      // dialog instead of the CSV open path.
+      if (lower.endsWith(".json") || lower.endsWith(".jsonl") || lower.endsWith(".ndjson")) {
+        await get().openJsonImport(path);
         return;
       }
       set({ busy: true, error: null });
@@ -3269,6 +3332,17 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
 
+      // F33: JSON import preview scan progress (guarded by our own job id so a
+      // stray "scan"-kind job from elsewhere never touches this state).
+      if (progress.kind === "scan") {
+        const st = get().jsonImport;
+        if (!st || st.scanJobId !== progress.jobId) return;
+        set({
+          jsonImport: { ...st, scanProcessed: progress.processed, scanTotal: progress.total },
+        });
+        return;
+      }
+
       if (progress.kind === "batch") {
         const batch = get().batch;
         if (batch?.jobId !== progress.jobId) return;
@@ -3540,6 +3614,9 @@ export const useStore = create<Store>((set, get) => {
           // The job registered the NEW document; add its tab and focus it.
           const meta = await api.getMeta(derive.docId);
           set((s) => ({ ...switchPatch(s, meta.id), tabs: [...s.tabs, meta] }));
+          // F33: a successful JSON import closes its dialog (the document is
+          // now open); a failure above leaves it open to show the error.
+          if (derive.kind === "jsonImport") set({ jsonImport: null });
         } catch (e) {
           set({ deriveError: String(e) });
         }
@@ -3945,6 +4022,138 @@ export const useStore = create<Store>((set, get) => {
       // Remember the options per document, to seed the next export dialog.
       set({ lastExportOptions: options });
       await runExportJob(meta.id, chosen, options, scope, split, writeManifest);
+    },
+
+    // ----- JSON / JSON Lines interoperability (F33) -------------------------------
+
+    openJsonImport: async (path) => {
+      const fileName = path.split(/[\\/]/).pop() ?? path;
+      set({
+        jsonImport: {
+          path,
+          fileName,
+          options: defaultImportOptions(),
+          scanJobId: null,
+          scanProcessed: 0,
+          scanTotal: null,
+          preview: null,
+          scanError: null,
+        },
+      });
+      await get().runJsonScan(defaultImportOptions());
+    },
+
+    runJsonScan: async (options) => {
+      const st = get().jsonImport;
+      if (!st) return;
+      // Supersede any in-flight scan: cancel it and reset progress.
+      if (st.scanJobId != null) void api.cancelJob(st.scanJobId).catch(() => undefined);
+      set((s) =>
+        s.jsonImport
+          ? {
+              jsonImport: {
+                ...s.jsonImport,
+                scanJobId: null,
+                scanProcessed: 0,
+                scanTotal: null,
+                scanError: null,
+              },
+            }
+          : {},
+      );
+      try {
+        const jobId = await api.jsonImportPreview(st.path, options);
+        // The dialog may have closed while the invoke was in flight.
+        if (get().jsonImport?.path !== st.path) return;
+        set((s) => (s.jsonImport ? { jsonImport: { ...s.jsonImport, scanJobId: jobId } } : {}));
+        const finished = await awaitJob(jobId);
+        // A newer scan may have superseded this one.
+        if (get().jsonImport?.scanJobId !== jobId) return;
+        if (finished.status === "done") {
+          const preview = await api.getJsonImportPreview(jobId);
+          set((s) =>
+            s.jsonImport
+              ? {
+                  jsonImport: {
+                    ...s.jsonImport,
+                    scanJobId: null,
+                    preview,
+                    options,
+                    scanError: null,
+                  },
+                }
+              : {},
+          );
+        } else if (finished.status === "failed") {
+          set((s) =>
+            s.jsonImport
+              ? {
+                  jsonImport: {
+                    ...s.jsonImport,
+                    scanJobId: null,
+                    scanError: finished.error ?? "scan failed",
+                  },
+                }
+              : {},
+          );
+        } else {
+          // Cancelled: just clear the in-flight marker.
+          set((s) => (s.jsonImport ? { jsonImport: { ...s.jsonImport, scanJobId: null } } : {}));
+        }
+      } catch (e) {
+        if (get().jsonImport?.path !== st.path) return;
+        set((s) =>
+          s.jsonImport
+            ? { jsonImport: { ...s.jsonImport, scanJobId: null, scanError: String(e) } }
+            : {},
+        );
+      }
+    },
+
+    cancelJsonScan: async () => {
+      const jobId = get().jsonImport?.scanJobId;
+      if (jobId != null) await api.cancelJob(jobId).catch(() => undefined);
+    },
+
+    applyJsonImport: async (options) => {
+      const st = get().jsonImport;
+      // One derive slot at a time (shared with append/join/group/reshape).
+      if (!st || get().derive) return;
+      set({ deriveError: null });
+      try {
+        const started = await api.jsonImportApply(st.path, options);
+        get().trackDerive(started.jobId, started.docId, "jsonImport");
+        pushRecent(st.path);
+      } catch (e) {
+        set({ deriveError: String(e) });
+      }
+    },
+
+    dismissJsonImport: () => {
+      const jobId = get().jsonImport?.scanJobId;
+      if (jobId != null) void api.cancelJob(jobId).catch(() => undefined);
+      set({ jsonImport: null });
+    },
+
+    exportJson: async (options, scope) => {
+      const meta = activeMeta();
+      if (!meta) return;
+      const chosen = await saveFileDialog({
+        defaultPath: suggestJsonFileName(meta.fileName, options.format),
+        filters: JSON_FILE_FILTERS,
+      });
+      if (!chosen) return;
+      try {
+        // plan() rejects invalid options / duplicate output paths here, BEFORE
+        // any job spawns — the invoke itself throws and we surface it.
+        const jobId = await api.jsonExport(meta.id, chosen, options, scope, meta.revision);
+        const finished = await awaitJob(jobId);
+        if (finished.status === "failed") {
+          set({ error: finished.error ?? "JSON export failed" });
+        }
+      } catch (e) {
+        set({ error: String(e) });
+      }
     },
 
     // ----- compare (F09) -----------------------------------------------------------

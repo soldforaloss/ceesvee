@@ -433,6 +433,60 @@ impl From<&ExportOptions> for ExportOptionsEcho {
     }
 }
 
+/// The three JSON output layouts (F33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JsonExportFormat {
+    /// One JSON array of objects (keys are column names / rebuilt paths).
+    Objects,
+    /// One JSON array of positional arrays (optional header array first).
+    Arrays,
+    /// One compact object per LF-terminated line (JSON Lines / NDJSON).
+    JsonLines,
+}
+
+/// Options controlling a JSON export (F33). The defaults mirror the JSON
+/// import defaults (`nullToken` "null", `missingToken` ""), so an
+/// import → export round-trip needs no configuration. Token, typing and
+/// nested-rebuild rules are documented on the `json_export` module; output
+/// is always UTF-8 with LF separators and no BOM.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct JsonExportOptions {
+    pub format: JsonExportFormat,
+    /// Cells with EXACTLY this text export as JSON `null`. An explicit
+    /// `null` on the wire disables the mapping.
+    pub null_token: Option<String>,
+    /// Cells with EXACTLY this text export as a MISSING property (omitted
+    /// in objects / JSON Lines; collapses to `null` in the positional
+    /// arrays format). An explicit `null` on the wire disables the mapping.
+    pub missing_token: Option<String>,
+    /// Rebuild nested objects from flattened path column names (objects and
+    /// JSON Lines formats only; rejected for arrays).
+    pub rebuild_nested: bool,
+    /// Emit typed JSON values (numbers, booleans, re-inflated JSON, schema
+    /// null tokens) for columns with a declared schema.
+    pub typed: bool,
+    /// Arrays format only: write the header names as the first array.
+    pub include_headers: bool,
+    /// Backup policy for the previous destination file.
+    pub backup: BackupPolicy,
+}
+
+impl Default for JsonExportOptions {
+    fn default() -> JsonExportOptions {
+        JsonExportOptions {
+            format: JsonExportFormat::Objects,
+            null_token: Some("null".to_string()),
+            missing_token: Some(String::new()),
+            rebuild_nested: false,
+            typed: true,
+            include_headers: true,
+            backup: BackupPolicy::default(),
+        }
+    }
+}
+
 /// One cell (or header) whose text cannot be represented in a target encoding.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

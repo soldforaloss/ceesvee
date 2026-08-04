@@ -57,6 +57,14 @@ function staticCommands(): AppCommand[] {
       run: () => void state().openDialog(),
     },
     {
+      id: "file.openJson",
+      title: "Open JSON…",
+      keywords: ["json", "jsonl", "ndjson", "import", "nested", "records"],
+      category: "File",
+      allowInEditable: true,
+      run: () => void state().openJsonDialog(),
+    },
+    {
       id: "file.save",
       title: "Save",
       keywords: ["write", "persist"],
@@ -83,6 +91,14 @@ function staticCommands(): AppCommand[] {
       defaultShortcut: "mod+e",
       unavailableReason: needsDoc,
       run: () => openModal("export"),
+    },
+    {
+      id: "file.exportJson",
+      title: "Export as JSON…",
+      keywords: ["json", "jsonl", "ndjson", "objects", "arrays", "nested", "rebuild"],
+      category: "Export",
+      unavailableReason: needsDoc,
+      run: () => openModal("jsonExport"),
     },
     {
       id: "file.closeTab",

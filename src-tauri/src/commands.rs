@@ -25,8 +25,9 @@ use crate::document::{ChangeSummary, Document};
 use crate::dto::{
     BackupPolicy, CellRect, ColumnSummary, DocumentMeta, EncodingCompatibility,
     EncodingIncompatibility, ExportOptions, ExportScope, ExternalChange, FileFingerprint,
-    FilterGroup, FindMatch, FindOptions, IndexedOpenStart, OpenOptions, ReparsePreview,
-    ReplaceResult, RowsResponse, ScopeCounts, SelectionStats, SortKey, SplitOptions,
+    FilterGroup, FindMatch, FindOptions, IndexedOpenStart, JsonExportOptions, OpenOptions,
+    ReparsePreview, ReplaceResult, RowsResponse, ScopeCounts, SelectionStats, SortKey,
+    SplitOptions,
 };
 use crate::error::{AppError, AppResult};
 use crate::follow::{self, FollowRegistry};
@@ -34,6 +35,7 @@ use crate::groupby::{self, GroupByPreview, GroupBySpec};
 use crate::job::JobRegistry;
 use crate::joins::{self, JoinPreview, JoinSpec};
 use crate::journal::{self, RecoverableSession};
+use crate::json_import::{JsonImportOptions, JsonImportPreview, JsonImportPreviewCache};
 use crate::outlier::{
     self, CachedOutlier, OutlierAction, OutlierActionPreview, OutlierCache, OutlierSpec,
 };
@@ -57,7 +59,7 @@ use crate::settings::{self, AppSettings, FileProfile, ProfileValidation};
 use crate::state::{AppState, PendingFiles, SharedDocument};
 use crate::transform::{self, TransformErrorPolicy, TransformPreview, TransformSpec};
 use crate::{
-    encoding, export, export_scope, filter as filter_mod, find as find_mod, index,
+    encoding, export, export_scope, filter as filter_mod, find as find_mod, index, json_export,
     save as save_mod, util,
 };
 
@@ -3566,6 +3568,138 @@ pub async fn start_export(
                 &scope,
                 &split,
                 write_manifest,
+                ctx,
+            )?;
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+// ----- JSON / JSON Lines interoperability (F33) --------------------------------
+
+/// Start a full-pass JSON import preview scan as a cancellable job (kind
+/// "scan"): detected shape + pointer candidates, the deterministic key
+/// union, per-column present/null/missing counts, nested-object and
+/// array-field reports, projected dimensions and bounded sample rows.
+/// Nothing is created; fetch the result with `get_json_import_preview`
+/// after the `job-finished` event.
+#[tauri::command]
+pub async fn json_import_preview(
+    path: String,
+    options: Option<JsonImportOptions>,
+    app: tauri::AppHandle,
+    jobs: State<'_, JobRegistry>,
+    json_previews: State<'_, JsonImportPreviewCache>,
+) -> AppResult<u64> {
+    let options = options.unwrap_or_default();
+    let sink = json_previews.share();
+    let ctx = jobs.begin_for_app(&app, "scan", None);
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let scan = crate::json_import::scan(Path::new(&path), &options, Some(ctx))?;
+            if let Ok(mut map) = sink.lock() {
+                map.insert(job_id, scan.preview);
+            }
+            Ok(())
+        })
+        .await;
+    });
+    Ok(job_id)
+}
+
+/// The preview of a finished JSON import scan, by its job id.
+#[tauri::command]
+pub fn get_json_import_preview(
+    job_id: u64,
+    json_previews: State<'_, JsonImportPreviewCache>,
+) -> Option<JsonImportPreview> {
+    json_previews.get(job_id)
+}
+
+/// Run a JSON / JSON Lines import as a cancellable job (kind "derive"): the
+/// engine re-validates the WHOLE input first, then the NEW document
+/// registers under the returned doc id when the job finishes — through the
+/// same derived-document pipeline as every other producer (dirty tracking,
+/// tabs, spill-to-indexed for large results). Invalid input fails the job
+/// and leaves no document and no stray cache files behind.
+#[tauri::command]
+pub async fn json_import_apply(
+    path: String,
+    options: Option<JsonImportOptions>,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<IndexedOpenStart> {
+    let options = options.unwrap_or_default();
+    let doc_id = lock(&state)?.alloc_id();
+    let cache_root = index_cache_root(&app)?;
+
+    let ctx = jobs.begin_for_app(&app, "derive", Some(doc_id));
+    let job_id = ctx.id;
+    let app_for_job = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            use tauri::Manager;
+            let doc = crate::json_import::import(
+                Path::new(&path),
+                &options,
+                &cache_root,
+                doc_id,
+                Some(ctx),
+            )?;
+            let registry = app_for_job.state::<Mutex<AppState>>();
+            registry
+                .lock()
+                .map_err(|_| AppError::Other("internal state lock error".into()))?
+                .insert(doc);
+            Ok(())
+        })
+        .await;
+    });
+    Ok(IndexedOpenStart { job_id, doc_id })
+}
+
+/// Start a scoped JSON / JSON Lines export as a cancellable job (kind
+/// "export"): objects, arrays or JSON Lines through the atomic-save
+/// pipeline. Options validate, the scope resolves and duplicate output
+/// paths are rejected BEFORE the job spawns (and re-checked inside it,
+/// revision-guarded); failure or cancellation removes the staging file and
+/// never touches an existing destination.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn json_export(
+    doc_id: u64,
+    path: String,
+    options: JsonExportOptions,
+    scope: ExportScope,
+    expected_revision: u64,
+    app: tauri::AppHandle,
+    state: Db<'_>,
+    jobs: State<'_, JobRegistry>,
+) -> AppResult<u64> {
+    let handle = doc_handle(&state, doc_id)?;
+    {
+        // Fail fast: stale snapshots, invalid option combinations and
+        // duplicate output paths reject the invoke, not a background job.
+        let doc = handle.read().map_err(poisoned)?;
+        doc.check_revision(expected_revision)?;
+        json_export::plan(&doc, &options, &scope)?;
+    }
+
+    let ctx = jobs.begin_for_app(&app, "export", Some(doc_id));
+    let job_id = ctx.id;
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::job::run_blocking(ctx, move |ctx| {
+            let doc = handle.read().map_err(poisoned)?;
+            json_export::run(
+                &doc,
+                Path::new(&path),
+                &options,
+                &scope,
+                expected_revision,
                 ctx,
             )?;
             Ok(())
