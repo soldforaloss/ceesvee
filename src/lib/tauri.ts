@@ -139,6 +139,9 @@ import type {
   DbExportSpec,
   DbExportPreview,
   DbExportResult,
+  FacetConfig,
+  FacetResultSet,
+  FacetConversion,
 } from "../types";
 
 export const openFile = (path: string, options?: OpenOptions) =>
@@ -946,6 +949,50 @@ export const setFilter = (docId: number, spec: FilterGroup) =>
   invoke<DocumentMeta>("set_filter", { docId, spec });
 
 export const clearFilter = (docId: number) => invoke<DocumentMeta>("clear_filter", { docId });
+
+// ----- multi-facet exploration (F39) ----------------------------------------
+
+/**
+ * Compute every facet's cross-filtered bucket counts against the current
+ * document (F39). Read-only; safe to recompute on every selection change.
+ * `dedup`/`dedupScope` resolve a duplicate-status facet (F05); omit them when
+ * no duplicate facet is present (or none has been configured yet).
+ */
+export const computeFacets = (
+  docId: number,
+  config: FacetConfig,
+  expectedRevision: number,
+  dedup?: DedupSpec | null,
+  dedupScope?: ExportScope | null,
+) =>
+  invoke<FacetResultSet>("compute_facets", {
+    docId,
+    config,
+    expectedRevision,
+    dedup: dedup ?? null,
+    dedupScope: dedupScope ?? null,
+  });
+
+/** Drive the grid row view from the current facet selection (F39). A view
+ * operation — never dirties the document. Returns the refreshed meta. */
+export const applyFacets = (
+  docId: number,
+  config: FacetConfig,
+  expectedRevision: number,
+  dedup?: DedupSpec | null,
+  dedupScope?: ExportScope | null,
+) =>
+  invoke<DocumentMeta>("apply_facets", {
+    docId,
+    config,
+    expectedRevision,
+    dedup: dedup ?? null,
+    dedupScope: dedupScope ?? null,
+  });
+
+/** Convert the active facets to the filter-builder tree (F39, one-way/lossy). */
+export const convertFacetsToFilter = (docId: number, config: FacetConfig) =>
+  invoke<FacetConversion>("convert_facets_to_filter", { docId, config });
 
 /** F12: set (or clear, with empty keys) the non-destructive view sort. */
 export const setViewSort = (docId: number, keys: SortKey[]) =>
