@@ -748,6 +748,15 @@ function staticCommands(): AppCommand[] {
       run: () => state().setExplorerOpen(!state().explorer.open),
     },
     {
+      id: "view.recordForm",
+      title: "Toggle record form",
+      keywords: ["record", "form", "single", "row", "wide", "field", "edit one"],
+      category: "View",
+      defaultShortcut: "mod+shift+r",
+      unavailableReason: needsDoc,
+      run: () => state().setRecordFormOpen(!state().recordFormOpen),
+    },
+    {
       id: "view.theme",
       title: "Toggle theme",
       keywords: ["dark", "light", "appearance"],

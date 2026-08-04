@@ -74,6 +74,23 @@ and faithful on large, real-world delimited files.**
   a retrievable issue.
 - **Multiline / raw cell editor** (`F2`) with an Escaped view that reveals
   newlines, tabs, and invisible characters — safe to inspect and copy.
+- **Record form** (`Ctrl+Shift+R`) — edit one record at a time in a dockable
+  form built for very wide / record-oriented tables: schema-aware field labels
+  (data-dictionary display names and descriptions when documented), type and
+  semantic badges, autosizing multiline editors, a raw-vs-formatted toggle, a
+  null-token-vs-blank control where the schema declares tokens, and per-field
+  validation that surfaces strict blocks, advisory warnings, and previously
+  recorded advisory issues distinctly. A changed-field indicator, copy, and
+  jump-to-grid-column sit on each field; navigate previous / next / go-to
+  across the _visible_ records (filters and view sorts respected). A draft
+  commits every changed field as one undo step; strict-invalid drafts cannot
+  commit; unsaved drafts prompt on navigation (or auto-save, per preference).
+  Fields can be grouped, hidden, and shown compact or comfortable; indexed
+  documents open the form read-only. The header carries a row bookmark strip
+  (star, flag, tags, and a row note) and every field shows a cell-note
+  indicator you can click to add or edit its note — the same annotations as the
+  grid and the annotations panel, so a note taken in the form appears
+  everywhere.
 - Insert / delete / reorder rows; insert / delete / rename / reorder columns.
 - Multi-cell selection and **Excel-compatible copy/paste** (TSV on the clipboard).
 - **Copy As** JSON / Markdown / SQL / CSV variants, and **Paste Special** with

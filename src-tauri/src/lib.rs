@@ -54,6 +54,10 @@ mod pii;
 mod profile;
 mod project;
 mod recipe;
+/// Record-form view (F41): the bounded per-row join (schema + dictionary +
+/// semantic), the batched draft pre-check, and the per-row advisory-issue
+/// lookup behind the single-record editing form.
+mod record;
 mod reopen;
 mod repair;
 mod reshape;
@@ -201,6 +205,10 @@ pub fn run() {
             commands::column_summaries,
             commands::set_cell,
             commands::set_cells,
+            commands::fetch_record,
+            commands::validate_record_draft,
+            commands::get_record_issues,
+            commands::save_record_draft,
             commands::paste,
             commands::copy_as,
             commands::preview_paste_special,

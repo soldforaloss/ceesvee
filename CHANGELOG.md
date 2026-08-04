@@ -27,6 +27,29 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the active project's workspace file or, with no project open, a versioned
   `<file>.ceesvee-notes.json` sidecar written atomically — never inside the
   CSV, and never in an ordinary data export.
+- **Record form view** (palette → "Toggle record form", or `Ctrl+Shift+R`):
+  a dockable single-record editor for very wide / record-oriented tables.
+  Each field shows its schema-aware label (the data-dictionary display name
+  and description when documented), type and semantic badges, an autosizing
+  editor for long or multiline text, a raw-vs-formatted toggle (raw and
+  formatted never disagree about the stored value), and — only where the
+  schema declares null tokens — a null-token-vs-blank control. Per-field
+  validation surfaces three things distinctly: a strict violation that blocks
+  the save, an advisory violation that only warns, and any advisory issue
+  already recorded for the cell (closing a deliberate gap in the typed-edit
+  path). A changed-field indicator, copy-value, and jump-to-grid-column sit on
+  every field. Navigate previous / next / go-to across the _visible_ records,
+  so the form respects the active filter and view sort and always edits the
+  correct absolute row; a draft commits every changed field as one undo step,
+  a strict-invalid draft cannot commit, and moving away from an unsaved draft
+  prompts to save or discard — or auto-saves, per a persisted preference.
+  Fields can be arranged into named groups, hidden, and shown compact or
+  comfortable (persisted per document); indexed documents open the form
+  read-only. The form reuses the F40 annotations: a row bookmark strip in the
+  header (star, flag, tags, and a row note) and a per-field cell-note indicator
+  that opens the same note editor — annotations taken in the form resolve to
+  the same rows as the grid gutter and the annotations panel, and stay
+  available on a read-only form since they are pure metadata.
 - **JSON & JSON Lines interoperability** (palette → "Open JSON…" and
   "Export as JSON…"): open structured JSON without pre-converting to CSV —
   an array of objects, an array of arrays, JSON Lines / NDJSON, or an
