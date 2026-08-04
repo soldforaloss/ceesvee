@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
 
-import type { DictionaryField, DictionaryFieldKey, FieldConflict } from "../types";
+import type {
+  DictionaryField,
+  DictionaryFieldKey,
+  FieldConflict,
+  MergeMatchBy,
+  MergePlan,
+} from "../types";
 import {
   allConflictsResolved,
+  applyMatchBy,
   buildPerFieldResolution,
   bulkChoices,
   completeness,
@@ -151,5 +158,38 @@ describe("conflict reduction", () => {
       expect(res.resolutions).toHaveLength(1);
       expect(res.resolutions[0].columnId).toBe("c0");
     }
+  });
+});
+
+describe("applyMatchBy", () => {
+  const planWith = (matchBy: MergeMatchBy): MergePlan => ({
+    dictionaryRevision: 7,
+    matchBy,
+    matchedColumns: 0,
+    newEntries: [],
+    cleanAdditions: 0,
+    conflicts: [],
+    unmatched: [],
+  });
+
+  it("returns the match mode the plan was previewed under, for every mode", () => {
+    // Regression guard for the import-apply threading bug: apply must run under
+    // the plan's recorded mode. Preview is async, so the live `Match by`
+    // dropdown (or a stale preview) can differ from what produced the displayed
+    // plan; applying under the live selection would merge a different set of
+    // columns than the user reviewed.
+    for (const mode of ["auto", "columnId", "columnName"] as const) {
+      expect(applyMatchBy(planWith(mode))).toBe(mode);
+    }
+  });
+
+  it("reads only the plan, never a separate live selection", () => {
+    // The plan the user reviewed said "columnId"; even if the dialog's dropdown
+    // has since moved to "auto", the apply must still use the plan's mode. The
+    // helper takes only the plan, so this is enforced structurally.
+    const previewedPlan = planWith("columnId");
+    const liveSelection: MergeMatchBy = "auto";
+    expect(applyMatchBy(previewedPlan)).toBe("columnId");
+    expect(applyMatchBy(previewedPlan)).not.toBe(liveSelection);
   });
 });

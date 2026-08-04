@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 
 import {
+  canApplyImport,
   describeShape,
   isIgnored,
   needsMultiArrayChoice,
+  previewReflectsOptions,
   toggleIgnorePath,
   validateImportOptions,
 } from "../lib/jsonImport";
@@ -80,7 +82,20 @@ export function JsonImportDialog() {
   const shownColumns = preview ? preview.columns.slice(0, MAX_PREVIEW_COLUMNS) : [];
   const hiddenColumns = (preview?.columns.length ?? 0) - shownColumns.length;
 
-  const canImport = !importing && !scanning && errors.length === 0 && hasColumns;
+  // Only enable Import when the shown preview reflects the edited options (a
+  // just-changed option is still within the debounce / rescan, so the preview
+  // is stale) and the last scan succeeded — otherwise the applied options would
+  // not match what the preview shows.
+  const previewIsCurrent = previewReflectsOptions(opts, st.options);
+  const canImport = canApplyImport({
+    importing,
+    scanning,
+    scanError: st.scanError,
+    errors,
+    hasColumns,
+    editedOptions: opts,
+    scannedOptions: st.options,
+  });
 
   return (
     <Modal
@@ -95,7 +110,14 @@ export function JsonImportDialog() {
           <button
             onClick={() => void applyJsonImport(opts)}
             disabled={!canImport}
-            title={errors[0] ?? (!hasColumns ? "Nothing to import yet" : undefined)}
+            title={
+              errors[0] ??
+              (!hasColumns
+                ? "Nothing to import yet"
+                : scanning || !previewIsCurrent
+                  ? "Re-scanning with the changed options…"
+                  : undefined)
+            }
             className="rounded bg-violet-600 px-3 py-1.5 text-sm text-white hover:bg-violet-500 disabled:opacity-40"
           >
             {importing ? "Importing…" : "Import into a new document"}

@@ -17,6 +17,7 @@ import type {
   FieldResolution,
   FieldRole,
   MergeMatchBy,
+  MergePlan,
   MergeResolution,
   Sensitivity,
 } from "../types";
@@ -91,6 +92,21 @@ export const MATCH_BY_OPTIONS: { value: MergeMatchBy; label: string }[] = [
   { value: "columnId", label: "Column ID only" },
   { value: "columnName", label: "Column name only" },
 ];
+
+/**
+ * The match mode an apply MUST run under: the one recorded on the plan the user
+ * reviewed, NOT the live `Match by` dropdown. Preview is async, so between the
+ * plan being computed and the user pressing Apply the selector can change (or a
+ * stale in-flight preview can land) — applying under the live selection would
+ * merge under a different mode than the previewed conflicts/counts and could
+ * touch a different set of columns. Threading the plan's own `matchBy` keeps the
+ * apply consistent with the displayed plan (the same principle that already
+ * guards the apply with `plan.dictionaryRevision`). Taking only the plan makes
+ * it structurally impossible to read live UI state here.
+ */
+export function applyMatchBy(plan: Pick<MergePlan, "matchBy">): MergeMatchBy {
+  return plan.matchBy;
+}
 
 /**
  * Whether a sensitivity classification makes a column PII-relevant (mirrors the
