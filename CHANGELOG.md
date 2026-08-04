@@ -66,6 +66,27 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   16,384-column limits are checked before writing (an over-limit export is
   refused up front), and the workbook is committed through the atomic-save
   pipeline, so a failed or cancelled export never touches an existing file.
+- **Local database browser** (F35): open a SQLite database file (palette →
+  "Open database…", or by opening a `.db` / `.sqlite` / `.sqlite3` file) to
+  browse its tables and views — columns with declared type, NOT NULL, defaults
+  and primary keys, plus indexes, foreign keys, WITHOUT ROWID flags, row-count
+  estimates and bounded preview rows. Open any table or view as an indexed,
+  read-only document (paged straight out of the database — a large table is
+  never copied into memory) or import it into a fully editable document
+  (guarded by a memory check, with an explicit "import anyway"). A changed
+  database is detected (rows via `PRAGMA data_version`, schema via a hash) and
+  offers a reload. Export the active document back to a database (palette →
+  "Export to database…"): create a new table, append to a compatible existing
+  one, or replace one after explicit confirmation. Before writing, a preview
+  shows the resolved document-column → SQL-type mapping (from the F31 declared
+  schema, TEXT by default; per-column name/type/primary-key overrides) and a
+  bounded scan of the cells that would fail to convert; the write runs in one
+  transaction that rolls back completely on any failure, with an explicit
+  primary-key conflict policy (abort / skip / replace). Every database read
+  goes through a read-only, authorizer-guarded connection restricted to the
+  files the user explicitly opened. _SQLite only this cycle — DuckDB support is
+  deliberately out of scope (its bundled C++ library cannot be built on the
+  low-memory MinGW development machine)._
 - **Row bookmarks, tags & notes** (F40): mark and annotate records without
   touching the source data. Star or flag a row, apply multiple named tags
   (a per-document tag namespace with usage counts), and attach a row note or

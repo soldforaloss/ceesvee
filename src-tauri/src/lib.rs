@@ -19,6 +19,14 @@ pub mod columnar_export;
 mod commands;
 mod compare;
 mod crossval;
+/// Local database browser (F35): SQLite schema browsing, indexed read-only
+/// table opens, bounded editable imports and external-change detection.
+/// SQLite ONLY this cycle — DuckDB is out of scope (see the module docs).
+mod db_browser;
+/// Database export (F35 write side): mapping + conversion previews and the
+/// single-transaction create/append/replace write path with explicit
+/// primary-key conflict policies. The ONE place CEESVEE writes to a database.
+mod db_export;
 mod dedup;
 mod delimiter;
 mod derived;
@@ -89,6 +97,12 @@ mod reshape;
 /// key→row resolver) consumed by F40 annotations, F46 patches and F47
 /// three-way merge.
 pub mod row_identity;
+/// Public like [`job`]: the SafeQueryEngine core (F35/F36) — approved-source
+/// registry, authorizer-guarded read-only SQLite connections, result limits,
+/// progress-handler cancellation and the document virtual table with
+/// revision snapshot semantics — consumed by the F35 database browser now
+/// and the F36 query surface next.
+pub mod safe_query;
 /// Reproducible sampling & partitioning (F48): seeded PRNG, the eight sampling
 /// methods, weighted/stratified/group-preserving partitioning, previews, and
 /// manifested execution over the shared [`tabular`] contracts.
@@ -186,6 +200,9 @@ pub fn run() {
         .manage(crate::highlight::HighlightStore::default())
         .manage(crate::excel::ExcelInspectCache::default())
         .manage(crate::excel::ExcelPreviewCache::default())
+        .manage(crate::safe_query::ApprovedSources::default())
+        .manage(crate::db_browser::DbBrowserCache::default())
+        .manage(crate::db_export::DbExportReports::default())
         .setup(|app| {
             // Delete index caches orphaned by an abnormal termination. Live
             // instances hold their cache's lock file, so they are skipped.
@@ -396,6 +413,17 @@ pub fn run() {
             commands::get_excel_import_preview,
             commands::excel_import_apply,
             commands::excel_export,
+            db_browser::db_open,
+            db_browser::db_close,
+            db_browser::db_schema,
+            db_browser::db_preview,
+            db_browser::db_refresh_probe,
+            db_browser::start_db_open_table,
+            db_browser::start_db_import_table,
+            db_browser::db_doc_refresh_probe,
+            db_export::db_export_preview,
+            db_export::start_db_export,
+            db_export::db_export_report,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
