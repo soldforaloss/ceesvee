@@ -29,11 +29,12 @@ import {
   buildSources,
   buildTabsSection,
   buildViewsSection,
-  deriveProjectDirty,
   gatingWarnings,
+  nextProjectOpenStep,
   orderTabsForPlan,
   panelsFromLayout,
   pathKey,
+  projectDirty,
   projectSnapshot,
   type PanelLayout,
   type ProjectSnapshot,
@@ -99,6 +100,7 @@ import type {
   ProjectMeta,
   ProjectOpenPreview,
   ProjectOpenPlan,
+  ProjectOpenPending,
   FileFingerprint,
   DictionaryField,
   DictionaryFormat,
@@ -1049,6 +1051,8 @@ interface Store {
   projectOpen: ProjectOpenPreview | null;
   /** Per-source choices in the open dialog, by source id. */
   projectOpenChoices: Record<string, SourceChoice>;
+  /** An open being driven source-by-source; non-null while sources are opening. */
+  projectOpenPending: ProjectOpenPending | null;
   /** Sources whose saved views were gated on the last open (warn, never break). */
   projectWarnings: GatingWarning[];
   /** Whether the unsaved-project close confirmation is showing. */
@@ -1069,6 +1073,12 @@ interface Store {
   cancelProjectOpen: () => void;
   /** Apply the open with the current per-source choices. */
   applyProjectOpen: () => Promise<void>;
+  /**
+   * Drive the queued project open forward: open the next source, or finalize
+   * once none are deferred. Idempotent and re-entrancy-safe — the deferred-open
+   * completion/cancellation paths call it whenever a source settles (@internal).
+   */
+  advanceProjectOpen: () => void;
   /** Open every present source and leave missing/moved ones out. */
   projectOpenAvailableOnly: () => Promise<void>;
   /** Capture live sections and save the project (prompting for a path if new). */
@@ -1599,7 +1609,11 @@ export const useStore = create<Store>((set, get) => {
     const finished = finishedEarly.get(jobId);
     if (finished) {
       finishedEarly.delete(jobId);
-      void get().handleJobFinished(finished);
+      // Resume a queued project open once the (possibly tab-adding) handler has
+      // run — mirrors the live job-finished dispatch in App.tsx.
+      void get()
+        .handleJobFinished(finished)
+        .finally(() => get().advanceProjectOpen());
     }
   };
 
@@ -1749,7 +1763,8 @@ export const useStore = create<Store>((set, get) => {
    */
   const guardDiscardProject = async (): Promise<boolean> => {
     const s = get();
-    if (!s.project || !deriveProjectDirty(s.projectBaseline, currentProjectSnapshot())) return true;
+    if (!s.project || !projectDirty(s.project.dirty, s.projectBaseline, currentProjectSnapshot()))
+      return true;
     return ask("Discard unsaved changes to the current project?", {
       title: "Discard project changes",
       kind: "warning",
@@ -1791,17 +1806,18 @@ export const useStore = create<Store>((set, get) => {
     await api.projectSetSection("views", views);
   };
 
+  /** Whether an open is currently paused on a user/job decision (F10/F17/F33). */
+  const openIsDeferred = (s: Store): boolean =>
+    s.openDecision != null || s.archivePick != null || s.jsonImport != null || s.indexing != null;
+
   /**
-   * Drive an open plan: open each referenced document through the ordinary
-   * open pipeline, restore tab order/panel layout, reapply EVERY opened
-   * source's saved view (not just the active tab's) when the gating allows,
-   * then end focused on the saved active tab. NEVER runs recipes, queries,
-   * joins, comparisons or exports.
+   * Finalize a fully-opened project: restore tab order/panel layout, reapply
+   * EVERY opened source's saved view (not just the active tab's) when the gating
+   * allows, end focused on the saved active tab, then capture the baseline. Runs
+   * only once the queue has drained so the baseline reflects every tab (never
+   * dirtying the just-opened project). NEVER runs recipes/queries/joins/exports.
    */
-  const applyProjectPlan = async (plan: ProjectOpenPlan) => {
-    for (const entry of plan.entries) {
-      await get().openPath(entry.path);
-    }
+  const finalizeProjectOpen = async (plan: ProjectOpenPlan) => {
     // Restore saved tab order (project docs first, extras appended).
     set((s) => {
       const order = orderTabsForPlan(s.tabs, plan.entries);
@@ -1823,11 +1839,10 @@ export const useStore = create<Store>((set, get) => {
     }));
 
     // Reapply each opened source's saved view against ITS OWN document. A
-    // source still pending a large-file decision or archive extraction has no
-    // tab yet — skip it rather than applying its view to whatever document is
-    // active. applyNamedView targets the active document, so switch to each
-    // source's tab first; the saved active tab is done LAST so the session ends
-    // focused on it.
+    // source left out or that failed to open has no tab — skip it rather than
+    // applying its view to whatever document is active. applyNamedView targets
+    // the active document, so switch to each source's tab first; the saved
+    // active tab is done LAST so the session ends focused on it.
     const findTab = (path: string) =>
       get().tabs.find((t) => t.path && pathKey(t.path) === pathKey(path));
     const reapplyOrder = [
@@ -1854,9 +1869,56 @@ export const useStore = create<Store>((set, get) => {
       project: plan.meta,
       projectBaseline: currentProjectSnapshot(),
       projectWarnings: gatingWarnings(plan.entries),
+      projectOpenPending: null,
+    });
+  };
+
+  // Only one queue pump runs at a time; the deferred-open completion paths
+  // re-invoke the pump when a source settles, and any re-entrant call while it
+  // is mid-flight (awaiting an openPath) must be ignored.
+  let pumpingProjectOpen = false;
+
+  /**
+   * Drive a queued project open one source at a time through the ordinary open
+   * pipeline. A source that routes through a deferred flow (large-file decision,
+   * archive extraction, JSON import) pauses the queue — opening the next source
+   * would overwrite the single pending decision — until it settles, at which
+   * point its completion/cancellation path calls `advanceProjectOpen` to resume.
+   * Finalizes once nothing is left and nothing is deferred.
+   */
+  const pumpProjectOpen = async () => {
+    if (pumpingProjectOpen) return;
+    pumpingProjectOpen = true;
+    try {
+      for (;;) {
+        const pending = get().projectOpenPending;
+        if (!pending) return;
+        const step = nextProjectOpenStep(pending.remaining, openIsDeferred(get()));
+        if (step.kind === "wait") return;
+        if (step.kind === "finalize") {
+          await finalizeProjectOpen(pending.plan);
+          return;
+        }
+        set({ projectOpenPending: { plan: pending.plan, remaining: step.remaining } });
+        await get().openPath(step.path);
+      }
+    } finally {
+      pumpingProjectOpen = false;
+    }
+  };
+
+  /**
+   * Begin driving an open plan. Closes the open dialog immediately and queues
+   * every referenced source; `pumpProjectOpen` opens them (finalizing the
+   * baseline/warnings only once all have settled).
+   */
+  const applyProjectPlan = async (plan: ProjectOpenPlan) => {
+    set({
       projectOpen: null,
       projectOpenChoices: {},
+      projectOpenPending: { plan, remaining: plan.entries.map((e) => e.path) },
     });
+    await pumpProjectOpen();
   };
 
   return {
@@ -1924,6 +1986,7 @@ export const useStore = create<Store>((set, get) => {
     projectBaseline: null,
     projectOpen: null,
     projectOpenChoices: {},
+    projectOpenPending: null,
     projectWarnings: [],
     projectClosePromptOpen: false,
     exportPreferredScope: null,
@@ -2420,6 +2483,10 @@ export const useStore = create<Store>((set, get) => {
           .catch(() => undefined);
       } catch (e) {
         set({ error: String(e), busy: false });
+      } finally {
+        // The in-memory tab is now open (or failed): resume a queued project
+        // open paused on this large-file decision.
+        void pumpProjectOpen();
       }
     },
 
@@ -2459,6 +2526,10 @@ export const useStore = create<Store>((set, get) => {
         consumeEarlyFinish(started.jobId);
       } catch (e) {
         set({ error: String(e) });
+      } finally {
+        // On success the indexing job now owns the open (its completion resumes
+        // the queue); if starting it threw, resume here so the queue isn't stuck.
+        void pumpProjectOpen();
       }
     },
 
@@ -2466,6 +2537,8 @@ export const useStore = create<Store>((set, get) => {
       const token = get().openDecision?.archiveToken;
       if (token != null) void api.discardArchive(token).catch(() => undefined);
       set({ openDecision: null });
+      // The paused source was skipped; move a queued project open along.
+      void pumpProjectOpen();
     },
 
     convertActiveToEditable: async (force) => {
@@ -3286,9 +3359,16 @@ export const useStore = create<Store>((set, get) => {
       if (!pick) return;
       set({ archivePick: null });
       await get().startArchiveExtract(pick.path, entry, false);
+      // On success the extraction job now owns the open; if it failed to start,
+      // resume so a queued project open isn't stuck on the dismissed picker.
+      void pumpProjectOpen();
     },
 
-    dismissArchivePick: () => set({ archivePick: null }),
+    dismissArchivePick: () => {
+      set({ archivePick: null });
+      // The paused source was skipped; move a queued project open along.
+      void pumpProjectOpen();
+    },
 
     confirmArchiveLarge: async () => {
       const confirm = get().archiveLargeConfirm;
@@ -4352,7 +4432,7 @@ export const useStore = create<Store>((set, get) => {
     isProjectDirty: () => {
       const s = get();
       if (!s.project) return false;
-      return deriveProjectDirty(s.projectBaseline, currentProjectSnapshot());
+      return projectDirty(s.project.dirty, s.projectBaseline, currentProjectSnapshot());
     },
 
     projectNew: async (templatePath) => {
@@ -4416,6 +4496,8 @@ export const useStore = create<Store>((set, get) => {
         set({ error: String(e) });
       }
     },
+
+    advanceProjectOpen: () => void pumpProjectOpen(),
 
     projectOpenAvailableOnly: async () => {
       const preview = get().projectOpen;
@@ -4671,6 +4753,8 @@ export const useStore = create<Store>((set, get) => {
       const jobId = get().jsonImport?.scanJobId;
       if (jobId != null) void api.cancelJob(jobId).catch(() => undefined);
       set({ jsonImport: null });
+      // The paused source was skipped; move a queued project open along.
+      void pumpProjectOpen();
     },
 
     exportJson: async (options, scope) => {
@@ -4978,8 +5062,10 @@ export function useActiveMeta(): DocumentMeta | null {
 /**
  * Whether the open project has unsaved changes (F37). Derived reactively from
  * the open documents, active tab, panel layout and each document's active named
- * view versus the snapshot captured at the last save/open, so the dirty dot
- * updates without event bookkeeping.
+ * view versus the snapshot captured at the last save/open, OR'd with the
+ * backend's own dirty flag (a relink/removal applied while opening is already
+ * unsaved even though the snapshot matches its just-captured baseline), so the
+ * dirty dot updates without event bookkeeping.
  */
 export function useProjectDirty(): boolean {
   return useStore((s) => {
@@ -4989,7 +5075,8 @@ export function useProjectDirty(): boolean {
       activeViews[t.id] =
         t.id === s.activeId ? s.activeViewId : (s.uiStates[t.id]?.activeViewId ?? null);
     }
-    return deriveProjectDirty(
+    return projectDirty(
+      s.project.dirty,
       s.projectBaseline,
       projectSnapshot(
         s.tabs,
