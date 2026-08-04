@@ -4,6 +4,44 @@ All notable changes to CEESVEE are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Explicit schemas and typed columns** (palette → "Edit schema…", or a
+  column header's menu): declare an explicit logical type per column —
+  text, integer, decimal, float, boolean, date, datetime, UUID, or JSON —
+  as a layer ON TOP of the raw text that never rewrites a cell, so a ZIP
+  column declared text keeps its leading zeroes. Every cell resolves to
+  one of five distinguishable states — a missing field in a ragged short
+  row, a configured null token, an empty string, a valid typed value, or a
+  value invalid for the declared type — and empty strings stay distinct
+  from null tokens everywhere. Schemas key columns by stable IDs so
+  assignments survive renames and reorders; one click infers a schema from
+  the data (with leading-zero protection so numeric-looking codes stay
+  text), and whole schemas import and export as versioned JSON (unknown
+  columns are skipped and reported). The searchable per-column editor sets
+  the logical type, nullability, null tokens (including the empty string),
+  locale, time zone, custom input formats, a display format, and an
+  advisory/strict validation mode. Parsing is locale-aware (`de-DE` /
+  `fr-FR` decimals, Swiss grouping, …) and timezone-aware (IANA zones, DST
+  folds resolve earliest, gaps are invalid); a display format only changes
+  how a cell is shown — the editor, copy, and fill always see the raw
+  stored text, and changing a display format never marks the document
+  dirty. Column headers show a violet badge for the declared type, and
+  sorting (destructive and view), range filters, column profiles and
+  summaries, group-by aggregates, join key equivalence, and cross-column
+  validation all prefer the declared logical type over heuristics —
+  full-width integer, exact decimal, and chronological date comparisons,
+  locale-parsed decimals, and null tokens counted as null (still distinct
+  from empty strings). The editor surfaces each column's five-state counts
+  with invalid-value samples and runs a canonical conversion as a
+  previewed, cancellable, single-undo operation that leaves invalid and
+  null cells untouched. Cell edits are gated by the column's mode — strict
+  rejects an invalid edit before it reaches the model (in the editor and
+  the backend), advisory accepts it and records a bounded, retrievable
+  issue — while schema edits themselves never touch the undo stack.
+
 ## [0.4.0]
 
 ### Added

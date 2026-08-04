@@ -16,6 +16,10 @@ const RAGGED_SAMPLE_LIMIT: usize = 1000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RaggedSample {
+    /// 0-based RECORD index in the source file (the header, when present, is
+    /// record 0). Lets F31 cell classification map short records back to
+    /// grid rows exactly, without guessing from line numbers.
+    pub record: usize,
     /// 1-based line number in the source file where the record starts
     /// (embedded newlines inside quoted fields are accounted for).
     pub line: u64,
@@ -146,11 +150,15 @@ fn import_info(had_decode_errors: bool, shapes: &[(u64, usize)]) -> ImportInfo {
 
     let mut ragged_total = 0usize;
     let mut ragged_samples = Vec::new();
-    for &(line, fields) in shapes {
+    for (record, &(line, fields)) in shapes.iter().enumerate() {
         if fields != modal_field_count {
             ragged_total += 1;
             if ragged_samples.len() < RAGGED_SAMPLE_LIMIT {
-                ragged_samples.push(RaggedSample { line, fields });
+                ragged_samples.push(RaggedSample {
+                    record,
+                    line,
+                    fields,
+                });
             }
         }
     }
@@ -228,8 +236,16 @@ mod tests {
         assert_eq!(
             info.ragged_samples,
             vec![
-                RaggedSample { line: 2, fields: 2 },
-                RaggedSample { line: 4, fields: 1 },
+                RaggedSample {
+                    record: 1,
+                    line: 2,
+                    fields: 2
+                },
+                RaggedSample {
+                    record: 3,
+                    line: 4,
+                    fields: 1
+                },
             ]
         );
         assert!(!info.had_decode_errors);
@@ -245,7 +261,11 @@ mod tests {
         assert_eq!(info.ragged_total, 1);
         assert_eq!(
             info.ragged_samples,
-            vec![RaggedSample { line: 4, fields: 1 }]
+            vec![RaggedSample {
+                record: 2,
+                line: 4,
+                fields: 1
+            }]
         );
     }
 

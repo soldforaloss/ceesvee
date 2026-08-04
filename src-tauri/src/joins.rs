@@ -20,6 +20,7 @@ use crate::document::Document;
 use crate::error::{AppError, AppResult};
 use crate::index;
 use crate::job::JobCtx;
+use crate::schema::ColumnSchema;
 
 /// The classic six join types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,8 +82,43 @@ fn default_suffix() -> String {
 
 /// One normalized key component. Tag prefixes keep numeric/date canonical
 /// forms from colliding with ordinary text that happens to look the same.
-fn key_component(norm: &JoinNormalization, value: &str) -> String {
+/// When the key column has a DECLARED schema (F31), numeric and date
+/// equivalence parse under the declared type — so a locale decimal `1,5` on
+/// one side matches `1.5` on the other. A value the declared type REJECTS is
+/// keyed as plain text, never reinterpreted through the untyped heuristic: a
+/// schema-invalid cell must not silently join under a different convention
+/// (this matches how `filter.rs` and `schema::compare_cells` exclude Invalid
+/// rather than re-reading it). Blank/null-token values are handled by
+/// `row_key` before this is called, so a schema-typed value here is either
+/// Valid or Invalid — never null-ish.
+fn key_component(norm: &JoinNormalization, value: &str, schema: Option<&ColumnSchema>) -> String {
     let base = if norm.trim { value.trim() } else { value };
+    let text_key = || {
+        let text = if norm.case_insensitive {
+            base.to_lowercase()
+        } else {
+            base.to_string()
+        };
+        format!("t:{text}")
+    };
+    if let Some(s) = schema {
+        if norm.numeric_equal && s.logical_type.is_numeric() {
+            // The f64 canonical form matches the heuristic side's, so typed
+            // and untyped documents still join on VALID values; an invalid
+            // value keys as text (excluded from numeric equivalence) rather
+            // than being re-parsed under the generic heuristic.
+            return match crate::schema::numeric_cell(s, base) {
+                crate::schema::NumericCell::Value(n) => format!("n:{n}"),
+                _ => text_key(),
+            };
+        }
+        if norm.date_equal && s.logical_type.is_temporal() {
+            return match crate::schema::temporal_cell(s, base) {
+                Some(d) => format!("d:{d}"),
+                None => text_key(),
+            };
+        }
+    }
     if norm.numeric_equal {
         if let Some(n) = analyze::as_number(base.trim()) {
             return format!("n:{n}");
@@ -93,26 +129,45 @@ fn key_component(norm: &JoinNormalization, value: &str) -> String {
             return format!("d:{d}");
         }
     }
-    let text = if norm.case_insensitive {
-        base.to_lowercase()
-    } else {
-        base.to_string()
-    };
-    format!("t:{text}")
+    text_key()
 }
 
 /// The full key for one row; `None` = "never matches" (blank component
-/// under SQL NULL semantics).
-fn row_key(norm: &JoinNormalization, columns: &[usize], row: &[String]) -> Option<Vec<String>> {
+/// under SQL NULL semantics). A configured null token of a DECLARED schema
+/// counts as blank: it never matches unless `blank_equal` is set, in which
+/// case it matches other blanks. `schemas` runs parallel to `columns`.
+fn row_key(
+    norm: &JoinNormalization,
+    columns: &[usize],
+    row: &[String],
+    schemas: &[Option<ColumnSchema>],
+) -> Option<Vec<String>> {
     let mut key = Vec::with_capacity(columns.len());
-    for &c in columns {
+    for (i, &c) in columns.iter().enumerate() {
         let value = row.get(c).map(String::as_str).unwrap_or("");
-        if value.trim().is_empty() && !norm.blank_equal {
+        let schema = schemas.get(i).and_then(Option::as_ref);
+        let blank = value.trim().is_empty();
+        let nullish = blank || schema.is_some_and(|s| crate::schema::is_null_token(s, value));
+        if nullish && !norm.blank_equal {
             return None;
         }
-        key.push(key_component(norm, value));
+        if nullish && !blank {
+            // A null token under blank_equal keys like an EMPTY cell, so
+            // "NULL" and "" group together once blanks are declared equal.
+            key.push("t:".to_string());
+            continue;
+        }
+        key.push(key_component(norm, value, schema));
     }
     Some(key)
+}
+
+/// Cloned declared schemas (F31) for a key-column list.
+fn key_schemas(doc: &Document, columns: &[usize]) -> Vec<Option<ColumnSchema>> {
+    columns
+        .iter()
+        .map(|&c| doc.column_schema_at(c).cloned())
+        .collect()
 }
 
 fn validate(spec: &JoinSpec, left: &Document, right: &Document) -> AppResult<()> {
@@ -181,6 +236,7 @@ fn build_right_table(
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut by_key: HashMap<Vec<String>, Vec<u32>> = HashMap::new();
     let mut bytes = 0u64;
+    let right_schemas = key_schemas(right, &spec.right_keys);
     right.visit_rows(0..right.n_rows(), &mut |_, row| {
         if let Some(ctx) = ctx {
             ctx.check()?;
@@ -192,7 +248,7 @@ fn build_right_table(
             .map(|&c| row.get(c).cloned().unwrap_or_default())
             .collect();
         bytes += cells.iter().map(|c| c.len() as u64 + 32).sum::<u64>();
-        let key = row_key(&spec.normalization, &spec.right_keys, row);
+        let key = row_key(&spec.normalization, &spec.right_keys, row, &right_schemas);
         if let Some(key) = &key {
             // The hash table owns the normalized key strings plus map/vec
             // overhead — for key-only joins (empty rightColumns, e.g. an
@@ -245,9 +301,10 @@ pub fn preview(left: &Document, right: &Document, spec: &JoinSpec) -> AppResult<
     let mut left_unmatched = 0u64;
     let mut left_rows = 0usize;
     let mut matched_right: Vec<bool> = vec![false; table.rows.len()];
+    let left_schemas = key_schemas(left, &spec.left_keys);
     left.visit_rows(0..left.n_rows(), &mut |_, row| {
         left_rows += 1;
-        match row_key(&spec.normalization, &spec.left_keys, row) {
+        match row_key(&spec.normalization, &spec.left_keys, row, &left_schemas) {
             Some(key) => match table.by_key.get(&key) {
                 Some(matches) => {
                     matched_pairs += matches.len() as u64;
@@ -335,9 +392,10 @@ pub fn run(
     let mut matched_right: Vec<bool> = vec![false; table.rows.len()];
 
     ctx.set_message("joining");
+    let left_schemas = key_schemas(left, &spec.left_keys);
     left.visit_rows(0..left.n_rows(), &mut |_, row| {
         ctx.advance(1)?;
-        let key = row_key(&spec.normalization, &spec.left_keys, row);
+        let key = row_key(&spec.normalization, &spec.left_keys, row, &left_schemas);
         let matches = key.as_ref().and_then(|k| table.by_key.get(k));
         match matches {
             Some(matches) => {
@@ -604,5 +662,83 @@ mod tests {
         let mut s = spec(JoinType::Inner);
         s.right_columns = vec![9];
         assert!(preview(&left, &right, &s).is_err());
+    }
+
+    // ----- declared schemas (F31) -------------------------------------------
+
+    fn declare_with(
+        d: &mut Document,
+        col: usize,
+        lt: crate::schema::LogicalType,
+        f: impl FnOnce(&mut crate::schema::ColumnSchema),
+    ) {
+        let mut schema = crate::schema::ColumnSchema::new(
+            d.column_ids()[col].clone(),
+            d.headers()[col].clone(),
+            lt,
+        );
+        f(&mut schema);
+        d.set_column_schema(schema);
+    }
+
+    #[test]
+    fn declared_locale_decimal_joins_across_locales() {
+        // Left keys are de-DE decimals ("1,5" quoted), right keys plain.
+        // Declared types make both sides canonicalise to the same numeric
+        // key, so the join matches across notations.
+        let mut left = doc("amount,who\n\"1,5\",ann\n\"2,25\",bob\n");
+        let mut right = doc("amount,tag\n1.5,x\n9.9,y\n");
+        declare_with(&mut left, 0, crate::schema::LogicalType::Decimal, |s| {
+            s.locale = Some("de-DE".to_string());
+        });
+        declare_with(&mut right, 0, crate::schema::LogicalType::Decimal, |_| {});
+        let mut s = spec(JoinType::Inner);
+        s.normalization.numeric_equal = true;
+        let p = preview(&left, &right, &s).unwrap();
+        assert_eq!(p.matched_pairs, 1, "1,5 (de) matches 1.5 (en)");
+        let out = run_join(&left, &right, &s).unwrap();
+        assert_eq!(out.n_rows(), 1);
+        assert_eq!(out.rows()[0][0], "1,5", "source text is never rewritten");
+    }
+
+    #[test]
+    fn schema_invalid_key_is_not_reinterpreted_by_the_heuristic() {
+        // Left declares Decimal de-DE; "1.23" is INVALID there (a group must
+        // be exactly three digits). The right side is a plain "1.23". The
+        // invalid left value must NOT be re-parsed by the generic heuristic
+        // into n:1.23 and silently join the untyped 1.23 — it keys as text.
+        let mut left = doc("amount,who\n1.23,ann\n2,bob\n");
+        let right = doc("amount,tag\n1.23,x\n2,y\n");
+        declare_with(&mut left, 0, crate::schema::LogicalType::Decimal, |s| {
+            s.locale = Some("de-DE".to_string());
+        });
+        let mut s = spec(JoinType::Inner);
+        s.normalization.numeric_equal = true;
+        let p = preview(&left, &right, &s).unwrap();
+        // Only the valid "2" ↔ "2" pair matches; the schema-invalid "1.23"
+        // keys as text "t:1.23" and never meets the right's numeric key.
+        assert_eq!(
+            p.matched_pairs, 1,
+            "the de-DE-invalid 1.23 must not join through the untyped heuristic"
+        );
+    }
+
+    #[test]
+    fn declared_null_token_keys_use_null_semantics() {
+        let mut left = doc("id,name\nNULL,ann\n1,bob\n");
+        let mut right = doc("id,tag\nNULL,x\n,y\n1,z\n");
+        for d in [&mut left, &mut right] {
+            declare_with(d, 0, crate::schema::LogicalType::Integer, |s| {
+                s.null_tokens = vec!["NULL".to_string()];
+            });
+        }
+        // Without blank_equal, a NULL-token key NEVER matches (SQL NULL).
+        let p = preview(&left, &right, &spec(JoinType::Inner)).unwrap();
+        assert_eq!(p.matched_pairs, 1, "only the 1↔1 pair");
+        // With blank_equal, NULL keys match blanks AND other NULLs.
+        let mut s = spec(JoinType::Inner);
+        s.normalization.blank_equal = true;
+        let p = preview(&left, &right, &s).unwrap();
+        assert_eq!(p.matched_pairs, 3, "NULL↔NULL, NULL↔blank, 1↔1");
     }
 }

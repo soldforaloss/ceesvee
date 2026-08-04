@@ -107,6 +107,11 @@ pub struct ColumnProfile {
     pub scope: ProfileScope,
     /// Document revision this profile was computed against.
     pub revision: u64,
+    /// Schema revision this profile was computed against. A declared schema
+    /// (F31) changes how cells classify — numeric stats, `inferredKind`, null
+    /// exclusion — WITHOUT moving the document revision, so the cache must also
+    /// invalidate when this moves, or it would serve pre-schema statistics.
+    pub schema_revision: u64,
     /// Rows covered by the scope.
     pub row_count: usize,
     pub blank_count: usize,
@@ -263,6 +268,10 @@ pub fn profile_column(
     let mut len_sum = 0u64;
     let mut non_blank = 0usize;
 
+    // A DECLARED schema (F31) replaces the heuristic per-cell classes: cells
+    // classify under the declared type (locale, input formats, null tokens).
+    let schema = doc.column_schema_at(column).cloned();
+
     {
         let mut i = 0usize;
         let mut visitor = |_r: usize, row: &[String]| -> AppResult<bool> {
@@ -272,21 +281,39 @@ pub fn profile_column(
             i += 1;
             let cell = row.get(column).map(String::as_str).unwrap_or("");
             let trimmed = cell.trim();
-            match analyze::classify(cell) {
+            let class = match &schema {
+                Some(s) => match schema_class(s, cell, &mut numbers, &mut sum) {
+                    Some(class) => class,
+                    None => {
+                        // Empty, a configured null token, or missing: all
+                        // count into the blank bucket for the stats.
+                        blank += 1;
+                        return Ok(true);
+                    }
+                },
+                None => analyze::classify(cell),
+            };
+            match class {
                 CellClass::Blank => {
                     blank += 1;
                     return Ok(true);
                 }
                 CellClass::Number => {
                     counts.number += 1;
-                    if let Some(n) = analyze::as_number(trimmed) {
-                        numbers.push(n);
-                        sum += n;
+                    if schema.is_none() {
+                        if let Some(n) = analyze::as_number(trimmed) {
+                            numbers.push(n);
+                            sum += n;
+                        }
                     }
                 }
                 CellClass::Date => {
                     counts.date += 1;
-                    if let Some(parsed) = analyze::parse_date(trimmed) {
+                    let parsed = match &schema {
+                        Some(s) => crate::schema::temporal_cell(s, cell),
+                        None => analyze::parse_date(trimmed),
+                    };
+                    if let Some(parsed) = parsed {
                         if earliest.as_ref().is_none_or(|(e, _)| parsed < *e) {
                             earliest = Some((parsed, trimmed.to_string()));
                         }
@@ -342,13 +369,18 @@ pub fn profile_column(
         })
     };
 
-    let inferred_kind = infer_kind(non_blank, &counts);
+    // The DECLARED type wins over the heuristic vote when a schema exists.
+    let inferred_kind = match &schema {
+        Some(s) => crate::schema::column_kind_of(s.logical_type),
+        None => infer_kind(non_blank, &counts),
+    };
     let (top_values, top_is_approximate) = top.top(options.top_k);
 
     Ok(ColumnProfile {
         column,
         scope,
         revision: doc.revision(),
+        schema_revision: doc.schema_revision(),
         row_count: total_rows,
         blank_count: blank,
         inferred_kind,
@@ -366,6 +398,38 @@ pub fn profile_column(
             avg_len: len_sum as f64 / non_blank as f64,
         }),
     })
+}
+
+/// Classify one cell under a DECLARED schema for the profile buckets:
+/// `None` = blank-ish (empty or a configured null token). Valid numeric
+/// values also land in the numeric stats (`numbers`/`sum`) here, since the
+/// typed reading — not the f64 heuristic — is the source of truth. Invalid
+/// cells count as text.
+fn schema_class(
+    schema: &crate::schema::ColumnSchema,
+    cell: &str,
+    numbers: &mut Vec<f64>,
+    sum: &mut f64,
+) -> Option<CellClass> {
+    use crate::schema::{classify, CellState, TypedValue};
+    match classify(Some(cell), schema) {
+        CellState::Empty | CellState::NullToken | CellState::Missing => None,
+        CellState::Valid(value) => Some(match value {
+            TypedValue::Integer(_) | TypedValue::Decimal(_) | TypedValue::Float(_) => {
+                if let crate::schema::NumericCell::Value(n) =
+                    crate::schema::numeric_cell(schema, cell)
+                {
+                    numbers.push(n);
+                    *sum += n;
+                }
+                CellClass::Number
+            }
+            TypedValue::Boolean(_) => CellClass::Bool,
+            TypedValue::Date(_) | TypedValue::DateTime(_) => CellClass::Date,
+            TypedValue::Text(_) | TypedValue::Uuid(_) | TypedValue::Json(_) => CellClass::Text,
+        }),
+        CellState::Invalid(_) => Some(CellClass::Text),
+    }
 }
 
 /// Same rule as the column summaries: a non-text kind only when every
@@ -445,6 +509,12 @@ pub fn profile_is_valid(doc: &Document, cached: &ColumnProfile) -> bool {
         return false;
     }
     if cached.revision < doc.column_revision(cached.column) {
+        return false;
+    }
+    // A schema declaration/edit changes how the column classifies without
+    // moving the document (or column) revision. Any schema change re-derives
+    // the profile, so drop a cache entry computed against an older schema.
+    if cached.schema_revision != doc.schema_revision() {
         return false;
     }
     if cached.scope == ProfileScope::VisibleRows && cached.revision < doc.filter_revision() {
@@ -612,6 +682,43 @@ mod tests {
     }
 
     #[test]
+    fn declaring_a_schema_invalidates_a_cached_profile() {
+        // A heuristic profile is computed and cached first; then the user
+        // declares a schema for that column. The document (and column)
+        // revision has NOT moved — only the schema revision — so the old
+        // per-column check would keep serving stale, pre-schema statistics.
+        let mut d = doc_from("amount\n\"1.234,5\"\n\"0,5\"");
+        let (_r, ctx) = ctx();
+        let cached =
+            profile_column(&d, 0, ProfileScope::All, &ProfileOptions::default(), &ctx).unwrap();
+        assert!(profile_is_valid(&d, &cached));
+
+        declare_with(&mut d, 0, crate::schema::LogicalType::Decimal, |s| {
+            s.locale = Some("de-DE".to_string());
+        });
+        assert_eq!(
+            d.revision(),
+            cached.revision,
+            "schema edits never move revision"
+        );
+        assert!(
+            !profile_is_valid(&d, &cached),
+            "a schema declaration must evict the pre-schema profile"
+        );
+
+        // Editing a DIFFERENT column's schema still evicts (schema_revision is
+        // document-wide); the recomputed profile is valid again.
+        let fresh =
+            profile_column(&d, 0, ProfileScope::All, &ProfileOptions::default(), &ctx).unwrap();
+        assert!(profile_is_valid(&d, &fresh));
+        d.remove_column_schema(&d.column_ids()[0].clone());
+        assert!(
+            !profile_is_valid(&d, &fresh),
+            "removing the schema evicts too"
+        );
+    }
+
+    #[test]
     fn cache_stores_and_prunes() {
         let d = doc_from("a\n1");
         let (_r, ctx) = ctx();
@@ -626,5 +733,71 @@ mod tests {
         assert!(cache.get_valid(&d, 0, ProfileScope::VisibleRows).is_none());
         cache.remove_doc(d.id);
         assert!(cache.get_valid(&d, 0, ProfileScope::All).is_none());
+    }
+
+    // ----- declared schemas (F31) -------------------------------------------
+
+    fn declare_with(
+        d: &mut Document,
+        col: usize,
+        lt: crate::schema::LogicalType,
+        f: impl FnOnce(&mut crate::schema::ColumnSchema),
+    ) {
+        let mut schema = crate::schema::ColumnSchema::new(
+            d.column_ids()[col].clone(),
+            d.headers()[col].clone(),
+            lt,
+        );
+        f(&mut schema);
+        d.set_column_schema(schema);
+    }
+
+    #[test]
+    fn declared_type_drives_classification_and_stats() {
+        // de-DE decimals + a declared null token. Heuristically all four
+        // cells would be text/blank; the declared schema reads two numbers,
+        // one blank-ish token and one invalid (counted as text).
+        let mut d = doc_from("amount,who\n\"1.234,5\",a\n\"0,5\",b\nNULL,c\nxyz,d");
+        declare_with(&mut d, 0, crate::schema::LogicalType::Decimal, |s| {
+            s.locale = Some("de-DE".to_string());
+            s.null_tokens = vec!["NULL".to_string()];
+        });
+        let (_r, ctx) = ctx();
+        let p = profile_column(&d, 0, ProfileScope::All, &ProfileOptions::default(), &ctx).unwrap();
+        assert_eq!(p.inferred_kind, ColumnKind::Number, "declared type wins");
+        assert_eq!(p.type_counts.number, 2);
+        assert_eq!(p.type_counts.text, 1, "invalid cell counts as text");
+        assert_eq!(p.blank_count, 1, "the null token lands in the blank bucket");
+        let numeric = p.numeric.expect("typed numeric stats");
+        assert_eq!(numeric.min, 0.5);
+        assert_eq!(numeric.max, 1234.5);
+    }
+
+    #[test]
+    fn declared_text_zip_column_profiles_as_text() {
+        // All-numeric cells, but the column is DECLARED text (leading-zero
+        // ZIPs): the badge must say text, not number.
+        let mut d = doc_from("zip\n00501\n10001");
+        declare_with(&mut d, 0, crate::schema::LogicalType::Text, |_| {});
+        let (_r, ctx) = ctx();
+        let p = profile_column(&d, 0, ProfileScope::All, &ProfileOptions::default(), &ctx).unwrap();
+        assert_eq!(p.inferred_kind, ColumnKind::Text);
+        assert_eq!(p.type_counts.text, 2);
+        assert_eq!(p.type_counts.number, 0);
+        assert!(p.numeric.is_none(), "no numeric stats for declared text");
+    }
+
+    #[test]
+    fn declared_date_profile_uses_input_formats_for_extremes() {
+        let mut d = doc_from("d\n31.12.2023\n02.01.2024");
+        declare_with(&mut d, 0, crate::schema::LogicalType::Date, |s| {
+            s.input_formats = Some(vec!["%d.%m.%Y".to_string()]);
+        });
+        let (_r, ctx) = ctx();
+        let p = profile_column(&d, 0, ProfileScope::All, &ProfileOptions::default(), &ctx).unwrap();
+        assert_eq!(p.inferred_kind, ColumnKind::Date);
+        assert_eq!(p.type_counts.date, 2);
+        assert_eq!(p.earliest_date.as_deref(), Some("31.12.2023"));
+        assert_eq!(p.latest_date.as_deref(), Some("02.01.2024"));
     }
 }

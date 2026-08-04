@@ -1177,6 +1177,10 @@ export interface ColumnProfile {
   scope: ProfileScope;
   /** Document revision this profile was computed against. */
   revision: number;
+  /** Schema revision this profile was computed against (F31): a declared
+   * schema changes classification without moving `revision`, so the cache
+   * keys on both. */
+  schemaRevision: number;
   rowCount: number;
   blankCount: number;
   inferredKind: ColumnKind;
@@ -1334,4 +1338,149 @@ export interface EncodingCompatibility {
   affectedCells: number;
   /** First affected locations (capped at 100). */
   samples: EncodingIncompatibility[];
+}
+
+// ----- explicit schemas and typed columns (F31) ----------------------------
+
+/** The nine declarable logical types (mirrors the Rust `LogicalType`). */
+export type LogicalType =
+  | "text"
+  | "integer"
+  | "decimal"
+  | "float"
+  | "boolean"
+  | "date"
+  | "datetime"
+  | "uuid"
+  | "json";
+
+/**
+ * How edit validation behaves: `advisory` records an issue without blocking,
+ * `strict` rejects an invalid edit before it reaches the document model.
+ */
+export type ValidationMode = "advisory" | "strict";
+
+/**
+ * One column's declared logical schema (F31). Keyed by the STABLE column ID
+ * (F12), never by position or header text, so assignments survive renames and
+ * reorders. Optional fields are omitted by the backend when unset.
+ */
+export interface ColumnSchema {
+  columnId: string;
+  /** Display name; the backend refreshes it from the header on read. */
+  name: string;
+  logicalType: LogicalType;
+  nullable: boolean;
+  /** Cell texts (compared trimmed) that mean "no value" — "", "NULL", … */
+  nullTokens: string[];
+  /** BCP-47-ish tag ("de-DE") selecting number separators. */
+  locale?: string;
+  /** IANA zone ("Europe/Berlin") naive datetimes are interpreted in. */
+  timeZone?: string;
+  /** strftime patterns tried in order for date/datetime parsing. */
+  inputFormats?: string[];
+  /** Display-only pattern from the documented catalogue. */
+  displayFormat?: string;
+  validationMode: ValidationMode;
+}
+
+/**
+ * A document's schema: per-column entries keyed by stable column ID. Columns
+ * without an entry are implicitly plain text.
+ */
+export interface DocumentSchema {
+  columns: Record<string, ColumnSchema>;
+}
+
+/**
+ * The schema surface returned by `get_schema` / edits. `schemaRevision` tracks
+ * schema-only changes; `revision` is the ordinary document revision, which
+ * schema edits deliberately do NOT move (so display-format changes never
+ * dirty the document).
+ */
+export interface SchemaInfo {
+  schema: DocumentSchema;
+  schemaRevision: number;
+  revision: number;
+}
+
+/** Result of importing a versioned schema file (REPLACES the schema). */
+export interface SchemaImportOutcome {
+  applied: number;
+  /** Entry IDs skipped because no current column carries them. */
+  skippedUnknown: string[];
+  info: SchemaInfo;
+}
+
+/** Counts of the five distinguishable cell states over the scanned rows. */
+export interface ColumnStateCounts {
+  valid: number;
+  invalid: number;
+  empty: number;
+  nullToken: number;
+  missing: number;
+}
+
+/** One invalid cell under the declared type. */
+export interface InvalidSample {
+  /** Absolute (unfiltered) row index. */
+  row: number;
+  value: string;
+  reason: string;
+}
+
+/** Bounded report of a column's invalid values under its declared type. */
+export interface InvalidSampleReport {
+  columnId: string;
+  counts: ColumnStateCounts;
+  samples: InvalidSample[];
+  scannedRows: number;
+  totalRows: number;
+  revision: number;
+  /** Schema revision this scan was computed against (F31). */
+  schemaRevision: number;
+}
+
+/** One before/after pair of a canonical conversion. */
+export interface ConvertSample {
+  row: number;
+  before: string;
+  after: string;
+}
+
+/** Preview of an explicit canonical conversion (computed without mutating). */
+export interface ConvertPreview {
+  columnId: string;
+  counts: ColumnStateCounts;
+  /** Valid cells whose text would actually change. */
+  changed: number;
+  samples: ConvertSample[];
+  invalidSamples: InvalidSample[];
+  scannedRows: number;
+  /** The revision to hand back to `convert_column_apply`. */
+  revision: number;
+  /** The schema revision to hand back to `convert_column_apply` alongside
+   * `revision`, so a schema edit between preview and apply is rejected (F31). */
+  schemaRevision: number;
+}
+
+/** The backend's verdict on one proposed cell edit (F31 pre-check). */
+export interface CellEditValidation {
+  valid: boolean;
+  reason?: string;
+  /** The declared column's mode; absent = no schema (anything goes). */
+  mode?: ValidationMode;
+  columnId?: string;
+}
+
+/** One advisory-mode validation issue: an accepted but ill-typed edit. */
+export interface SchemaIssue {
+  /** Absolute (unfiltered) row index at the time of the edit. */
+  row: number;
+  col: number;
+  columnId: string;
+  value: string;
+  reason: string;
+  /** Document revision AFTER the edit was applied. */
+  revision: number;
 }

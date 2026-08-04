@@ -17,6 +17,7 @@ use crate::dto::ExportScope;
 use crate::error::{AppError, AppResult};
 use crate::export_scope::resolve_scope;
 use crate::job::JobCtx;
+use crate::schema::{self, ColumnSchema, NumericCell};
 
 /// Hard cap on the number of groups (bounded memory, clear error).
 pub const MAX_GROUPS: usize = 1_000_000;
@@ -207,15 +208,33 @@ impl Acc {
 
     /// Feed one cell. Returns how many NEW distinct entries were tracked
     /// (for the global bound) and whether a non-blank cell failed to parse
-    /// as a number for a numeric aggregate.
-    fn feed(&mut self, value: &str, spec: &GroupBySpec) -> (usize, bool) {
+    /// as a number for a numeric aggregate. When the aggregated column has a
+    /// DECLARED schema (F31), its configured null tokens count as blank and
+    /// numeric parsing follows the declared type (locale-aware) instead of
+    /// the f64 heuristic.
+    fn feed(
+        &mut self,
+        value: &str,
+        spec: &GroupBySpec,
+        schema: Option<&ColumnSchema>,
+    ) -> (usize, bool) {
         let trimmed = value.trim();
-        let blank = trimmed.is_empty();
+        let blank = trimmed.is_empty() || schema.is_some_and(|s| schema::is_null_token(s, trimmed));
         let mut tracked = 0usize;
         let mut invalid = false;
         let mut number = || -> Option<f64> {
             if blank {
                 return None;
+            }
+            if let Some(s) = schema.filter(|s| s.logical_type.is_numeric()) {
+                return match schema::numeric_cell(s, trimmed) {
+                    NumericCell::Value(n) => Some(n),
+                    NumericCell::Null => None,
+                    NumericCell::Invalid => {
+                        invalid = true;
+                        None
+                    }
+                };
             }
             match analyze::as_number(trimmed) {
                 Some(n) => Some(n),
@@ -381,6 +400,14 @@ fn group(doc: &Document, spec: &GroupBySpec, ctx: Option<&JobCtx>) -> AppResult<
     let mut distinct_tracked = 0usize;
     let mut processed = 0u64;
 
+    // Declared schemas (F31) per aggregated column, parallel to the
+    // aggregate list (null tokens + typed numeric parsing in `Acc::feed`).
+    let agg_schemas: Vec<Option<ColumnSchema>> = spec
+        .aggregates
+        .iter()
+        .map(|a| a.column.and_then(|c| doc.column_schema_at(c).cloned()))
+        .collect();
+
     doc.visit_rows_at(&rows, &mut |_, row| {
         processed += 1;
         if let Some(ctx) = ctx {
@@ -430,13 +457,18 @@ fn group(doc: &Document, spec: &GroupBySpec, ctx: Option<&JobCtx>) -> AppResult<
         };
         let group = &mut groups[group_idx];
         group.rows += 1;
-        for (acc, agg) in group.accs.iter_mut().zip(&spec.aggregates) {
+        for ((acc, agg), agg_schema) in group
+            .accs
+            .iter_mut()
+            .zip(&spec.aggregates)
+            .zip(&agg_schemas)
+        {
             let cell = agg
                 .column
                 .and_then(|c| row.get(c))
                 .map(String::as_str)
                 .unwrap_or("");
-            let (tracked, invalid) = acc.feed(cell, spec);
+            let (tracked, invalid) = acc.feed(cell, spec, agg_schema.as_ref());
             distinct_tracked += tracked;
             if invalid && agg.aggregate.is_numeric() {
                 invalid_numeric += 1;
@@ -454,10 +486,19 @@ fn group(doc: &Document, spec: &GroupBySpec, ctx: Option<&JobCtx>) -> AppResult<
         ctx.flush_progress();
     }
 
-    // Deterministic ordering; ties resolve by the display key.
+    // Deterministic ordering; ties resolve by the display key. ByKey prefers
+    // the DECLARED type (F31) of each grouping column: integer keys sort
+    // numerically, date keys chronologically, unschema'd keys as text.
     match spec.ordering {
         GroupOrdering::FirstSeen => {}
-        GroupOrdering::ByKey => groups.sort_by(|a, b| a.display.cmp(&b.display)),
+        GroupOrdering::ByKey => {
+            let key_schemas: Vec<Option<ColumnSchema>> = spec
+                .group_columns
+                .iter()
+                .map(|&c| doc.column_schema_at(c).cloned())
+                .collect();
+            groups.sort_by(|a, b| compare_display_keys(&a.display, &b.display, &key_schemas));
+        }
         GroupOrdering::ByCountDesc => {
             groups.sort_by(|a, b| b.rows.cmp(&a.rows).then_with(|| a.display.cmp(&b.display)));
         }
@@ -469,6 +510,25 @@ fn group(doc: &Document, spec: &GroupBySpec, ctx: Option<&JobCtx>) -> AppResult<
         blank_key_rows,
         scanned_rows: rows.len(),
     })
+}
+
+/// Componentwise display-key comparison: typed under a declared schema,
+/// lexicographic otherwise (the pre-schema behavior).
+fn compare_display_keys(
+    a: &[String],
+    b: &[String],
+    schemas: &[Option<ColumnSchema>],
+) -> std::cmp::Ordering {
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        let ord = match schemas.get(i).and_then(Option::as_ref) {
+            Some(schema) => schema::compare_cells(schema, x, y),
+            None => x.cmp(y),
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// The output schema: grouping columns, then one column per aggregate.
@@ -808,5 +868,69 @@ mod tests {
         let mut s = spec(vec![0], vec![agg(Aggregate::Concat, Some(1))]);
         s.concat_max_len = 0;
         assert!(preview(&d, &s).is_err());
+    }
+
+    // ----- declared schemas (F31) -------------------------------------------
+
+    fn declare_with(
+        d: &mut Document,
+        col: usize,
+        lt: crate::schema::LogicalType,
+        f: impl FnOnce(&mut crate::schema::ColumnSchema),
+    ) {
+        let mut schema = crate::schema::ColumnSchema::new(
+            d.column_ids()[col].clone(),
+            d.headers()[col].clone(),
+            lt,
+        );
+        f(&mut schema);
+        d.set_column_schema(schema);
+    }
+
+    #[test]
+    fn declared_locale_decimal_sum_parses_typed() {
+        // de-DE "1.234,5" + "0,5" = 1235; the heuristic would call both
+        // invalid. Values are quoted (comma is the delimiter).
+        let mut d = doc("k,amount\na,\"1.234,5\"\na,\"0,5\"\n");
+        declare_with(&mut d, 1, crate::schema::LogicalType::Decimal, |s| {
+            s.locale = Some("de-DE".to_string());
+        });
+        let p = preview(&d, &spec(vec![0], vec![agg(Aggregate::Sum, Some(1))])).unwrap();
+        assert_eq!(p.invalid_numeric, 0);
+        assert_eq!(p.sample[0][1], "1235");
+    }
+
+    #[test]
+    fn declared_null_tokens_count_as_blank_not_invalid() {
+        let mut d = doc("k,n\na,1\na,NULL\na,\n");
+        declare_with(&mut d, 1, crate::schema::LogicalType::Integer, |s| {
+            s.null_tokens = vec!["NULL".to_string()];
+        });
+        let p = preview(
+            &d,
+            &spec(
+                vec![0],
+                vec![
+                    agg(Aggregate::Sum, Some(1)),
+                    agg(Aggregate::CountNonBlank, Some(1)),
+                ],
+            ),
+        )
+        .unwrap();
+        // NULL is a declared null: skipped by the sum WITHOUT counting as an
+        // invalid numeric cell, and not counted as non-blank.
+        assert_eq!(p.invalid_numeric, 0);
+        assert_eq!(p.sample[0][1], "1");
+        assert_eq!(p.sample[0][2], "1");
+    }
+
+    #[test]
+    fn by_key_ordering_prefers_declared_type() {
+        let mut d = doc("n,v\n10,a\n9,b\n2,c\n");
+        declare_with(&mut d, 0, crate::schema::LogicalType::Integer, |_| {});
+        let p = preview(&d, &spec(vec![0], vec![agg(Aggregate::Count, None)])).unwrap();
+        // Typed (numeric) key order, not the lexicographic "10" < "2" < "9".
+        let keys: Vec<&str> = p.sample.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(keys, vec!["2", "9", "10"]);
     }
 }

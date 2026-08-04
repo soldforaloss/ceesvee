@@ -15,10 +15,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { indicesToRanges } from "../lib/gridSelection";
 import { darkGridTheme, dirtyCellOverride, lightGridTheme } from "../lib/gridTheme";
+import { formatCellValue, isNumericType } from "../lib/schema";
 import * as api from "../lib/tauri";
 import { physicalToDisplay, projectColumns } from "../lib/viewProjection";
 import { useStore } from "../store/useStore";
-import type { ColumnKind, DocumentMeta } from "../types";
+import type { ColumnKind, ColumnSchema, DocumentMeta, LogicalType } from "../types";
 import { ColumnMenu, type ColumnMenuState } from "./ColumnMenu";
 
 const PAGE = 200;
@@ -32,14 +33,40 @@ const AUTOFIT_MAX = 640;
 const AUTOFIT_PADDING = 26;
 
 // Header type-badge sprites (Feather-style), rendered by glide-data-grid next
-// to a column's title once its type has been detected. Text columns get none.
+// to a column's title. The `ceesvee*` sprites badge a HEURISTICALLY DETECTED
+// type (theme-coloured); the `ceesveeSchema*` sprites badge an EXPLICITLY
+// DECLARED F31 logical type and are drawn in a fixed violet so a declaration
+// reads distinctly from — and visually wins over — detection.
+const DECLARED = "#8b5cf6"; // violet-500: "this type was declared, not guessed"
+
+const glyph = (body: (stroke: string) => string) => (p: { fgColor: string }) =>
+  `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${body(
+    p.fgColor,
+  )}</svg>`;
+
+const NUMBER_BODY = (s: string) =>
+  `<g stroke="${s}"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></g>`;
+const DATE_BODY = (s: string) =>
+  `<g stroke="${s}"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></g>`;
+const BOOL_BODY = (s: string) => `<polyline points="20 6 9 17 4 12" stroke="${s}"/>`;
+const TEXT_BODY = (s: string) =>
+  `<g stroke="${s}"><path d="M4 7V4h16v3"/><line x1="12" y1="4" x2="12" y2="20"/><line x1="8" y1="20" x2="16" y2="20"/></g>`;
+const UUID_BODY = (s: string) =>
+  `<g stroke="${s}"><circle cx="8" cy="15" r="4"/><line x1="10.85" y1="12.15" x2="19" y2="4"/><line x1="18" y1="5" x2="20" y2="7"/><line x1="15" y1="8" x2="17" y2="10"/></g>`;
+const JSON_BODY = (s: string) =>
+  `<g stroke="${s}"><path d="M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5a2 2 0 0 0 2 2h1"/><path d="M16 3h1a2 2 0 0 1 2 2v5a2 2 0 0 1 2 2 2 2 0 0 1-2 2v5a2 2 0 0 1-2 2h-1"/></g>`;
+
 const HEADER_ICONS: Record<string, (p: { fgColor: string }) => string> = {
-  ceesveeNumber: (p) =>
-    `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="${p.fgColor}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></svg>`,
-  ceesveeDate: (p) =>
-    `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="${p.fgColor}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`,
-  ceesveeBool: (p) =>
-    `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="${p.fgColor}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`,
+  ceesveeNumber: glyph(NUMBER_BODY),
+  ceesveeDate: glyph(DATE_BODY),
+  ceesveeBool: glyph(BOOL_BODY),
+  // Declared (F31): fixed violet, one per logical-type family.
+  ceesveeSchemaNumber: glyph(() => NUMBER_BODY(DECLARED)),
+  ceesveeSchemaDate: glyph(() => DATE_BODY(DECLARED)),
+  ceesveeSchemaBool: glyph(() => BOOL_BODY(DECLARED)),
+  ceesveeSchemaText: glyph(() => TEXT_BODY(DECLARED)),
+  ceesveeSchemaUuid: glyph(() => UUID_BODY(DECLARED)),
+  ceesveeSchemaJson: glyph(() => JSON_BODY(DECLARED)),
 };
 
 function iconForKind(kind: ColumnKind): string | undefined {
@@ -52,6 +79,27 @@ function iconForKind(kind: ColumnKind): string | undefined {
       return "ceesveeBool";
     default:
       return undefined;
+  }
+}
+
+/** The declared-schema badge sprite for a logical type (violet, F31). */
+function iconForLogicalType(lt: LogicalType): string {
+  switch (lt) {
+    case "integer":
+    case "decimal":
+    case "float":
+      return "ceesveeSchemaNumber";
+    case "date":
+    case "datetime":
+      return "ceesveeSchemaDate";
+    case "boolean":
+      return "ceesveeSchemaBool";
+    case "uuid":
+      return "ceesveeSchemaUuid";
+    case "json":
+      return "ceesveeSchemaJson";
+    default:
+      return "ceesveeSchemaText";
   }
 }
 
@@ -116,6 +164,22 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
     return kinds;
   }, [summaries, colCount]);
 
+  // F31: the active document's declared schema, by physical column. A declared
+  // logical type wins the header badge over detection and drives display-only
+  // formatting + numeric alignment. Keyed by stable column ID so it stays put
+  // across reorders.
+  const schemaColumns = useStore((s) => s.schemaInfo?.schema.columns ?? null);
+  const columnSchemas = useMemo<(ColumnSchema | undefined)[]>(() => {
+    const arr: (ColumnSchema | undefined)[] = new Array(colCount).fill(undefined);
+    if (schemaColumns) {
+      for (let phys = 0; phys < colCount; phys++) {
+        const id = meta.columnIds[phys];
+        if (id) arr[phys] = schemaColumns[id];
+      }
+    }
+    return arr;
+  }, [schemaColumns, meta.columnIds, colCount]);
+
   // ----- columns (through the F12 view projection) -------------------------
 
   // DISPLAY position -> PHYSICAL column index. Everything the grid renders or
@@ -130,14 +194,20 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
 
   const columns = useMemo<GridColumn[]>(
     () =>
-      projection.physical.map((phys) => ({
-        title: meta.headers[phys] || `Column ${phys + 1}`,
-        id: meta.columnIds[phys] ?? String(phys),
-        width: colWidths[phys] ?? DEFAULT_COL_WIDTH,
-        hasMenu: true,
-        icon: iconForKind(columnKinds[phys] ?? "text"),
-      })),
-    [meta.headers, meta.columnIds, colWidths, columnKinds, projection],
+      projection.physical.map((phys) => {
+        const schema = columnSchemas[phys];
+        return {
+          title: meta.headers[phys] || `Column ${phys + 1}`,
+          id: meta.columnIds[phys] ?? String(phys),
+          width: colWidths[phys] ?? DEFAULT_COL_WIDTH,
+          hasMenu: true,
+          // Declared logical type wins over the detected-kind badge (F31).
+          icon: schema
+            ? iconForLogicalType(schema.logicalType)
+            : iconForKind(columnKinds[phys] ?? "text"),
+        };
+      }),
+    [meta.headers, meta.columnIds, colWidths, columnKinds, columnSchemas, projection],
   );
 
   // ----- windowed data fetching ------------------------------------------
@@ -196,9 +266,11 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
 
   // (Re)detect column types + summaries whenever the document changes
   // structurally. Debounced in the store; results drive header badges,
-  // numeric alignment, and the summaries panel.
+  // numeric alignment, and the summaries panel. The F31 schema is refetched
+  // alongside so declared badges + display formatting track structural edits.
   useEffect(() => {
     useStore.getState().loadSummaries();
+    void useStore.getState().loadSchema();
   }, [docId, dataVersion]);
 
   const onVisibleRegionChanged = useCallback(
@@ -303,20 +375,27 @@ export function Grid({ meta, dataVersion, dark }: GridProps) {
       const phys = projection.physical[col] ?? col;
       const value = rowData[phys] ?? "";
       const isDirty = dirtyCache.current.get(row)?.[phys] ?? false;
+      // F31: a declared display format changes only what is SHOWN. `data`
+      // stays the raw stored text, so the overlay editor and copy/fill always
+      // see and write the unformatted value; numeric alignment prefers the
+      // declared logical type over heuristic detection.
+      const schema = columnSchemas[phys];
+      const displayData = schema ? formatCellValue(schema, value) : value;
+      const numeric = schema ? isNumericType(schema.logicalType) : columnKinds[phys] === "number";
       return {
         kind: GridCellKind.Text,
         data: value,
-        displayData: value,
+        displayData,
         allowOverlay: !readOnly,
         allowWrapping: wrapText,
-        contentAlign: columnKinds[phys] === "number" ? "right" : undefined,
+        contentAlign: numeric ? "right" : undefined,
         themeOverride: isDirty ? dirtyCellOverride : undefined,
       };
     },
-    // Cell data is read from refs; recreated when column types, wrap or the
-    // projection change so cells re-render correctly. Structural refreshes
-    // still go through `updateCells`.
-    [columnKinds, readOnly, wrapText, projection],
+    // Cell data is read from refs; recreated when column types, schema, wrap
+    // or the projection change so cells re-render correctly. Structural
+    // refreshes still go through `updateCells`.
+    [columnKinds, columnSchemas, readOnly, wrapText, projection],
   );
 
   const onCellEdited = useCallback(
