@@ -14,6 +14,8 @@ import {
   Filter,
   FolderOpen,
   Layers,
+  Close,
+  Save as SaveIcon,
   Moon,
   Pulse,
   Redo,
@@ -46,6 +48,15 @@ export function Toolbar() {
   const recent = useStore((s) => s.recent);
   const [recentOpen, setRecentOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
+
+  const [projectOpen, setProjectOpen] = useState(false);
+  const project = useStore((s) => s.project);
+  const projectNew = useStore((s) => s.projectNew);
+  const projectNewFromTemplate = useStore((s) => s.projectNewFromTemplate);
+  const projectPickAndOpen = useStore((s) => s.projectPickAndOpen);
+  const projectSave = useStore((s) => s.projectSave);
+  const projectSaveTemplate = useStore((s) => s.projectSaveTemplate);
+  const requestCloseProject = useStore((s) => s.requestCloseProject);
 
   const newDoc = useStore((s) => s.newDoc);
   const openDialog = useStore((s) => s.openDialog);
@@ -233,6 +244,86 @@ export function Toolbar() {
 
       <Divider />
 
+      <div className="relative flex">
+        <Tool
+          title="Project workspace"
+          onClick={() => setProjectOpen((o) => !o)}
+          active={projectOpen || !!project}
+        >
+          <Layers />
+        </Tool>
+        {projectOpen && (
+          <div
+            className="absolute left-0 top-10 z-40 w-60 overflow-hidden rounded-lg border border-zinc-200 bg-white py-1 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-800"
+            onMouseLeave={() => setProjectOpen(false)}
+          >
+            <MenuItem
+              label="New project"
+              icon={<FilePlus />}
+              onClick={() => {
+                setProjectOpen(false);
+                void projectNew();
+              }}
+            />
+            <MenuItem
+              label="New from template…"
+              icon={<Bookmark />}
+              onClick={() => {
+                setProjectOpen(false);
+                void projectNewFromTemplate();
+              }}
+            />
+            <MenuItem
+              label="Open project…"
+              icon={<FolderOpen />}
+              onClick={() => {
+                setProjectOpen(false);
+                void projectPickAndOpen();
+              }}
+            />
+            {project && (
+              <>
+                <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
+                <MenuItem
+                  label="Save project"
+                  icon={<SaveIcon />}
+                  onClick={() => {
+                    setProjectOpen(false);
+                    void projectSave(false);
+                  }}
+                />
+                <MenuItem
+                  label="Save project as…"
+                  icon={<SaveIcon />}
+                  onClick={() => {
+                    setProjectOpen(false);
+                    void projectSave(true);
+                  }}
+                />
+                <MenuItem
+                  label="Save as template…"
+                  icon={<Bookmark />}
+                  onClick={() => {
+                    setProjectOpen(false);
+                    void projectSaveTemplate();
+                  }}
+                />
+                <MenuItem
+                  label="Close project"
+                  icon={<Close />}
+                  onClick={() => {
+                    setProjectOpen(false);
+                    requestCloseProject();
+                  }}
+                />
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      <Divider />
+
       <Tool title="Undo (Ctrl+Z)" onClick={() => void undo()} disabled={!meta?.canUndo}>
         <Undo />
       </Tool>
@@ -360,6 +451,26 @@ function MenuGroup({
         </button>
       ))}
     </>
+  );
+}
+
+function MenuItem({
+  label,
+  icon,
+  onClick,
+}: {
+  label: string;
+  icon: React.ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-zinc-700 transition-colors hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-700"
+    >
+      <span className="text-zinc-500 dark:text-zinc-400">{icon}</span>
+      {label}
+    </button>
   );
 }
 

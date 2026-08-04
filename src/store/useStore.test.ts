@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { DocumentMeta } from "../types";
+import type {
+  DocumentMeta,
+  PlanEntry,
+  ProjectMeta,
+  ProjectOpenPlan,
+  ProjectOpenPreview,
+  SourcePreviewEntry,
+} from "../types";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), save: vi.fn() }));
 vi.mock("@tauri-apps/api/window", () => ({
@@ -20,6 +27,8 @@ vi.mock("../lib/tauri", () => ({
   pendingArchiveEstimate: vi.fn(),
   openArchiveDocument: vi.fn(),
   discardArchive: vi.fn(),
+  projectOpenApply: vi.fn(),
+  projectGet: vi.fn(),
 }));
 
 import * as api from "../lib/tauri";
@@ -518,5 +527,149 @@ describe("compressed file open flow (F17)", () => {
     useStore.getState().dismissOpenDecision();
     expect(api.discardArchive).toHaveBeenCalledWith(12);
     expect(useStore.getState().openDecision).toBeNull();
+  });
+});
+
+describe("project open queue + dirtiness (F37)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useStore.setState({
+      tabs: [],
+      activeId: null,
+      uiStates: {},
+      settings: { version: 1, profiles: [] },
+      openDecision: null,
+      indexing: null,
+      archivePick: null,
+      jsonImport: null,
+      busy: false,
+      error: null,
+      diagnosticsOpen: false,
+      changesOpen: false,
+      project: null,
+      projectBaseline: null,
+      projectOpen: null,
+      projectOpenChoices: {},
+      projectOpenPending: null,
+      projectWarnings: [],
+    });
+  });
+
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  const estimate = (needsDecision: boolean) => ({
+    fileSize: 2_000_000_000,
+    estimatedRows: 20_000_000,
+    estimatedMemory: 6_000_000_000,
+    needsDecision,
+    encoding: "UTF-8",
+  });
+
+  const pmeta = (dirty: boolean): ProjectMeta => ({
+    path: "C:/proj.ceesveeproj",
+    name: "proj",
+    dirty,
+    revision: dirty ? 1 : 0,
+    formatVersion: "1",
+    appVersion: "0.4.0",
+  });
+
+  const planEntry = (sourceId: string, path: string): PlanEntry => ({
+    sourceId,
+    path,
+    displayName: null,
+    open: {},
+    status: "ok",
+    reapplyViews: false,
+    viewWarnings: [],
+    views: [],
+    activeViewId: null,
+  });
+
+  const previewEntry = (sourceId: string, resolvedPath: string): SourcePreviewEntry => ({
+    sourceId,
+    displayName: null,
+    resolvedPath,
+    status: "ok",
+    storedFingerprint: null,
+    diskFingerprint: null,
+    movedCandidate: null,
+    reapplyViews: true,
+    warnings: [],
+  });
+
+  const preview = (sources: SourcePreviewEntry[]): ProjectOpenPreview => ({
+    path: "C:/proj.ceesveeproj",
+    formatVersion: "1",
+    appVersion: "0.4.0",
+    sources,
+    tabOrder: sources.map((e) => e.sourceId),
+    activeTab: sources[0]?.sourceId ?? null,
+  });
+
+  const plan = (dirty: boolean, entries: PlanEntry[]): ProjectOpenPlan => ({
+    meta: pmeta(dirty),
+    entries,
+    tabOrder: entries.map((e) => e.sourceId),
+    activeTab: entries[0]?.sourceId ?? null,
+    removedSourceIds: [],
+    skippedSourceIds: [],
+  });
+
+  it("queues a large-file source and finalizes only after the decision resolves", async () => {
+    const small = "C:/data/doc-1.csv";
+    const large = "C:/data/doc-2.csv";
+    vi.mocked(api.projectOpenApply).mockResolvedValue(
+      plan(false, [planEntry("s1", small), planEntry("s2", large)]),
+    );
+    vi.mocked(api.probeOpen).mockImplementation(async (p: string) => estimate(p.includes("doc-2")));
+    vi.mocked(api.openFile).mockImplementation(async (p: string) =>
+      p.includes("doc-2") ? meta(2) : meta(1),
+    );
+    vi.mocked(api.projectGet).mockResolvedValue({ meta: pmeta(false), sections: { layout: null } });
+
+    useStore.setState({
+      projectOpen: preview([previewEntry("s1", small), previewEntry("s2", large)]),
+    });
+    await useStore.getState().applyProjectOpen();
+
+    // Paused on the large-file decision: only the small tab is open, and the
+    // project is NOT yet finalized (no baseline captured that omits the big tab).
+    let s = useStore.getState();
+    expect(s.openDecision?.path).toBe(large);
+    expect(s.projectOpenPending).not.toBeNull();
+    expect(s.project).toBeNull();
+    expect(s.tabs.map((t) => t.id)).toEqual([1]);
+
+    // Confirming the decision opens the second tab, then the queue drains and
+    // finalizes — leaving the just-opened project clean (not immediately dirty).
+    await useStore.getState().confirmOpenEditable();
+    await flush();
+
+    s = useStore.getState();
+    expect(s.openDecision).toBeNull();
+    expect(s.projectOpenPending).toBeNull();
+    expect(s.tabs.map((t) => t.id)).toEqual([1, 2]);
+    expect(s.project?.name).toBe("proj");
+    expect(s.isProjectDirty()).toBe(false);
+  });
+
+  it("honors the backend dirty flag from a relink/removal applied during open", async () => {
+    const only = "C:/data/doc-1.csv";
+    vi.mocked(api.projectOpenApply).mockResolvedValue(plan(true, [planEntry("s1", only)]));
+    vi.mocked(api.probeOpen).mockResolvedValue(estimate(false));
+    vi.mocked(api.openFile).mockResolvedValue(meta(1));
+    vi.mocked(api.projectGet).mockResolvedValue({ meta: pmeta(true), sections: { layout: null } });
+
+    useStore.setState({ projectOpen: preview([previewEntry("s1", only)]) });
+    await useStore.getState().applyProjectOpen();
+
+    const s = useStore.getState();
+    // No deferral → finalized immediately, snapshot equals its fresh baseline.
+    expect(s.projectOpenPending).toBeNull();
+    expect(s.project?.dirty).toBe(true);
+    // ...yet the project reports dirty because the backend holds the unsaved
+    // relink/removal (which the snapshot comparison alone cannot see).
+    expect(s.isProjectDirty()).toBe(true);
   });
 });
