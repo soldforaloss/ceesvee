@@ -105,6 +105,14 @@ function staticCommands(): AppCommand[] {
       run: () => void state().openDbExport(),
     },
     {
+      id: "data.sqlWorkspace",
+      title: "SQL workspace…",
+      keywords: ["sql", "query", "select", "join", "sqlite", "parameter", "explain", "run"],
+      category: "Data",
+      // Works with no document open — it can query approved files / a database.
+      run: () => void state().openSqlWorkspace(),
+    },
+    {
       id: "file.save",
       title: "Save",
       keywords: ["write", "persist"],

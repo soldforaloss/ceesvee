@@ -208,6 +208,12 @@ pub struct AppSettings {
     /// checkbox survives a restart / settings reload, like every other pref.
     #[serde(default)]
     pub auto_save_record_on_navigate: bool,
+    /// F36: SQL workspace query history, most recent first, capped at
+    /// [`crate::sql_workspace::SQL_HISTORY_CAP`]. Entries are DATA — loading
+    /// them never prepares or executes anything; re-running is always an
+    /// explicit user action.
+    #[serde(default)]
+    pub sql_history: Vec<crate::sql_workspace::SqlHistoryEntry>,
 }
 
 fn default_recovery_retention() -> u32 {
@@ -223,6 +229,7 @@ impl Default for AppSettings {
             recovery_enabled: false,
             recovery_retention_days: default_recovery_retention(),
             auto_save_record_on_navigate: false,
+            sql_history: Vec::new(),
         }
     }
 }
