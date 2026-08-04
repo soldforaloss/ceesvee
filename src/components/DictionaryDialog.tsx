@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   FIELD_KEY_LABELS,
@@ -8,6 +8,7 @@ import {
   SENSITIVITY_LABELS,
   SENSITIVITY_OPTIONS,
   allConflictsResolved,
+  applyMatchBy,
   bulkChoices,
   completeness,
   conflictKey,
@@ -72,6 +73,10 @@ export function DictionaryDialog({ onClose }: { onClose: () => void }) {
   const [importBusy, setImportBusy] = useState(false);
   const [conflictOpen, setConflictOpen] = useState(false);
   const [importSummary, setImportSummary] = useState<string | null>(null);
+  // Monotonic id of the most recently requested preview. A preview that
+  // resolves after a newer request (a changed Match by selector) or after the
+  // panel was cancelled is stale and must not populate the displayed plan.
+  const previewSeq = useRef(0);
 
   useEffect(() => {
     void loadDictionary();
@@ -159,8 +164,12 @@ export function DictionaryDialog({ onClose }: { onClose: () => void }) {
   };
 
   const runPreview = async (path: string, mb: MergeMatchBy) => {
+    const seq = ++previewSeq.current;
     setImportBusy(true);
     const p = await previewImport(path, mb);
+    // Drop a stale result: a newer preview or a cancel superseded this one, so
+    // the plan it produced no longer matches the current Match by selection.
+    if (seq !== previewSeq.current) return;
     setImportBusy(false);
     setPlan(p);
   };
@@ -171,6 +180,10 @@ export function DictionaryDialog({ onClose }: { onClose: () => void }) {
   };
 
   const cancelImport = () => {
+    // Invalidate any in-flight preview so its late result cannot repopulate the
+    // panel after it has been dismissed.
+    previewSeq.current++;
+    setImportBusy(false);
     setImportPath(null);
     setPlan(null);
     setConflictOpen(false);
@@ -179,10 +192,18 @@ export function DictionaryDialog({ onClose }: { onClose: () => void }) {
   const finishImport = async (resolution: MergeResolution) => {
     if (!importPath || !plan) return;
     setImportBusy(true);
-    // Guard with the revision captured when this plan was previewed, so an edit
-    // saved after the preview (which moves the dictionary revision) rejects this
-    // now-stale apply rather than silently discarding that edit.
-    const outcome = await applyImport(importPath, matchBy, resolution, plan.dictionaryRevision);
+    // Apply under exactly what the reviewed plan was computed with: its own
+    // match mode and revision, NOT the live dialog state. The Match by selector
+    // (or a stale preview) can have moved on since this plan was displayed, and
+    // merging under a different mode would touch a different set of columns than
+    // the conflicts/counts the user reviewed. The revision guard likewise
+    // rejects a now-stale apply if documentation was edited after the preview.
+    const outcome = await applyImport(
+      importPath,
+      applyMatchBy(plan),
+      resolution,
+      plan.dictionaryRevision,
+    );
     setImportBusy(false);
     if (!outcome) return; // error surfaced globally; keep the panel open to retry
     setConflictOpen(false);

@@ -94,6 +94,37 @@ export function saveBlocked(validation: DraftValidation | null): boolean {
   return validation?.strictBlocks ?? false;
 }
 
+/**
+ * A stable identity token for the record a fetched form view belongs to: the
+ * document plus the visible row it was read at. `fetch_record` is async, so
+ * after the user moves to another record — or switches to another document/tab
+ * — the previously-loaded view lingers in state until the new fetch resolves.
+ * The form tags each loaded view with this token and compares it to the token
+ * for the row it now points at (see `recordViewCurrent`); keying on the DOCUMENT
+ * (not the revision) defeats the "revisions happen to match" trap the reviewer
+ * flagged, where a coincidental row+revision match on the previous tab would
+ * otherwise look current.
+ */
+export function recordViewToken(docId: number, displayRow: number): string {
+  // A colon separates the two non-negative integers unambiguously.
+  return `${docId}:${displayRow}`;
+}
+
+/**
+ * Whether the loaded view still matches the (document, row) the form points at.
+ * `loaded` is the token the currently-held view answered to (`null` before the
+ * first fetch resolves or after the view was cleared); `target` is the token for
+ * the active document+row (`null` when no document is active). They are current
+ * only when a view is loaded AND its token equals the live target — the single
+ * condition that gates rendering the fields and committing a draft. While it is
+ * false the form shows a loading placeholder and `commit` refuses to write, so a
+ * quick edit+save during the async refetch can never land on the previous record
+ * (or the previous tab).
+ */
+export function recordViewCurrent(loaded: string | null, target: string | null): boolean {
+  return loaded !== null && target !== null && loaded === target;
+}
+
 /** One rendered section of the form: a named group, or the default (ungrouped). */
 export interface RecordSection {
   /** The group, or `null` for the implicit "everything else" section. */
