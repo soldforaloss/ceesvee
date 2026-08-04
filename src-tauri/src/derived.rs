@@ -121,8 +121,10 @@ impl DerivedDocumentBuilder {
 
     /// Finish the build and produce the document. In-memory outputs become
     /// ordinary editable documents (unsaved, so closing warns); spilled
-    /// outputs open INDEXED over the temp file with the guard attached.
-    /// `progress` receives byte deltas while the spilled file is indexed.
+    /// outputs open INDEXED over the temp file with the guard attached and are
+    /// likewise marked unsaved — the temp backing is discarded on close, so the
+    /// document must still prompt to save (Save routes to Save As, clearing the
+    /// guard). `progress` receives byte deltas while the spilled file is indexed.
     pub fn finish(
         self,
         doc_id: u64,
@@ -166,6 +168,10 @@ impl DerivedDocumentBuilder {
                 let indexed = index::build_index(&path, &self.cache_root, &settings, progress)?;
                 let mut doc = Document::from_index(doc_id, None, indexed);
                 doc.set_derived_guard(guard);
+                // Like the in-memory branch, a freshly built derived document is
+                // unsaved: it has no source path and its temp backing is dropped
+                // on close, so closing must warn and Save must route to Save As.
+                doc.mark_derived_unsaved();
                 Ok(doc)
             }
         }
@@ -239,6 +245,14 @@ mod tests {
         assert!(!doc.is_editable(), "spilled outputs open indexed");
         assert_eq!(doc.n_rows(), 50);
         assert_eq!(doc.headers(), &["a", "b"]);
+        // A spilled derived document is a fresh, temp-backed table with no
+        // source path: it must start unsaved so closing warns (exactly like the
+        // in-memory branch) instead of silently dropping the just-built import.
+        assert!(
+            doc.is_dirty(),
+            "spilled derived documents start unsaved too"
+        );
+        assert!(doc.meta().path.is_none());
         // Values round-trip through the CSV spill + index.
         let rows = doc.fetch_rows(&[0, 49]).unwrap();
         assert_eq!(rows[0][0], "row 0");

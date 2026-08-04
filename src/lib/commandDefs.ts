@@ -81,6 +81,14 @@ function staticCommands(): AppCommand[] {
       run: () => void state().openColumnarDialog(),
     },
     {
+      id: "file.openExcel",
+      title: "Open Excel…",
+      keywords: ["xlsx", "excel", "workbook", "spreadsheet", "sheet", "import", "table"],
+      category: "File",
+      allowInEditable: true,
+      run: () => void state().openExcelDialog(),
+    },
+    {
       id: "file.save",
       title: "Save",
       keywords: ["write", "persist"],
@@ -123,6 +131,14 @@ function staticCommands(): AppCommand[] {
       category: "Export",
       unavailableReason: needsDoc,
       run: () => openModal("columnarExport"),
+    },
+    {
+      id: "file.exportExcel",
+      title: "Export to Excel…",
+      keywords: ["xlsx", "excel", "workbook", "spreadsheet", "sheets", "tabs", "styling"],
+      category: "Export",
+      unavailableReason: needsDoc,
+      run: () => openModal("excelExport"),
     },
     {
       id: "file.closeTab",

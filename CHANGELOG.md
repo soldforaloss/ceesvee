@@ -42,6 +42,30 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are written as NULL and counted into a per-column warning report; columns
   without a schema export as text verbatim. A columnar document opens
   unsaved so a later Save can never overwrite the binary source with CSV.
+- **Excel `.xlsx` interoperability** (F34): read and produce Excel workbooks
+  without a detour through CSV, and without a formula engine. The open chooser
+  inspects a workbook up front — every sheet with its visibility (including
+  hidden and very-hidden sheets), named tables and named ranges, per-sheet used
+  ranges and dimensions, formula and merged-cell counts, detected header-row
+  candidates and a bounded preview. Import a chosen sheet, named table or named
+  range (optionally a specific `A1` cell range), with control over the header
+  row (first row, a chosen row, or none), merged cells (keep the top-left value
+  only, or repeat it across the region), formulas (cached result, formula text,
+  or blank — with a warning when a workbook has formulas but no cached results,
+  since CEESVEE never evaluates them) and blank-row/blank-column trimming.
+  Imports honour the workbook's 1900/1904 date system so dates never shift and
+  the Excel 1900 leap-year quirk is preserved, and leading-zero text (ZIP and
+  account codes) stays text — cell types are respected, never numeric-coerced.
+  Every import produces a fresh CEESVEE document (there is no in-place `.xlsx`
+  save); the original workbook is never modified. Export one sheet from one
+  document, or several sheets (one per open tab) into a single workbook, with
+  optional bold/filled header styling, a frozen header row, an autofilter, and
+  column widths from the grid or autofit. Typed columns (from the F31 schema)
+  export as real Excel numbers, booleans and dates; text stays text and cells
+  invalid under their schema fall back to text. Excel's 1,048,576-row ×
+  16,384-column limits are checked before writing (an over-limit export is
+  refused up front), and the workbook is committed through the atomic-save
+  pipeline, so a failed or cancelled export never touches an existing file.
 - **Row bookmarks, tags & notes** (F40): mark and annotate records without
   touching the source data. Star or flag a row, apply multiple named tags
   (a per-document tag namespace with usage counts), and attach a row note or

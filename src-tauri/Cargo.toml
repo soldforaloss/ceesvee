@@ -55,6 +55,12 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # Parquet & Arrow interop (F32): typed columnar open/export.
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
+# Excel .xlsx interoperability (F34): calamine reads workbooks (the `dates`
+# feature pulls in chrono so date cells honour the workbook epoch), and
+# rust_xlsxwriter produces them (typed values via its native ExcelDateTime, so
+# no extra chrono feature is needed on the writer).
+calamine = { version = "0.36", features = ["dates"] }
+rust_xlsxwriter = "0.96"
 
 # Single-instance is desktop-only: it forwards a second "Open with" launch
 # (and its file argument) to the already-running window instead of spawning a

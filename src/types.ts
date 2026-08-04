@@ -1953,6 +1953,147 @@ export interface ColumnarExportOptions {
   backup: BackupPolicy;
 }
 
+// ----- Excel .xlsx interoperability (F34) -----------------------------------
+
+/**
+ * Which row of the selected region is the header (mirrors the Rust
+ * `HeaderMode`, a `#[serde(tag = "type")]` enum). `row` drops every row above
+ * the chosen index (title/notes rows); `none` synthesises `Column N` names.
+ */
+export type ExcelHeaderMode =
+  | { type: "firstRow" }
+  | { type: "row"; index: number }
+  | { type: "none" };
+
+/** How merged cells are imported (mirrors Rust `MergedPolicy`). */
+export type ExcelMergedPolicy = "topLeftOnly" | "repeat";
+
+/** How formula cells are imported (mirrors Rust `FormulaPolicy`). */
+export type ExcelFormulaPolicy = "cachedResult" | "formulaText" | "blank";
+
+/**
+ * Everything an Excel import (preview or apply) needs (mirrors the Rust
+ * `ExcelImportOptions`). Exactly one of `sheet` / `table` / `namedRange`
+ * identifies the source; `range` narrows a sheet source to an `A1` rectangle.
+ */
+export interface ExcelImportOptions {
+  /** Worksheet to import (required unless `table` or `namedRange` is set). */
+  sheet?: string;
+  /** Named table to import (its own column names become the header). */
+  table?: string;
+  /** Named range to import (resolved to a sheet + cell range). */
+  namedRange?: string;
+  /** `A1` sub-range within `sheet` (e.g. `"B2:F100"`); ignored otherwise. */
+  range?: string;
+  header: ExcelHeaderMode;
+  merged: ExcelMergedPolicy;
+  formula: ExcelFormulaPolicy;
+  /** Drop rows entirely empty within the selection. */
+  trimBlankRows: boolean;
+  /** Drop columns entirely empty within the selection. */
+  trimBlankColumns: boolean;
+  /** Spill straight to the indexed read-only backing. */
+  forceIndexed: boolean;
+}
+
+/** One sheet in the Excel open chooser (mirrors Rust `SheetInfo`). */
+export interface ExcelSheetInfo {
+  name: string;
+  /** `"visible"`, `"hidden"` or `"veryHidden"`. */
+  visibility: string;
+  /** `"worksheet"`, `"dialog"`, `"macro"`, `"chart"` or `"vba"`. */
+  kind: string;
+  hasData: boolean;
+  startRow: number;
+  startCol: number;
+  usedRows: number;
+  usedCols: number;
+  formulaCount: number;
+  mergedCount: number;
+  /** Formula cells for which Excel stored no cached result. */
+  formulasWithoutCachedResults: number;
+  /** Header-row candidates, as 0-based offsets from the used-range start. */
+  headerCandidates: number[];
+  /** Bounded preview of the cached cell values (top-left corner). */
+  previewRows: string[][];
+}
+
+/** One named table in the Excel open chooser (mirrors Rust `TableInfo`). */
+export interface ExcelTableInfo {
+  name: string;
+  sheet: string;
+  columns: string[];
+  rows: number;
+  /** `A1` range of the table body (headers excluded), when it has rows. */
+  range?: string | null;
+}
+
+/** One named range in the Excel open chooser (mirrors Rust `NamedRangeInfo`). */
+export interface ExcelNamedRangeInfo {
+  name: string;
+  /** The raw defined-name formula (e.g. `Sheet1!$A$1:$C$9`). */
+  formula: string;
+  /** The sheet the range resolves to, when it is a simple single area. */
+  sheet?: string | null;
+  range?: string | null;
+}
+
+/** Everything the Excel open chooser renders (mirrors Rust `WorkbookInfo`). */
+export interface ExcelWorkbookInfo {
+  has1904Epoch: boolean;
+  sheets: ExcelSheetInfo[];
+  tables: ExcelTableInfo[];
+  namedRanges: ExcelNamedRangeInfo[];
+  warnings: string[];
+}
+
+/** One column of an Excel import preview (mirrors Rust `PreviewColumn`). */
+export interface ExcelPreviewColumn {
+  name: string;
+  inferredType: LogicalType;
+  nonEmpty: number;
+  empty: number;
+}
+
+/**
+ * The preview of importing the selected source under the chosen options
+ * (mirrors the Rust `ExcelImportPreview`).
+ */
+export interface ExcelImportPreview {
+  has1904Epoch: boolean;
+  /** Human description of what was scanned (sheet + range / table). */
+  source: string;
+  hasHeaderRow: boolean;
+  columns: ExcelPreviewColumn[];
+  rowCount: number;
+  columnCount: number;
+  sampleRows: string[][];
+  /** Formula cells with no cached result that landed in the selection. */
+  formulasWithoutCachedResults: number;
+  warnings: string[];
+}
+
+/** How an Excel export sizes its columns (mirrors Rust `ExcelColumnWidths`). */
+export type ExcelColumnWidths = "default" | "autofit" | "grid";
+
+/**
+ * Options controlling an Excel `.xlsx` export (mirrors the Rust
+ * `ExcelExportOptions`). Values only — never formulas.
+ */
+export interface ExcelExportOptions {
+  /** Bold + filled styling on the header row. */
+  headerStyle: boolean;
+  /** Freeze the header row so it stays visible while scrolling. */
+  freezeHeader: boolean;
+  /** Add an autofilter over the used range (header row required). */
+  autofilter: boolean;
+  columnWidths: ExcelColumnWidths;
+  /** Emit typed numbers/dates/booleans for schema-carrying columns. */
+  typed: boolean;
+  /** Backup policy for the previous destination file. */
+  backup: BackupPolicy;
+}
+
 /** Per-column invalid-cell total on a finished export (mirrors Rust
  * `ColumnWarning`). */
 export interface ColumnWarning {
@@ -1973,6 +2114,19 @@ export interface ColumnarExportReport {
   invalidCells: number;
   /** Per-column breakdown (only columns with at least one warning). */
   columnWarnings: ColumnWarning[];
+}
+
+/**
+ * One sheet of a (possibly multi-sheet) Excel export (mirrors the Rust
+ * `ExcelSheetExport`).
+ */
+export interface ExcelSheetExport {
+  docId: number;
+  name: string;
+  scope: ExportScope;
+  expectedRevision: number;
+  /** Per-output-column pixel widths (used only with `grid` column widths). */
+  gridWidthsPx?: number[] | null;
 }
 
 // ----- project workspaces (F37) ---------------------------------------------

@@ -487,6 +487,64 @@ impl Default for JsonExportOptions {
     }
 }
 
+/// How an Excel export sizes its columns (F34).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExcelColumnWidths {
+    /// Leave Excel's default column width.
+    #[default]
+    Default,
+    /// Autofit each column to its widest cell.
+    Autofit,
+    /// Use the caller's per-column grid widths (pixels).
+    Grid,
+}
+
+/// Options controlling an Excel `.xlsx` export (F34). Values only — never
+/// formulas. Typed emission consults the F31 schema; text stays text.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExcelExportOptions {
+    /// Bold + filled styling on the header row.
+    pub header_style: bool,
+    /// Freeze the header row so it stays visible while scrolling.
+    pub freeze_header: bool,
+    /// Add an autofilter over the used range (header row required).
+    pub autofilter: bool,
+    pub column_widths: ExcelColumnWidths,
+    /// Emit typed numbers/dates/booleans for schema-carrying columns.
+    pub typed: bool,
+    /// Backup policy for the previous destination file.
+    pub backup: BackupPolicy,
+}
+
+impl Default for ExcelExportOptions {
+    fn default() -> ExcelExportOptions {
+        ExcelExportOptions {
+            header_style: true,
+            freeze_header: true,
+            autofilter: false,
+            column_widths: ExcelColumnWidths::Default,
+            typed: true,
+            backup: BackupPolicy::default(),
+        }
+    }
+}
+
+/// One sheet of a (possibly multi-sheet) Excel export (F34): the document, the
+/// sheet name, the scope and the revision it was prepared against.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExcelSheetExport {
+    pub doc_id: u64,
+    pub name: String,
+    pub scope: ExportScope,
+    pub expected_revision: u64,
+    /// Per-output-column pixel widths (used only with `Grid` column widths).
+    #[serde(default)]
+    pub grid_widths_px: Option<Vec<f64>>,
+}
+
 /// One cell (or header) whose text cannot be represented in a target encoding.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
