@@ -10,6 +10,8 @@ import {
   isDraftDirty,
   layoutSections,
   parseGoto,
+  recordViewCurrent,
+  recordViewToken,
   removeGroup,
   saveBlocked,
   stepRecord,
@@ -96,6 +98,63 @@ describe("visible-record navigation", () => {
     expect(parseGoto("abc", 10)).toBeNull();
     expect(parseGoto("3.5", 10)).toBeNull();
     expect(parseGoto("3", 0)).toBeNull(); // no records
+  });
+});
+
+// ----- stale-record guard (no wrong-row edit window) -------------------------
+
+describe("stale-record guard", () => {
+  // The form loads a record via an async fetch, so after the user moves the
+  // target (navigation, or a switch to another document/tab) the previously
+  // loaded view lingers until the new fetch resolves. `recordViewCurrent`
+  // compares the token the loaded view answered to against the live target;
+  // while it is false the form shows "Loading record…" and `commit` refuses to
+  // write, so an edit+save can never land on the record the form has left.
+  // These assertions model that window as a sequence — the "loading state"
+  // (form not current) is exactly `recordViewCurrent(...) === false`.
+
+  it("stays stale from a navigation until the matching fetch resolves", () => {
+    const doc = 1;
+    // Showing record 0: the loaded view answers doc 0, target is doc 0.
+    let loaded = recordViewToken(doc, 0);
+    expect(recordViewCurrent(loaded, recordViewToken(doc, 0))).toBe(true);
+
+    // User navigates to record 1. The target moves immediately, but the async
+    // fetch for row 1 has NOT resolved — the loaded view still answers row 0,
+    // so the form is NOT current: it shows loading and blocks the commit that
+    // would otherwise write the draft onto row 0 (the P1 bug).
+    expect(recordViewCurrent(loaded, recordViewToken(doc, 1))).toBe(false);
+
+    // The fetch for row 1 resolves and stamps its view → current again.
+    loaded = recordViewToken(doc, 1);
+    expect(recordViewCurrent(loaded, recordViewToken(doc, 1))).toBe(true);
+  });
+
+  it("treats a coincidental row match on another document/tab as stale", () => {
+    // The previous tab's view answered row 5 of docA; the form now points at
+    // row 5 of docB. The row indices (and, in the wild, the revisions) coincide,
+    // but keying the token on the DOCUMENT — not the revision — defeats the
+    // "revisions happen to match" trap the reviewer flagged: still not current.
+    const loaded = recordViewToken(1, 5);
+    expect(recordViewCurrent(loaded, recordViewToken(2, 5))).toBe(false);
+    // Only once document 2's own fetch resolves does the form become current.
+    expect(recordViewCurrent(recordViewToken(2, 5), recordViewToken(2, 5))).toBe(true);
+  });
+
+  it("is not current before the first fetch resolves or with no active document", () => {
+    // No view loaded yet (first open) → loading, never a stale-editable form.
+    expect(recordViewCurrent(null, recordViewToken(1, 0))).toBe(false);
+    // No active document (form target null) → not current.
+    expect(recordViewCurrent(recordViewToken(1, 0), null)).toBe(false);
+    expect(recordViewCurrent(null, null)).toBe(false);
+  });
+
+  it("builds an unambiguous token that never conflates two documents/rows", () => {
+    // Distinct (doc, row) pairs must never collide, or a stale view could look
+    // current. Neighbouring rows and lookalike ids stay distinct.
+    expect(recordViewToken(7, 1)).not.toBe(recordViewToken(7, 2));
+    expect(recordViewToken(1, 0)).not.toBe(recordViewToken(2, 0));
+    expect(recordViewToken(7, 3)).toBe(recordViewToken(7, 3));
   });
 });
 

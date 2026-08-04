@@ -32,7 +32,10 @@
 //! literal backslash as `\\`, so `{"a.b": 1}` and `{"a": {"b": 2}}` yield
 //! the distinct columns `a\.b` and `a.b`. [`split_path`] reverses the
 //! escaping (the export stage rebuilds nested objects from it). Duplicate
-//! keys within one JSON object follow last-wins (matching serde_json/JS).
+//! keys within one JSON object follow last-wins (matching serde_json/JS) —
+//! both when flattening a record and when a duplicated key lies on a JSON
+//! Pointer's navigation path (the streaming resolver descends into the last
+//! occurrence; see [`plan_last_wins`]).
 //!
 //! **Missing vs explicit null.** A missing property is NOT the same thing
 //! as `"key": null`, and the distinction survives into the document through
@@ -660,6 +663,12 @@ struct SinkState<'a> {
 /// array's elements one at a time into the sink.
 struct PointerSeed<'a, 'b> {
     rest: &'b [String],
+    /// Which occurrence of each pointer segment to descend into, parallel to
+    /// `rest`. Object levels use it to honour duplicate-key last-wins (see
+    /// [`plan_last_wins`]); array levels ignore it (indices are unique). A
+    /// missing/short entry defaults to the first match, so an empty plan
+    /// reproduces the plain first-seen walk.
+    plan: &'b [usize],
     state: &'b mut SinkState<'a>,
 }
 
@@ -709,6 +718,7 @@ impl<'de> Visitor<'de> for PointerSeed<'_, '_> {
                 let st = state.take().expect("index matched once");
                 match seq.next_element_seed(PointerSeed {
                     rest: &self.rest[1..],
+                    plan: self.plan.get(1..).unwrap_or(&[]),
                     state: st,
                 })? {
                     Some(()) => matched = true,
@@ -734,16 +744,30 @@ impl<'de> Visitor<'de> for PointerSeed<'_, '_> {
                 "the JSON Pointer target is an object, not an array of records",
             ));
         };
+        // Duplicate object keys are last-wins here (matching serde_json/JS and
+        // the flattening path): descend into the `target`-th matching key,
+        // which pass 1 ([`plan_last_wins`]) resolved to the final occurrence.
+        // `target` defaults to 0 (first match) when the plan is absent, so a
+        // unique key behaves exactly as before.
+        let target = self.plan.first().copied().unwrap_or(0);
+        let plan_rest = self.plan.get(1..).unwrap_or(&[]);
         let mut state = Some(self.state);
         let mut matched = false;
+        let mut match_idx = 0usize;
         while let Some(key) = map.next_key::<String>()? {
-            if !matched && key == *seg {
-                let st = state.take().expect("key matched once");
-                map.next_value_seed(PointerSeed {
-                    rest: &self.rest[1..],
-                    state: st,
-                })?;
-                matched = true;
+            if key == *seg {
+                if !matched && match_idx == target {
+                    let st = state.take().expect("key matched once");
+                    map.next_value_seed(PointerSeed {
+                        rest: &self.rest[1..],
+                        plan: plan_rest,
+                        state: st,
+                    })?;
+                    matched = true;
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+                match_idx += 1;
             } else {
                 map.next_value::<IgnoredAny>()?;
             }
@@ -755,6 +779,99 @@ impl<'de> Visitor<'de> for PointerSeed<'_, '_> {
                 "JSON Pointer segment '{seg}' was not found"
             )))
         }
+    }
+}
+
+/// Pass 1 of the pointer resolver: walk the SAME path as [`PointerSeed`] but
+/// materialise nothing (every value is skipped with `IgnoredAny`), returning,
+/// for each object segment, the index of the LAST key that matches it. Pass 2
+/// then descends into that occurrence, so duplicate keys on the pointer path
+/// resolve last-wins — the behaviour serde_json/JS expose and the flattening
+/// path already applies (`json_import.rs` module docs). Array segments contain
+/// no duplicates (indices are unique), so their plan slot is a placeholder.
+///
+/// The returned plan is parallel to the remaining segments. A path that fails
+/// to navigate (missing key, wrong type) simply yields a short/empty plan; the
+/// authoritative error is left to pass 2, which reports it exactly as before.
+struct PlanSeed<'b> {
+    rest: &'b [String],
+}
+
+impl<'de> DeserializeSeed<'de> for PlanSeed<'_> {
+    type Value = Vec<usize>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Vec<usize>, D::Error> {
+        if self.rest.is_empty() {
+            // The target itself (usually the record array): skip it wholesale,
+            // there is nothing deeper to plan.
+            IgnoredAny::deserialize(deserializer)?;
+            return Ok(Vec::new());
+        }
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for PlanSeed<'_> {
+    type Value = Vec<usize>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON container on the pointer path")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<usize>, A::Error> {
+        // rest is non-empty (the terminal is handled in `deserialize`).
+        let want: Option<u64> = self.rest[0].parse().ok();
+        let mut deeper: Option<Vec<usize>> = None;
+        let mut i = 0u64;
+        loop {
+            if want == Some(i) && deeper.is_none() {
+                match seq.next_element_seed(PlanSeed {
+                    rest: &self.rest[1..],
+                })? {
+                    Some(d) => deeper = Some(d),
+                    None => break,
+                }
+            } else if seq.next_element::<IgnoredAny>()?.is_none() {
+                break;
+            }
+            i += 1;
+        }
+        Ok(prepend_plan(0, deeper))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Vec<usize>, A::Error> {
+        let seg = &self.rest[0];
+        let mut deeper: Option<Vec<usize>> = None;
+        let mut matches = 0usize;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == *seg {
+                // Recurse into EVERY match but keep only the last one's deeper
+                // plan — that is what pass 2 will descend into.
+                deeper = Some(map.next_value_seed(PlanSeed {
+                    rest: &self.rest[1..],
+                })?);
+                matches += 1;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        // `matches - 1` is the last occurrence; if the key was absent, leave an
+        // empty plan and let pass 2 raise "segment was not found".
+        Ok(prepend_plan(matches.saturating_sub(1), deeper))
+    }
+}
+
+/// Combine one segment's occurrence index with the deeper plan (if the segment
+/// resolved), or return an empty plan when navigation stopped here.
+fn prepend_plan(here: usize, deeper: Option<Vec<usize>>) -> Vec<usize> {
+    match deeper {
+        Some(d) => {
+            let mut plan = Vec::with_capacity(1 + d.len());
+            plan.push(here);
+            plan.extend(d);
+            plan
+        }
+        None => Vec::new(),
     }
 }
 
@@ -804,6 +921,25 @@ impl Read for CountingReader<'_> {
     }
 }
 
+/// `Read` wrapper that observes cancellation but does NOT advance progress —
+/// used for the last-wins planning pass (see [`plan_last_wins`]) so the extra
+/// read stays cancellable without double-counting the job's progress bar.
+struct CancelReader<'a> {
+    inner: File,
+    ctx: Option<&'a JobCtx>,
+}
+
+impl Read for CancelReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(ctx) = self.ctx {
+            if ctx.is_cancelled() {
+                return Err(std::io::Error::other("cancelled"));
+            }
+        }
+        self.inner.read(buf)
+    }
+}
+
 /// Stream the record array at `segments` inside the JSON document at
 /// `path`, feeding each element to `f`. Returns the record count.
 /// Advance `file` past a leading UTF-8 BOM if present (leaving it at byte 0
@@ -825,12 +961,44 @@ fn skip_utf8_bom(file: &mut File) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Resolve, for every object segment on the pointer path, the index of its
+/// LAST matching key, so [`stream_doc`] descends into the last-wins occurrence
+/// when a key is duplicated. A cheap bounded pre-pass: it materialises nothing
+/// (records are skipped) and its cost is a single tokenising read. Any parse or
+/// navigation failure yields an empty plan — pass 2 then walks first-seen and
+/// reports the authoritative error, so this never changes success/error
+/// behaviour, only which duplicate occurrence wins.
+fn plan_last_wins(path: &Path, segments: &[String], ctx: Option<&JobCtx>) -> Vec<usize> {
+    let Ok(mut file) = File::open(path) else {
+        return Vec::new();
+    };
+    if skip_utf8_bom(&mut file).is_err() {
+        return Vec::new();
+    }
+    let reader = BufReader::with_capacity(64 * 1024, CancelReader { inner: file, ctx });
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    // Any parse/navigation failure → empty plan; pass 2 walks first-seen and
+    // raises the authoritative error, so behaviour is unchanged bar last-wins.
+    PlanSeed { rest: segments }
+        .deserialize(&mut de)
+        .unwrap_or_default()
+}
+
 fn stream_doc(
     path: &Path,
     segments: &[String],
     ctx: Option<&JobCtx>,
     f: &mut dyn FnMut(u64, Loc, JVal) -> AppResult<()>,
 ) -> AppResult<u64> {
+    // Pass 1: resolve duplicate keys on the pointer path to their LAST
+    // occurrence (serde_json/JS last-wins). Skipped for pointerless array
+    // documents — with no object navigation there are no duplicate keys to
+    // resolve, so the common array-of-records import keeps its single pass.
+    let plan = if segments.is_empty() {
+        Vec::new()
+    } else {
+        plan_last_wins(path, segments, ctx)
+    };
     let mut file = File::open(path)?;
     // A BOM-prefixed array/object document detects fine (detect_shape strips
     // it) but serde_json would choke on it; skip it before the streaming parse.
@@ -854,6 +1022,7 @@ fn stream_doc(
     };
     let result = PointerSeed {
         rest: segments,
+        plan: &plan,
         state: &mut state,
     }
     .deserialize(&mut de)
@@ -2432,6 +2601,58 @@ mod tests {
         let path = write(dir.path(), "d.json", doc.as_bytes());
         let err = err_of(import(&path, &options(), &dir.path().join("c"), 1, None));
         assert!(err.contains("JSON Pointer"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_pointer_key_resolves_last_wins() {
+        // Two `items` keys on the pointer path: a normal serde/JS parse exposes
+        // the LAST one, and the flattening path is last-wins too, so the
+        // streaming resolver must open the second array, not the first.
+        let mut opts = options();
+        opts.pointer = Some("/items".into());
+        let doc = r#"{"items": [{"a": 1}], "items": [{"a": 2}, {"a": 3}]}"#;
+
+        let scan = scan_str("dup.json", doc, &opts).unwrap();
+        assert_eq!(scan.preview.record_count, 2, "last array has two records");
+
+        let (_dir, imported) = import_str("dup.json", doc, &opts).unwrap();
+        assert_eq!(imported.headers(), &["a"]);
+        let rows = imported.rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec!["2".to_string()]);
+        assert_eq!(rows[1], vec!["3".to_string()]);
+    }
+
+    #[test]
+    fn duplicate_pointer_key_last_wins_at_intermediate_segment() {
+        // The duplicate is an intermediate segment (`data`); last-wins must
+        // descend into the final `data` and stream ITS `items`.
+        let mut opts = options();
+        opts.pointer = Some("/data/items".into());
+        let (_dir, imported) = import_str(
+            "dup2.json",
+            r#"{"data": {"items": [{"a": 1}]}, "data": {"items": [{"a": 9}]}}"#,
+            &opts,
+        )
+        .unwrap();
+        let rows = imported.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec!["9".to_string()]);
+    }
+
+    #[test]
+    fn duplicate_pointer_key_last_wins_beats_a_valid_earlier_match() {
+        // The last `items` is not an array of records; last-wins means the
+        // import fails (the final occurrence wins) rather than silently opening
+        // the earlier valid array.
+        let mut opts = options();
+        opts.pointer = Some("/items".into());
+        let err = err_of(scan_str(
+            "dup3.json",
+            r#"{"items": [{"a": 1}], "items": 7}"#,
+            &opts,
+        ));
+        assert!(err.contains("expected an array"), "{err}");
     }
 
     // ----- key union ----------------------------------------------------------

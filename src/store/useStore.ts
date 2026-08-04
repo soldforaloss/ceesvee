@@ -37,11 +37,12 @@ import {
   buildSources,
   buildTabsSection,
   buildViewsSection,
-  deriveProjectDirty,
   gatingWarnings,
+  nextProjectOpenStep,
   orderTabsForPlan,
   panelsFromLayout,
   pathKey,
+  projectDirty,
   projectSnapshot,
   restoreOpenRoute,
   type PanelLayout,
@@ -113,6 +114,7 @@ import type {
   ProjectMeta,
   ProjectOpenPreview,
   ProjectOpenPlan,
+  ProjectOpenPending,
   FileFingerprint,
   DictionaryField,
   DictionaryFormat,
@@ -1441,10 +1443,21 @@ interface Store {
   project: ProjectMeta | null;
   /** UI snapshot captured at the last save/open, for dirty derivation. */
   projectBaseline: ProjectSnapshot | null;
+  /**
+   * Whether project-backed annotations changed since the last project save/open.
+   * Annotations are not part of the {@link ProjectSnapshot} (they live in the
+   * backend registry and are captured into the project's `annotations` section
+   * on save), so an annotation edit is tracked with this explicit flag to keep
+   * `isProjectDirty()` honest — otherwise adding a note in a project would leave
+   * the project falsely clean and quit/discard would drop it.
+   */
+  projectAnnotationsDirty: boolean;
   /** The open-dialog preview awaiting per-source resolutions, if any. */
   projectOpen: ProjectOpenPreview | null;
   /** Per-source choices in the open dialog, by source id. */
   projectOpenChoices: Record<string, SourceChoice>;
+  /** An open being driven source-by-source; non-null while sources are opening. */
+  projectOpenPending: ProjectOpenPending | null;
   /** Sources whose saved views were gated on the last open (warn, never break). */
   projectWarnings: GatingWarning[];
   /** Whether the unsaved-project close confirmation is showing. */
@@ -1465,6 +1478,12 @@ interface Store {
   cancelProjectOpen: () => void;
   /** Apply the open with the current per-source choices. */
   applyProjectOpen: () => Promise<void>;
+  /**
+   * Drive the queued project open forward: open the next source, or finalize
+   * once none are deferred. Idempotent and re-entrancy-safe — the deferred-open
+   * completion/cancellation paths call it whenever a source settles (@internal).
+   */
+  advanceProjectOpen: () => void;
   /** Open every present source and leave missing/moved ones out. */
   projectOpenAvailableOnly: () => Promise<void>;
   /** Capture live sections and save the project (prompting for a path if new). */
@@ -1695,13 +1714,6 @@ function applyThemeClass(theme: ThemePref) {
 
 export const useStore = create<Store>((set, get) => {
   // ----- internal helpers -------------------------------------------------
-
-  // True only while a project open is applying its plan (F40). During that
-  // window the per-source sidecar must never be read — the project's own
-  // `annotations` section is authoritative — but `get().project` is not set
-  // until the plan finishes, so this flag bridges the gap for the fire-and-
-  // forget sidecar hydration that `openPath` kicks off mid-plan.
-  let openingProject = false;
 
   const activeMeta = (): DocumentMeta | null => {
     const { tabs, activeId } = get();
@@ -2091,15 +2103,19 @@ export const useStore = create<Store>((set, get) => {
    * The two backing stores are mutually exclusive per the spec's migration
    * rule: when a PROJECT is open the annotations live in the project's
    * `annotations` section (captured into the ProjectStore on the next project
-   * save, exactly like tabs/layout/views — never in the sidecar), so this is a
-   * no-op. With no project open the durable store is the source's
-   * `.ceesvee-notes.json` sidecar; an empty store deletes it (the backend
-   * handles that). A path-less document (new/derived) has nowhere to write, so
-   * this is a no-op there too. Write failures are swallowed — they surface on
-   * the next explicit save/export instead of interrupting an annotation edit.
+   * save, exactly like tabs/layout/views — never in the sidecar), so instead of
+   * writing a sidecar we mark the project dirty, so quit/close prompts to save
+   * the edit rather than dropping it. With no project open the durable store is
+   * the source's `.ceesvee-notes.json` sidecar; an empty store deletes it (the
+   * backend handles that). A path-less document (new/derived) has nowhere to
+   * write, so this is a no-op there too. Write failures are swallowed — they
+   * surface on the next explicit save/export instead of interrupting an edit.
    */
   const persistAnnotationSidecar = (docId: number, path: string | null) => {
-    if (get().project) return;
+    if (get().project) {
+      if (!get().projectAnnotationsDirty) set({ projectAnnotationsDirty: true });
+      return;
+    }
     if (!path) return;
     void api.annotationsSaveSidecar(docId, path).catch(() => undefined);
   };
@@ -2123,7 +2139,11 @@ export const useStore = create<Store>((set, get) => {
     const finished = finishedEarly.get(jobId);
     if (finished) {
       finishedEarly.delete(jobId);
-      void get().handleJobFinished(finished);
+      // Resume a queued project open once the (possibly tab-adding) handler has
+      // run — mirrors the live job-finished dispatch in App.tsx.
+      void get()
+        .handleJobFinished(finished)
+        .finally(() => get().advanceProjectOpen());
     }
   };
 
@@ -2272,8 +2292,7 @@ export const useStore = create<Store>((set, get) => {
    * that would replace it (new / open). Returns whether to proceed.
    */
   const guardDiscardProject = async (): Promise<boolean> => {
-    const s = get();
-    if (!s.project || !deriveProjectDirty(s.projectBaseline, currentProjectSnapshot())) return true;
+    if (!get().isProjectDirty()) return true;
     return ask("Discard unsaved changes to the current project?", {
       title: "Discard project changes",
       kind: "warning",
@@ -2329,33 +2348,18 @@ export const useStore = create<Store>((set, get) => {
     await api.projectSetSection("annotations", annotations);
   };
 
+  /** Whether an open is currently paused on a user/job decision (F10/F17/F33). */
+  const openIsDeferred = (s: Store): boolean =>
+    s.openDecision != null || s.archivePick != null || s.jsonImport != null || s.indexing != null;
+
   /**
-   * Drive an open plan: open each referenced document through the ordinary
-   * open pipeline, restore tab order/panel layout, reapply EVERY opened
-   * source's saved view (not just the active tab's) when the gating allows,
-   * then end focused on the saved active tab. NEVER runs recipes, queries,
-   * joins, comparisons or exports.
+   * Finalize a fully-opened project: restore tab order/panel layout, reapply
+   * EVERY opened source's saved view (not just the active tab's) when the gating
+   * allows, end focused on the saved active tab, then capture the baseline. Runs
+   * only once the queue has drained so the baseline reflects every tab (never
+   * dirtying the just-opened project). NEVER runs recipes/queries/joins/exports.
    */
-  const applyProjectPlan = async (plan: ProjectOpenPlan) => {
-    // Suppress the per-source sidecar hydration `openPath` fires while the plan
-    // is applying — the project's `annotations` section (loaded below) wins.
-    openingProject = true;
-    try {
-      for (const entry of plan.entries) {
-        // A restore is non-interactive: a columnar (Parquet / Arrow) source
-        // must NOT route through the interactive inspect dialog `openPath`
-        // would open — that returns without creating a tab, leaving the
-        // restored source missing until the user manually confirmed it. Reopen
-        // it directly as an indexed read-only document instead (F37).
-        if (restoreOpenRoute(entry.path) === "columnarIndexed") {
-          await get().openColumnarRestore(entry.path);
-        } else {
-          await get().openPath(entry.path);
-        }
-      }
-    } finally {
-      openingProject = false;
-    }
+  const finalizeProjectOpen = async (plan: ProjectOpenPlan) => {
     // Restore saved tab order (project docs first, extras appended).
     set((s) => {
       const order = orderTabsForPlan(s.tabs, plan.entries);
@@ -2391,11 +2395,10 @@ export const useStore = create<Store>((set, get) => {
     }
 
     // Reapply each opened source's saved view against ITS OWN document. A
-    // source still pending a large-file decision or archive extraction has no
-    // tab yet — skip it rather than applying its view to whatever document is
-    // active. applyNamedView targets the active document, so switch to each
-    // source's tab first; the saved active tab is done LAST so the session ends
-    // focused on it.
+    // source left out or that failed to open has no tab — skip it rather than
+    // applying its view to whatever document is active. applyNamedView targets
+    // the active document, so switch to each source's tab first; the saved
+    // active tab is done LAST so the session ends focused on it.
     const reapplyOrder = [
       ...plan.entries.filter((e) => e.sourceId !== plan.activeTab),
       ...plan.entries.filter((e) => e.sourceId === plan.activeTab),
@@ -2419,13 +2422,70 @@ export const useStore = create<Store>((set, get) => {
     set({
       project: plan.meta,
       projectBaseline: currentProjectSnapshot(),
+      projectAnnotationsDirty: false,
       projectWarnings: gatingWarnings(plan.entries),
-      projectOpen: null,
-      projectOpenChoices: {},
+      projectOpenPending: null,
     });
     // Refresh the annotations surface for the now-active document from the
     // registry the project section just populated.
     void get().loadAnnotations();
+  };
+
+  // Only one queue pump runs at a time; the deferred-open completion paths
+  // re-invoke the pump when a source settles, and any re-entrant call while it
+  // is mid-flight (awaiting an openPath) must be ignored.
+  let pumpingProjectOpen = false;
+
+  /**
+   * Drive a queued project open one source at a time through the ordinary open
+   * pipeline. A source that routes through a deferred flow (large-file decision,
+   * archive extraction, JSON import) pauses the queue — opening the next source
+   * would overwrite the single pending decision — until it settles, at which
+   * point its completion/cancellation path calls `advanceProjectOpen` to resume.
+   * Finalizes once nothing is left and nothing is deferred.
+   */
+  const pumpProjectOpen = async () => {
+    if (pumpingProjectOpen) return;
+    pumpingProjectOpen = true;
+    try {
+      for (;;) {
+        const pending = get().projectOpenPending;
+        if (!pending) return;
+        const step = nextProjectOpenStep(pending.remaining, openIsDeferred(get()));
+        if (step.kind === "wait") return;
+        if (step.kind === "finalize") {
+          await finalizeProjectOpen(pending.plan);
+          return;
+        }
+        set({ projectOpenPending: { plan: pending.plan, remaining: step.remaining } });
+        // A restore is non-interactive: a columnar (Parquet / Arrow) source
+        // must NOT route through the interactive inspect dialog `openPath`
+        // would open — that returns without creating a tab, leaving the
+        // restored source missing until the user manually confirmed it. Reopen
+        // it directly as an indexed read-only document instead (F37).
+        if (restoreOpenRoute(step.path) === "columnarIndexed") {
+          await get().openColumnarRestore(step.path);
+        } else {
+          await get().openPath(step.path);
+        }
+      }
+    } finally {
+      pumpingProjectOpen = false;
+    }
+  };
+
+  /**
+   * Begin driving an open plan. Closes the open dialog immediately and queues
+   * every referenced source; `pumpProjectOpen` opens them (finalizing the
+   * baseline/warnings only once all have settled).
+   */
+  const applyProjectPlan = async (plan: ProjectOpenPlan) => {
+    set({
+      projectOpen: null,
+      projectOpenChoices: {},
+      projectOpenPending: { plan, remaining: plan.entries.map((e) => e.path) },
+    });
+    await pumpProjectOpen();
   };
 
   return {
@@ -2508,8 +2568,10 @@ export const useStore = create<Store>((set, get) => {
     quitPromptOpen: false,
     project: null,
     projectBaseline: null,
+    projectAnnotationsDirty: false,
     projectOpen: null,
     projectOpenChoices: {},
+    projectOpenPending: null,
     projectWarnings: [],
     projectClosePromptOpen: false,
     exportPreferredScope: null,
@@ -3046,6 +3108,10 @@ export const useStore = create<Store>((set, get) => {
           .catch(() => undefined);
       } catch (e) {
         set({ error: String(e), busy: false });
+      } finally {
+        // The in-memory tab is now open (or failed): resume a queued project
+        // open paused on this large-file decision.
+        void pumpProjectOpen();
       }
     },
 
@@ -3085,6 +3151,10 @@ export const useStore = create<Store>((set, get) => {
         consumeEarlyFinish(started.jobId);
       } catch (e) {
         set({ error: String(e) });
+      } finally {
+        // On success the indexing job now owns the open (its completion resumes
+        // the queue); if starting it threw, resume here so the queue isn't stuck.
+        void pumpProjectOpen();
       }
     },
 
@@ -3092,6 +3162,8 @@ export const useStore = create<Store>((set, get) => {
       const token = get().openDecision?.archiveToken;
       if (token != null) void api.discardArchive(token).catch(() => undefined);
       set({ openDecision: null });
+      // The paused source was skipped; move a queued project open along.
+      void pumpProjectOpen();
     },
 
     convertActiveToEditable: async (force) => {
@@ -4058,12 +4130,14 @@ export const useStore = create<Store>((set, get) => {
 
     hydrateAnnotationsFromSidecar: async (docId, sourcePath) => {
       try {
-        // With a project open (or one mid-open), the project's `annotations`
-        // section is authoritative — never let the per-source sidecar clobber
-        // it (F40 migration rule: the project absorbs the sidecar on save).
-        // Fall back to a plain registry view so the grid indicators still
-        // refresh without reading — or overwriting — the sidecar.
-        const useSidecar = !!sourcePath && !openingProject && !get().project;
+        // With a project open (or one mid-open — `projectOpenPending` spans the
+        // whole queued open, including deferred pauses), the project's
+        // `annotations` section is authoritative — never let the per-source
+        // sidecar clobber it (F40 migration rule: the project absorbs the
+        // sidecar on save). Fall back to a plain registry view so the grid
+        // indicators still refresh without reading — or overwriting — the
+        // sidecar.
+        const useSidecar = !!sourcePath && !get().projectOpenPending && !get().project;
         const view = useSidecar
           ? await api.annotationsLoadSidecar(docId, sourcePath as string)
           : await api.annotationsView(docId);
@@ -4340,9 +4414,16 @@ export const useStore = create<Store>((set, get) => {
       if (!pick) return;
       set({ archivePick: null });
       await get().startArchiveExtract(pick.path, entry, false);
+      // On success the extraction job now owns the open; if it failed to start,
+      // resume so a queued project open isn't stuck on the dismissed picker.
+      void pumpProjectOpen();
     },
 
-    dismissArchivePick: () => set({ archivePick: null }),
+    dismissArchivePick: () => {
+      set({ archivePick: null });
+      // The paused source was skipped; move a queued project open along.
+      void pumpProjectOpen();
+    },
 
     confirmArchiveLarge: async () => {
       const confirm = get().archiveLargeConfirm;
@@ -5643,7 +5724,8 @@ export const useStore = create<Store>((set, get) => {
     isProjectDirty: () => {
       const s = get();
       if (!s.project) return false;
-      return deriveProjectDirty(s.projectBaseline, currentProjectSnapshot());
+      if (s.projectAnnotationsDirty) return true;
+      return projectDirty(s.project.dirty, s.projectBaseline, currentProjectSnapshot());
     },
 
     projectNew: async (templatePath) => {
@@ -5653,6 +5735,7 @@ export const useStore = create<Store>((set, get) => {
         set({
           project: meta,
           projectBaseline: currentProjectSnapshot(),
+          projectAnnotationsDirty: false,
           projectWarnings: [],
           projectOpen: null,
           projectOpenChoices: {},
@@ -5708,6 +5791,8 @@ export const useStore = create<Store>((set, get) => {
       }
     },
 
+    advanceProjectOpen: () => void pumpProjectOpen(),
+
     projectOpenAvailableOnly: async () => {
       const preview = get().projectOpen;
       if (!preview) return;
@@ -5731,7 +5816,11 @@ export const useStore = create<Store>((set, get) => {
         } else {
           meta = await api.projectSave();
         }
-        set({ project: meta, projectBaseline: currentProjectSnapshot() });
+        set({
+          project: meta,
+          projectBaseline: currentProjectSnapshot(),
+          projectAnnotationsDirty: false,
+        });
         return true;
       } catch (e) {
         set({ error: String(e) });
@@ -5765,6 +5854,7 @@ export const useStore = create<Store>((set, get) => {
       set({
         project: null,
         projectBaseline: null,
+        projectAnnotationsDirty: false,
         projectWarnings: [],
         projectClosePromptOpen: false,
         projectOpen: null,
@@ -5962,6 +6052,8 @@ export const useStore = create<Store>((set, get) => {
       const jobId = get().jsonImport?.scanJobId;
       if (jobId != null) void api.cancelJob(jobId).catch(() => undefined);
       set({ jsonImport: null });
+      // The paused source was skipped; move a queued project open along.
+      void pumpProjectOpen();
     },
 
     // ----- local database browser (F35) ------------------------------------------
@@ -6910,19 +7002,23 @@ export function useActiveMeta(): DocumentMeta | null {
 
 /**
  * Whether the open project has unsaved changes (F37). Derived reactively from
- * the open documents, active tab, panel layout and each document's active named
- * view versus the snapshot captured at the last save/open, so the dirty dot
- * updates without event bookkeeping.
+ * the open documents, active tab, panel layout, each document's active named
+ * view and the annotations-dirty flag versus the snapshot captured at the last
+ * save/open, OR'd with the backend's own dirty flag (a relink/removal applied
+ * while opening is already unsaved even though the snapshot matches its
+ * just-captured baseline), so the dirty dot updates without event bookkeeping.
  */
 export function useProjectDirty(): boolean {
   return useStore((s) => {
     if (s.project == null) return false;
+    if (s.projectAnnotationsDirty) return true;
     const activeViews: Record<number, string | null> = {};
     for (const t of s.tabs) {
       activeViews[t.id] =
         t.id === s.activeId ? s.activeViewId : (s.uiStates[t.id]?.activeViewId ?? null);
     }
-    return deriveProjectDirty(
+    return projectDirty(
+      s.project.dirty,
       s.projectBaseline,
       projectSnapshot(
         s.tabs,
