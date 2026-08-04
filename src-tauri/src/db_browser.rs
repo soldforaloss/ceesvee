@@ -811,14 +811,27 @@ pub(crate) fn import_table(
         safe_query::install_cancel_handler(&conn, ctx.cancel_token())?;
         ctx.check()?;
     }
-    let (name, kind) = resolve_object(&conn, object)?;
+
+    // Pin ONE database snapshot for the whole import. The memory gate below
+    // (exact count + sampled row cost) and the streaming copy that follows it
+    // must observe the same database state: if a concurrent writer changed the
+    // table in between, the copy could materialise far more data than the gate
+    // authorized — bypassing the memory threshold — or copy rows from a
+    // different snapshot than the schema and count the gate reported. A
+    // deferred read transaction takes its snapshot at the first read below and
+    // holds it until the copy finishes (a SHARED lock in rollback-journal mode
+    // so writers block; a stable read view in WAL mode). The authorizer allows
+    // transaction control on the read-only handle (see `safe_query::authorize`).
+    let tx = conn.unchecked_transaction()?;
+
+    let (name, kind) = resolve_object(&tx, object)?;
     let from = quote_ident(&name);
 
     // Columns + declared types.
     let mut headers: Vec<String> = Vec::new();
     let mut decls: Vec<String> = Vec::new();
     {
-        let mut stmt = conn.prepare("SELECT name, type FROM pragma_table_info(?1) ORDER BY cid")?;
+        let mut stmt = tx.prepare("SELECT name, type FROM pragma_table_info(?1) ORDER BY cid")?;
         let mut rows = stmt.query([&name])?;
         while let Some(row) = rows.next()? {
             headers.push(row.get(0)?);
@@ -833,13 +846,15 @@ pub(crate) fn import_table(
     let n_cols = headers.len();
 
     // Memory gate: exact row count (cancellable) + sampled average row cost.
-    let n_rows: u64 = conn.query_row(&format!("SELECT COUNT(*) FROM {from}"), [], |r| {
+    // Both reads run inside `tx`, so they and the streaming copy below see the
+    // one pinned snapshot.
+    let n_rows: u64 = tx.query_row(&format!("SELECT COUNT(*) FROM {from}"), [], |r| {
         r.get::<_, i64>(0)
     })? as u64;
     let mut sample_bytes = 0u64;
     let mut sampled = 0u64;
     {
-        let mut stmt = conn.prepare(&format!("SELECT * FROM {from} LIMIT {IMPORT_SAMPLE_ROWS}"))?;
+        let mut stmt = tx.prepare(&format!("SELECT * FROM {from} LIMIT {IMPORT_SAMPLE_ROWS}"))?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             for i in 0..n_cols {
@@ -871,7 +886,7 @@ pub(crate) fn import_table(
     // Stream every row. Ordinary tables order by rowid for a deterministic
     // result; WITHOUT ROWID tables iterate in primary-key order naturally,
     // and views have no rowid to order on.
-    let sql = if kind == "table" && !is_without_rowid(&conn, &name)? {
+    let sql = if kind == "table" && !is_without_rowid(&tx, &name)? {
         format!("SELECT * FROM {from} ORDER BY rowid")
     } else {
         format!("SELECT * FROM {from}")
@@ -879,7 +894,7 @@ pub(crate) fn import_table(
     let mut records: Vec<Vec<String>> = Vec::with_capacity(n_rows as usize + 1);
     records.push(headers.clone());
     {
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = tx.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         let mut count = 0u64;
         while let Some(row) = rows.next()? {
@@ -899,6 +914,9 @@ pub(crate) fn import_table(
     if let Some(ctx) = ctx {
         ctx.check()?;
     }
+    // The snapshot has served every row; end the read transaction (releasing
+    // the SHARED lock) before the in-memory document is assembled.
+    drop(tx);
 
     let parsed = ParsedFile {
         records,
@@ -1568,6 +1586,64 @@ mod tests {
         );
         let doc = import_table(&canonical, "customers", 9, 1, true, None).unwrap();
         assert_eq!(doc.n_rows(), 2, "force imports anyway");
+    }
+
+    #[test]
+    fn import_reads_one_consistent_snapshot_across_a_concurrent_write() {
+        // `import_table` runs its memory gate (exact count + sample) and its
+        // streaming copy inside ONE deferred read transaction, so both observe
+        // the same snapshot even if another connection commits in between —
+        // otherwise the copy could exceed the count the gate authorized, or mix
+        // rows from a different snapshot than the schema/count reported. This
+        // reproduces the exact sequence the import uses against a guarded
+        // read-only handle — open_guarded, unchecked_transaction, the COUNT,
+        // then a later read — and proves the later read stays pinned to the
+        // count-time snapshot despite an interleaved commit. WAL mode lets the
+        // writer commit while the reader stays pinned; rollback-journal mode
+        // gives the same guarantee by blocking the writer for the read's
+        // duration. If the shared transaction were dropped from `import_table`
+        // its two phases could straddle a write, which this locks out.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.sqlite");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO t VALUES (1, 'a'), (2, 'b');",
+            )
+            .unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+
+        let conn = safe_query::open_guarded(&canonical).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        // First read pins the snapshot (this is the import's COUNT phase).
+        let counted: i64 = tx
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(counted, 2);
+
+        // A concurrent writer commits two more rows mid-import.
+        writer
+            .execute_batch("INSERT INTO t VALUES (3, 'c'), (4, 'd');")
+            .unwrap();
+
+        // The import's later streaming read still sees the pinned snapshot: two
+        // rows, matching the count the memory gate authorized — not four.
+        let streamed: i64 = tx
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            streamed, 2,
+            "reads inside the import transaction stay on one snapshot"
+        );
+
+        // Ending the transaction, a fresh read observes the writer's rows.
+        drop(tx);
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 4);
     }
 
     #[test]

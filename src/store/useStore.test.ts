@@ -1,13 +1,19 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
   AnnotationsView,
+  DbExportPreview,
   DictionaryView,
   DocumentMeta,
   FacetConfig,
   FacetResultSet,
+  PlanEntry,
   ProjectMeta,
+  ProjectOpenPlan,
+  ProjectOpenPreview,
+  SourcePreviewEntry,
 } from "../types";
+import type { ExportForm } from "../lib/dbExport";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), save: vi.fn() }));
 vi.mock("@tauri-apps/api/window", () => ({
@@ -38,10 +44,14 @@ vi.mock("../lib/tauri", () => ({
   // F39 facets: apply drives the row view, compute returns cross-filtered counts.
   applyFacets: vi.fn(),
   computeFacets: vi.fn(),
+  // F35 database export preview.
+  dbExportPreview: vi.fn(),
+  projectOpenApply: vi.fn(),
+  projectGet: vi.fn(),
 }));
 
 import * as api from "../lib/tauri";
-import { INDEXED_FIND_LIMIT, useStore } from "./useStore";
+import { INDEXED_FIND_LIMIT, useStore, type DbExportState } from "./useStore";
 
 function meta(id: number, backing: DocumentMeta["backing"] = "editable"): DocumentMeta {
   return {
@@ -608,6 +618,8 @@ describe("annotation persistence: sidecar vs project (F40)", () => {
       tabs: [meta(1)],
       activeId: 1,
       project: null,
+      projectBaseline: null,
+      projectAnnotationsDirty: false,
       annotationsView: annView(0),
       error: null,
     });
@@ -629,6 +641,28 @@ describe("annotation persistence: sidecar vs project (F40)", () => {
     // but the per-source sidecar is never written — the two are exclusive.
     expect(api.annotationsEditRow).toHaveBeenCalled();
     expect(api.annotationsSaveSidecar).not.toHaveBeenCalled();
+  });
+
+  it("marks the project dirty on an edit when a project IS open", async () => {
+    useStore.setState({ project: project() });
+    // A freshly opened/saved project is clean.
+    expect(useStore.getState().isProjectDirty()).toBe(false);
+
+    const ok = await useStore.getState().applyRowMarks([0], { star: true });
+    expect(ok).toBe(true);
+
+    // Project-backed annotations live outside the project snapshot, so the edit
+    // must flip the explicit dirty flag — otherwise quit/close would drop it.
+    expect(api.annotationsSaveSidecar).not.toHaveBeenCalled();
+    expect(useStore.getState().projectAnnotationsDirty).toBe(true);
+    expect(useStore.getState().isProjectDirty()).toBe(true);
+  });
+
+  it("does not mark a project dirty for a sidecar (no-project) edit", async () => {
+    const ok = await useStore.getState().applyRowMarks([0], { star: true });
+    expect(ok).toBe(true);
+    expect(api.annotationsSaveSidecar).toHaveBeenCalled();
+    expect(useStore.getState().projectAnnotationsDirty).toBe(false);
   });
 
   it("hydrates the sidecar when an INDEXED open finishes", async () => {
@@ -772,5 +806,244 @@ describe("facet sync stale-response guard (F39)", () => {
     expect(useStore.getState().tabs[0].revision).toBe(2); // A did not clobber
     expect(useStore.getState().facets.results).toEqual(resultsB); // still B
     expect(api.computeFacets).toHaveBeenCalledTimes(1); // A bailed before compute
+  });
+});
+
+describe("database export preview invalidation (F35)", () => {
+  const exportForm = (over: Partial<ExportForm> = {}): ExportForm => ({
+    path: "/tmp/out.sqlite",
+    table: "customers",
+    mode: "create",
+    conflictPolicy: "abort",
+    confirmReplace: false,
+    overrides: {},
+    ...over,
+  });
+
+  const preview = (over: Partial<DbExportPreview> = {}): DbExportPreview => ({
+    revision: 3,
+    tableExists: false,
+    targetRows: null,
+    columns: [],
+    blocking: [],
+    failures: [],
+    failureCount: 0,
+    rowsScanned: 10,
+    scanComplete: true,
+    ...over,
+  });
+
+  const exportState = (over: Partial<DbExportState> = {}): DbExportState => ({
+    docId: 1,
+    docName: "doc-1.csv",
+    form: exportForm(),
+    preview: null,
+    previewLoading: false,
+    previewError: null,
+    jobId: null,
+    processed: 0,
+    total: null,
+    result: null,
+    error: null,
+    ...over,
+  });
+
+  beforeEach(() => {
+    vi.mocked(api.dbExportPreview).mockReset();
+    useStore.setState({ dbExport: exportState() });
+  });
+
+  afterEach(() => {
+    // Clears the debounce timer patchDbExportForm scheduled so it can never
+    // fire into a later test.
+    useStore.getState().closeDbExport();
+  });
+
+  it("clears an existing preview synchronously so Export cannot run against a changed form", () => {
+    // A clean preview is present (Export would be enabled)…
+    useStore.setState({ dbExport: exportState({ preview: preview() }) });
+    expect(useStore.getState().dbExport?.preview).not.toBeNull();
+
+    // …changing the form drops it immediately, before any new preview runs.
+    useStore.getState().patchDbExportForm({ table: "renamed" });
+    const st = useStore.getState().dbExport;
+    expect(st?.preview).toBeNull();
+    expect(st?.previewLoading).toBe(true);
+    expect(st?.form.table).toBe("renamed");
+    // The old, resolved-but-now-stale response never gets a chance to run.
+    expect(api.dbExportPreview).not.toHaveBeenCalled();
+  });
+
+  it("ignores an in-flight preview response that resolves after the form changed", async () => {
+    // Hold the preview invoke open so we can change the form while it is in
+    // flight and only then let it resolve.
+    const deferred: { resolve: (p: DbExportPreview) => void } = { resolve: () => {} };
+    vi.mocked(api.dbExportPreview).mockImplementationOnce(
+      () =>
+        new Promise<DbExportPreview>((resolve) => {
+          deferred.resolve = resolve;
+        }),
+    );
+
+    const pending = useStore.getState().previewDbExport();
+    expect(api.dbExportPreview).toHaveBeenCalledTimes(1);
+
+    // The form changes while that first invoke is still pending.
+    useStore.getState().patchDbExportForm({ table: "renamed" });
+
+    // The stale invoke now resolves with a preview computed for the OLD form.
+    deferred.resolve(preview({ revision: 99 }));
+    await pending;
+
+    // It must NOT be applied: the token bumped when the form changed, so the
+    // preview stays cleared and Export stays disabled until the fresh preview
+    // for the new form lands.
+    const st = useStore.getState().dbExport;
+    expect(st?.preview).toBeNull();
+    expect(st?.form.table).toBe("renamed");
+  });
+});
+
+describe("project open queue + dirtiness (F37)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useStore.setState({
+      tabs: [],
+      activeId: null,
+      uiStates: {},
+      settings: { version: 1, profiles: [] },
+      openDecision: null,
+      indexing: null,
+      archivePick: null,
+      jsonImport: null,
+      busy: false,
+      error: null,
+      diagnosticsOpen: false,
+      changesOpen: false,
+      project: null,
+      projectBaseline: null,
+      projectOpen: null,
+      projectOpenChoices: {},
+      projectOpenPending: null,
+      projectWarnings: [],
+    });
+  });
+
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  const estimate = (needsDecision: boolean) => ({
+    fileSize: 2_000_000_000,
+    estimatedRows: 20_000_000,
+    estimatedMemory: 6_000_000_000,
+    needsDecision,
+    encoding: "UTF-8",
+  });
+
+  const pmeta = (dirty: boolean): ProjectMeta => ({
+    path: "C:/proj.ceesveeproj",
+    name: "proj",
+    dirty,
+    revision: dirty ? 1 : 0,
+    formatVersion: "1",
+    appVersion: "0.4.0",
+  });
+
+  const planEntry = (sourceId: string, path: string): PlanEntry => ({
+    sourceId,
+    path,
+    displayName: null,
+    open: {},
+    status: "ok",
+    reapplyViews: false,
+    viewWarnings: [],
+    views: [],
+    activeViewId: null,
+  });
+
+  const previewEntry = (sourceId: string, resolvedPath: string): SourcePreviewEntry => ({
+    sourceId,
+    displayName: null,
+    resolvedPath,
+    status: "ok",
+    storedFingerprint: null,
+    diskFingerprint: null,
+    movedCandidate: null,
+    reapplyViews: true,
+    warnings: [],
+  });
+
+  const preview = (sources: SourcePreviewEntry[]): ProjectOpenPreview => ({
+    path: "C:/proj.ceesveeproj",
+    formatVersion: "1",
+    appVersion: "0.4.0",
+    sources,
+    tabOrder: sources.map((e) => e.sourceId),
+    activeTab: sources[0]?.sourceId ?? null,
+  });
+
+  const plan = (dirty: boolean, entries: PlanEntry[]): ProjectOpenPlan => ({
+    meta: pmeta(dirty),
+    entries,
+    tabOrder: entries.map((e) => e.sourceId),
+    activeTab: entries[0]?.sourceId ?? null,
+    removedSourceIds: [],
+    skippedSourceIds: [],
+  });
+
+  it("queues a large-file source and finalizes only after the decision resolves", async () => {
+    const small = "C:/data/doc-1.csv";
+    const large = "C:/data/doc-2.csv";
+    vi.mocked(api.projectOpenApply).mockResolvedValue(
+      plan(false, [planEntry("s1", small), planEntry("s2", large)]),
+    );
+    vi.mocked(api.probeOpen).mockImplementation(async (p: string) => estimate(p.includes("doc-2")));
+    vi.mocked(api.openFile).mockImplementation(async (p: string) =>
+      p.includes("doc-2") ? meta(2) : meta(1),
+    );
+    vi.mocked(api.projectGet).mockResolvedValue({ meta: pmeta(false), sections: { layout: null } });
+
+    useStore.setState({
+      projectOpen: preview([previewEntry("s1", small), previewEntry("s2", large)]),
+    });
+    await useStore.getState().applyProjectOpen();
+
+    // Paused on the large-file decision: only the small tab is open, and the
+    // project is NOT yet finalized (no baseline captured that omits the big tab).
+    let s = useStore.getState();
+    expect(s.openDecision?.path).toBe(large);
+    expect(s.projectOpenPending).not.toBeNull();
+    expect(s.project).toBeNull();
+    expect(s.tabs.map((t) => t.id)).toEqual([1]);
+
+    // Confirming the decision opens the second tab, then the queue drains and
+    // finalizes — leaving the just-opened project clean (not immediately dirty).
+    await useStore.getState().confirmOpenEditable();
+    await flush();
+
+    s = useStore.getState();
+    expect(s.openDecision).toBeNull();
+    expect(s.projectOpenPending).toBeNull();
+    expect(s.tabs.map((t) => t.id)).toEqual([1, 2]);
+    expect(s.project?.name).toBe("proj");
+    expect(s.isProjectDirty()).toBe(false);
+  });
+
+  it("honors the backend dirty flag from a relink/removal applied during open", async () => {
+    const only = "C:/data/doc-1.csv";
+    vi.mocked(api.projectOpenApply).mockResolvedValue(plan(true, [planEntry("s1", only)]));
+    vi.mocked(api.probeOpen).mockResolvedValue(estimate(false));
+    vi.mocked(api.openFile).mockResolvedValue(meta(1));
+    vi.mocked(api.projectGet).mockResolvedValue({ meta: pmeta(true), sections: { layout: null } });
+
+    useStore.setState({ projectOpen: preview([previewEntry("s1", only)]) });
+    await useStore.getState().applyProjectOpen();
+
+    const s = useStore.getState();
+    // No deferral → finalized immediately, snapshot equals its fresh baseline.
+    expect(s.projectOpenPending).toBeNull();
+    expect(s.project?.dirty).toBe(true);
+    // ...yet the project reports dirty because the backend holds the unsaved
+    // relink/removal (which the snapshot comparison alone cannot see).
+    expect(s.isProjectDirty()).toBe(true);
   });
 });
