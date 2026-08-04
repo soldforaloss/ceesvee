@@ -248,13 +248,18 @@ impl SummaryAccumulator {
     }
 }
 
-/// How a document's rows are stored (F10).
+/// How a document's rows are stored (F10, F32).
 pub enum Backing {
     /// Fully materialised and mutable (the default).
     Memory,
     /// Streaming, read-only access through a record index; `rows` stays
     /// empty and every mutation fails with [`AppError::ReadOnly`].
     Indexed(IndexHandle),
+    /// Read-only windowed access over a columnar file (F32: Parquet / Arrow
+    /// IPC). Like `Indexed`, `rows` stays empty and mutations fail; the text
+    /// plane renders columnar NULL as an empty cell while the handle keeps
+    /// the null-vs-empty distinction for export and conversion.
+    Columnar(crate::parquet_arrow::ColumnarHandle),
 }
 
 /// An open document.
@@ -543,6 +548,68 @@ impl Document {
         }
     }
 
+    /// Build a read-only document over an open columnar file (F32:
+    /// Parquet / Arrow IPC). Headers are the flattened path-based column
+    /// names (always real names — never synthetic), and the generated F31
+    /// schemas are attached keyed by the positional column IDs.
+    pub fn from_columnar(
+        id: u64,
+        path: Option<PathBuf>,
+        columnar: crate::parquet_arrow::ColumnarFile,
+    ) -> Document {
+        let crate::parquet_arrow::ColumnarFile {
+            handle,
+            headers,
+            schemas,
+        } = columnar;
+        let n_cols = headers.len();
+        let column_ids = positional_column_ids(n_cols);
+        let mut schema = crate::schema::DocumentSchema::default();
+        for (i, mut col_schema) in schemas.into_iter().enumerate() {
+            col_schema.column_id = column_ids[i].clone();
+            schema.set_column(col_schema);
+        }
+        Document {
+            id,
+            path,
+            headers,
+            rows: Vec::new(),
+            has_header_row: true,
+            delimiter: b',',
+            encoding_name: "UTF-8".to_string(),
+            had_bom: false,
+            line_ending: LineEnding::Lf,
+            dirty_cells: HashSet::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            undo_meta: Vec::new(),
+            redo_meta: Vec::new(),
+            next_op_id: 0,
+            journal: None,
+            follow: false,
+            follow_range_from: None,
+            saved_marker: 0,
+            column_ids,
+            next_column_id: n_cols as u64,
+            filter_rows: None,
+            view_sort: Vec::new(),
+            filter_view: None,
+            revision: 1,
+            col_revisions: vec![1; n_cols],
+            filter_revision: 1,
+            import_info: ImportInfo::default(),
+            fingerprint: None,
+            schema,
+            schema_revision: 0,
+            schema_issues: Vec::new(),
+            dictionary: crate::dictionary::Dictionary::default(),
+            dictionary_revision: 0,
+            backing: Backing::Columnar(handle),
+            archive: None,
+            archive_guard: None,
+        }
+    }
+
     // ----- accessors -------------------------------------------------------
 
     pub fn n_cols(&self) -> usize {
@@ -553,6 +620,7 @@ impl Document {
         match &self.backing {
             Backing::Memory => self.rows.len(),
             Backing::Indexed(handle) => handle.n_data_records(),
+            Backing::Columnar(handle) => handle.n_rows(),
         }
     }
 
@@ -770,11 +838,41 @@ impl Document {
         self.follow_range_from = from;
     }
 
-    /// Wire name of the backing, carried on [`DocumentMeta`].
+    /// Wire name of the backing, carried on [`DocumentMeta`]. Columnar (F32)
+    /// documents report `indexedReadOnly` DELIBERATELY: every front-end
+    /// affordance for the F10 indexed mode (read-only gating, the
+    /// convert-to-editable flow) applies to them unchanged.
     pub fn backing_name(&self) -> &'static str {
         match self.backing {
             Backing::Memory => "editable",
-            Backing::Indexed(_) => "indexedReadOnly",
+            Backing::Indexed(_) | Backing::Columnar(_) => "indexedReadOnly",
+        }
+    }
+
+    /// The columnar handle behind an F32 Parquet/Arrow document, when this
+    /// document has one. Export and conversion use it to read the `Option`
+    /// plane (columnar NULL = `None`, empty string = `Some("")`), which the
+    /// rectangular text plane cannot carry.
+    pub fn columnar_handle(&self) -> Option<&crate::parquet_arrow::ColumnarHandle> {
+        match &self.backing {
+            Backing::Columnar(handle) => Some(handle),
+            _ => None,
+        }
+    }
+
+    /// F32: the absolute row ranges a filter scan must visit, when the
+    /// columnar backing's row-group statistics prove the skipped groups
+    /// cannot match `spec`. `None` = scan everything (non-columnar backings,
+    /// no usable statistics, or no eligible conditions).
+    pub fn filter_scan_ranges(
+        &self,
+        spec: &crate::dto::FilterGroup,
+    ) -> Option<Vec<std::ops::Range<usize>>> {
+        match &self.backing {
+            Backing::Columnar(handle) => {
+                handle.filter_scan_ranges(spec, &|col| self.column_schema_at(col).cloned())
+            }
+            _ => None,
         }
     }
 
@@ -816,6 +914,7 @@ impl Document {
                 Ok(())
             }
             Backing::Indexed(handle) => handle.visit(range, f),
+            Backing::Columnar(handle) => handle.visit(range, f),
         }
     }
 
@@ -839,6 +938,7 @@ impl Document {
                 Ok(())
             }
             Backing::Indexed(handle) => handle.visit_at(indices, f),
+            Backing::Columnar(handle) => handle.visit_at(indices, f),
         }
     }
 
@@ -1236,7 +1336,7 @@ impl Document {
     fn summary_scan_len(&self) -> usize {
         match self.backing {
             Backing::Memory => self.n_rows(),
-            Backing::Indexed(_) => self.n_rows().min(INDEXED_SUMMARY_SAMPLE),
+            Backing::Indexed(_) | Backing::Columnar(_) => self.n_rows().min(INDEXED_SUMMARY_SAMPLE),
         }
     }
 

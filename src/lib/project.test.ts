@@ -32,6 +32,7 @@ import {
   projectDirty,
   projectSnapshot,
   projectSnapshotsEqual,
+  restoreOpenRoute,
   setCaseSensitivePaths,
   statusDisplay,
   type PanelLayout,
@@ -116,6 +117,25 @@ describe("pathKey", () => {
     expect(pathKey("/data/A.csv")).toBe("/data/A.csv");
     expect(pathKey("/data/A.csv")).not.toBe(pathKey("/data/a.csv"));
     expect(pathKey("/data\\sub/")).toBe("/data/sub");
+  });
+});
+
+describe("restoreOpenRoute", () => {
+  it("routes columnar sources to a non-interactive indexed open", () => {
+    expect(restoreOpenRoute("C:\\data\\sales.parquet")).toBe("columnarIndexed");
+    expect(restoreOpenRoute("/home/u/events.arrow")).toBe("columnarIndexed");
+    expect(restoreOpenRoute("C:/data/EVENTS.FEATHER")).toBe("columnarIndexed");
+    expect(restoreOpenRoute("C:/data/stream.arrows")).toBe("columnarIndexed");
+    expect(restoreOpenRoute("C:/data/legacy.ipc")).toBe("columnarIndexed");
+  });
+
+  it("routes every other source through the ordinary open pipeline", () => {
+    expect(restoreOpenRoute("C:\\data\\a.csv")).toBe("standard");
+    expect(restoreOpenRoute("C:\\data\\a.json")).toBe("standard");
+    expect(restoreOpenRoute("C:\\data\\a.jsonl")).toBe("standard");
+    expect(restoreOpenRoute("C:\\data\\a.tsv")).toBe("standard");
+    expect(restoreOpenRoute("C:\\data\\archive.zip")).toBe("standard");
+    expect(restoreOpenRoute("C:\\data\\log.txt.gz")).toBe("standard");
   });
 });
 

@@ -8,6 +8,40 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Parquet & Arrow interoperability** (palette → "Open Parquet/Arrow…" and
+  "Export as Parquet/Arrow…"): open and export typed columnar datasets —
+  Apache Parquet, Arrow IPC files (Feather v2 is the Arrow IPC file format),
+  and Arrow IPC streams — preserving types and nulls. Opening a `.parquet` /
+  `.arrow` / `.feather` / `.ipc` file (drag-and-drop, "Open file…", or the
+  command) first shows an inspect dialog: container format, row and
+  row-group/batch counts, compression codec, the schema mapped to the F31
+  logical types (nested fields indented, timezones shown), and an
+  editable-memory estimate — before anything is loaded. Choose read-only
+  (an indexed columnar backing with windowed reads over row groups / record
+  batches and a bounded decoded-block cache, so the grid, filters, and
+  export work with bounded memory on multi-gigabyte files) or convert to
+  editable behind an explicit memory check. Signed and unsigned 64-bit
+  integers (so `u64::MAX` round-trips losslessly), exact decimal
+  precision+scale, floats, booleans, dates, timestamps with their time-zone
+  metadata, and UTF-8 strings all survive intact, and a NULL stays distinct
+  from an empty string end to end (editable opens preserve the distinction
+  through collision-free per-column null tokens). Structs flatten to stable
+  path-based column names; each list/map/struct field takes an explicit
+  per-field policy (keep as JSON, explode into rows on an editable open, or
+  drop). Equality and range filters on numeric/date columns of indexed
+  parquet documents skip whole row groups using their statistics, with
+  results identical to a full scan. Export any scope (all rows, the filtered
+  view, selected rows / columns / range) to Parquet (uncompressed, Snappy,
+  or Zstd, with a configurable row-group size), an Arrow IPC file, or an
+  Arrow IPC stream, as a cancellable job through the atomic-save pipeline;
+  typed export maps each column's declared logical type to the matching
+  arrow type (Int64/UInt64, Decimal128 with unified precision/scale, Date32,
+  microsecond or nanosecond timestamps carrying the schema's time zone),
+  while null tokens and columnar NULLs export as real nulls distinct from
+  empty strings. Cells that cannot be represented under the declared types
+  are written as NULL and counted into a per-column warning report; columns
+  without a schema export as text verbatim. A columnar document opens
+  unsaved so a later Save can never overwrite the binary source with CSV.
 - **Row bookmarks, tags & notes** (F40): mark and annotate records without
   touching the source data. Star or flag a row, apply multiple named tags
   (a per-document tag namespace with usage counts), and attach a row note or
@@ -198,6 +232,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rejects an invalid edit before it reaches the model (in the editor and
   the backend), advisory accepts it and records a bounded, retrievable
   issue — while schema edits themselves never touch the undo stack.
+
+### Fixed
+
+- **Project open now restores Parquet / Arrow sources non-interactively**:
+  reopening a project that referenced a columnar source no longer routes it
+  through the interactive inspect dialog (which returned without creating a
+  tab, so the source was left missing until the user manually confirmed the
+  dialog while the project baseline had already advanced). A restore reopens a
+  columnar source directly as an indexed read-only document with default
+  policies, matching the non-interactive restore of every other source type.
 
 ### Internal
 

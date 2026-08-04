@@ -66,16 +66,27 @@ fn norm(s: &str, case_sensitive: bool) -> String {
 
 /// Evaluate a filter spec over every data row, returning matching absolute
 /// row indices in document order. Streams through [`Document::visit_rows`],
-/// so it works for both editable and indexed backings.
+/// so it works for every backing. On a columnar (F32 Parquet) document,
+/// row-group statistics can prove entire row groups unmatchable for the
+/// required equality/range conditions; those groups are skipped — the
+/// pruning is conservative, so the result is IDENTICAL to the full scan.
 pub fn matching_rows(doc: &Document, spec: &FilterGroup) -> AppResult<Vec<usize>> {
     let compiled = compile_group(spec, &|col| doc.column_schema_at(col).cloned())?;
     let mut out = Vec::new();
-    doc.visit_rows(0..doc.n_rows(), &mut |i, row| {
+    let mut visit = |i: usize, row: &[String]| {
         if eval(&compiled, row) {
             out.push(i);
         }
         Ok(true)
-    })?;
+    };
+    match doc.filter_scan_ranges(spec) {
+        Some(ranges) => {
+            for range in ranges {
+                doc.visit_rows(range, &mut visit)?;
+            }
+        }
+        None => doc.visit_rows(0..doc.n_rows(), &mut visit)?,
+    }
     Ok(out)
 }
 

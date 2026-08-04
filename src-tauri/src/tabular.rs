@@ -11,11 +11,15 @@
 //!
 //! Cells are `Option<String>`: `None` means the field is MISSING from the
 //! record (a short JSONL object, an absent Excel cell, SQL `NULL`), while
-//! `Some("")` is a present-but-empty value. Document-backed sources always
-//! produce `Some` — the grid is rectangular by construction (import-time
-//! padding is recorded in [`crate::parse::ImportInfo`], not in the cells) —
-//! but the distinction is part of the contract so future sources can carry
-//! it and sinks can decide how to narrow it (CSV writes missing as empty).
+//! `Some("")` is a present-but-empty value. Text-document-backed sources
+//! (editable / F10 indexed) always produce `Some` — the grid is rectangular
+//! by construction (import-time padding is recorded in
+//! [`crate::parse::ImportInfo`], not in the cells). A COLUMNAR-backed
+//! document (F32 Parquet/Arrow) carries the distinction for real: a columnar
+//! NULL reads as `None`, an empty string as `Some("")` — its rectangular
+//! text plane renders NULL as an empty cell, but this contract keeps the
+//! null bit so export and derivation round-trip it. Sinks decide how to
+//! narrow it (CSV writes missing as empty).
 //!
 //! ## Contract scope and access model
 //!
@@ -260,6 +264,12 @@ impl TabularSource for DocumentSource<'_> {
         }
         if limit == 0 {
             return Ok(Vec::new());
+        }
+        // Columnar documents (F32) read through the handle's Option plane so
+        // a columnar NULL stays `None` (distinct from `Some("")`); the text
+        // plane below would flatten both to an empty cell.
+        if let Some(handle) = self.doc.columnar_handle() {
+            return handle.read_optional(offset, limit, ctx);
         }
         let n = self.doc.n_rows();
         let start = usize::try_from(offset).unwrap_or(usize::MAX).min(n);
