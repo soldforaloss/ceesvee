@@ -39,6 +39,11 @@ mod recipe;
 mod reopen;
 mod repair;
 mod reshape;
+/// Public like [`job`]: the shared row-identity model (editor row ids,
+/// source record numbers, normalized composite keys, content hashes and the
+/// key→row resolver) consumed by F40 annotations, F46 patches and F47
+/// three-way merge.
+pub mod row_identity;
 mod save;
 /// Public like [`job`]: the F31 schema core (logical types, classification,
 /// typed parsing, inference, import/export) is a stable internal API consumed
@@ -49,6 +54,10 @@ mod semantic;
 mod settings;
 mod sort;
 mod state;
+/// Public like [`job`]: the shared TabularSource/TabularSink contracts
+/// (schema + windowed reads + fingerprints; atomic streamed writes) that
+/// upcoming import/export/sampling features implement and consume.
+pub mod tabular;
 mod transform;
 mod util;
 

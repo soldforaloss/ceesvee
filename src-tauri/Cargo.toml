@@ -44,6 +44,8 @@ thiserror = "2"
 tempfile = "3"
 # Export manifests carry a SHA-256 per output file.
 sha2 = "0.10"
+# Composite-key normalization (NFKC) for shared row identity (F40/F46/F47).
+unicode-normalization = "0.1"
 # PII pseudonymization (F28): HMAC-SHA-256 keyed hashes + CSPRNG salts.
 hmac = "0.12"
 getrandom = "0.2"
