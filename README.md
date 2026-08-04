@@ -211,6 +211,19 @@ and faithful on large, real-world delimited files.**
   with normalized grouping, blank-key policies, and ordering options.
 - **Pivot / unpivot / transpose** — reshape wide↔long with aggregation
   choices, duplicate-coordinate detection, provenance, and size guards.
+- **Sampling & partitioning** — carve reproducible subsets and splits into
+  new documents (or direct CSV exports) without deleting a row: first / last
+  N, random fixed count (single-pass reservoir, bounded memory even over
+  indexed sources), random percentage, systematic every-Nth, stratified,
+  balanced, and deterministic hash-based sampling; plus weighted named
+  partitions (train / validation / test presets or custom), optionally
+  stratified or group-preserving (rows sharing key-column values never
+  split). Every run is seeded — supplied, or crypto-generated and surfaced —
+  so the same source + settings + seed yields byte-identical outputs; a
+  preview shows the projected AND exact counts before anything is written,
+  source order is preserved (or an explicit shuffle applied), partitions are
+  disjoint by construction, and each export gets a JSON manifest (method,
+  seed, source fingerprint, per-output SHA-256).
 - **Compare two documents** — positional or keyed comparison with column
   mapping for renamed/reordered columns and value equivalences (numeric, date,
   blank, case, trim). Every record classifies as added, removed, changed,

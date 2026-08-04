@@ -57,6 +57,10 @@ mod reshape;
 /// key→row resolver) consumed by F40 annotations, F46 patches and F47
 /// three-way merge.
 pub mod row_identity;
+/// Reproducible sampling & partitioning (F48): seeded PRNG, the eight sampling
+/// methods, weighted/stratified/group-preserving partitioning, previews, and
+/// manifested execution over the shared [`tabular`] contracts.
+mod sampling;
 mod save;
 /// Public like [`job`]: the F31 schema core (logical types, classification,
 /// typed parsing, inference, import/export) is a stable internal API consumed
@@ -309,6 +313,8 @@ pub fn run() {
             project::project_close,
             project::project_open_preview,
             project::project_open_apply,
+            commands::preview_sample,
+            commands::start_sample,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
