@@ -247,7 +247,7 @@ export function Toolbar() {
                 dir="rtl"
                 title={path}
               >
-                {path}
+                <bdi dir="ltr">{path}</bdi>
               </button>
             ))}
           </div>

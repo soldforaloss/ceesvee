@@ -51,7 +51,7 @@ export function EmptyState() {
                 dir="rtl"
                 title={path}
               >
-                {path}
+                <bdi dir="ltr">{path}</bdi>
               </button>
             ))}
           </div>
