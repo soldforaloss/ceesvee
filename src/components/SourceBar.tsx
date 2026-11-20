@@ -155,8 +155,12 @@ export function SourceBar() {
             `${meta.archive!.archivePath}${meta.archive!.entryName ? ` → ${meta.archive!.entryName}` : ""}`
           }
         >
-          {meta.path ??
-            `${meta.archive!.archivePath}${meta.archive!.entryName ? ` → ${meta.archive!.entryName}` : ""}`}
+          {/* dir="rtl" puts the ellipsis on the left; the ltr isolate keeps the
+              path's own slashes in order (otherwise "/a/b.csv" shows "a/b.csv/"). */}
+          <bdi dir="ltr">
+            {meta.path ??
+              `${meta.archive!.archivePath}${meta.archive!.entryName ? ` → ${meta.archive!.entryName}` : ""}`}
+          </bdi>
         </span>
       )}
     </div>
