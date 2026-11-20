@@ -1024,8 +1024,9 @@ impl Document {
         match &self.backing {
             Backing::Memory => {
                 let end = range.end.min(self.rows.len());
-                for i in range.start.min(end)..end {
-                    if !f(i, &self.rows[i])? {
+                let start = range.start.min(end);
+                for (i, row) in self.rows[start..end].iter().enumerate() {
+                    if !f(start + i, row)? {
                         return Ok(());
                     }
                 }
@@ -2616,10 +2617,7 @@ impl Document {
     }
 
     fn touch_all_columns(&mut self) {
-        let rev = self.revision;
-        for r in &mut self.col_revisions {
-            *r = rev;
-        }
+        self.col_revisions.fill(self.revision);
     }
 
     fn check_cell(&self, row: usize, col: usize) -> AppResult<()> {

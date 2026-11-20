@@ -1,3 +1,5 @@
+import { useShallow } from "zustand/react/shallow";
+
 import { useStore } from "../store/useStore";
 import { Modal } from "./Modal";
 
@@ -7,7 +9,11 @@ import { Modal } from "./Modal";
  */
 export function QuitDialog() {
   const open = useStore((s) => s.quitPromptOpen);
-  const dirtyTabs = useStore((s) => s.tabs.filter((t) => t.dirty));
+  const dirtyTabs = useStore(
+    // useShallow: `.filter()` returns a new array every call, which zustand v5
+    // treats as a changed snapshot and re-renders forever (blank window).
+    useShallow((s) => s.tabs.filter((t) => t.dirty)),
+  );
   const setOpen = useStore((s) => s.setQuitPromptOpen);
   const confirmQuit = useStore((s) => s.confirmQuit);
   const isProjectDirty = useStore((s) => s.isProjectDirty);

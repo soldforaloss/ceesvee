@@ -1,8 +1,13 @@
 import { useState } from "react";
 
 import { normalizeTagName, tagColor } from "../lib/annotations";
+import type { AnnotationsView } from "../types";
 import { useStore } from "../store/useStore";
 import { Modal } from "./Modal";
+
+// Stable fallback: a fresh `[]` from the selector on every call makes zustand
+// v5 (useSyncExternalStore) see a new snapshot each render -> infinite loop.
+const NO_TAGS: AnnotationsView["tags"] = [];
 
 /**
  * Tag picker (F40). Applies or removes named tags across the selected DISPLAY
@@ -13,7 +18,7 @@ import { Modal } from "./Modal";
 export function TagPickerDialog() {
   const target = useStore((s) => s.annotationTagTarget);
   const close = useStore((s) => s.closeTagPicker);
-  const tags = useStore((s) => s.annotationsView?.tags ?? []);
+  const tags = useStore((s) => s.annotationsView?.tags ?? NO_TAGS);
   const applyRowMarks = useStore((s) => s.applyRowMarks);
   const [newTag, setNewTag] = useState("");
   const [busy, setBusy] = useState(false);
